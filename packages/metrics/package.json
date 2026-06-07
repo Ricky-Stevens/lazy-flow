@@ -1,0 +1,17 @@
+{
+  "name": "@lazy-flow/metrics",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@lazy-flow/core": "*",
+    "@lazy-flow/code-analysis": "*"
+  },
+  "devDependencies": {
+    "@lazy-flow/testkit": "*",
+    "@lazy-flow/orchestrator": "*"
+  }
+}

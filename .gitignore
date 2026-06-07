@@ -1,0 +1,22 @@
+node_modules/
+dist/
+# Un-ignore the bundled MCP server artifact so it ships with the plugin
+# (no install/build step required on the host — SPEC §12.3, WP-E2E).
+# Git cannot re-include a file if a PARENT directory is excluded, so the dir
+# itself must be re-included BEFORE its contents — otherwise the `**` negation
+# is silently a no-op and the server.js the plugin launches is never committed.
+!packages/mcp-server/server/dist/
+!packages/mcp-server/server/dist/**
+*.db
+*.db-shm
+*.db-wal
+*.tsbuildinfo
+coverage/
+.env
+.env.*
+.DS_Store
+
+# tooling
+.lazy-dev/
+.serena/
+.idea/

@@ -1,0 +1,16 @@
+{
+  "name": "@lazy-flow/ingest-github",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@lazy-flow/core": "*",
+    "octokit": "^4.0.2"
+  },
+  "devDependencies": {
+    "@lazy-flow/testkit": "*"
+  }
+}

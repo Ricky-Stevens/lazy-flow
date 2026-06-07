@@ -1,0 +1,44 @@
+name: CI
+
+# Quality gates + a guard against shipping a stale MCP-server bundle. The plugin
+# is installed straight from this repo and launches packages/mcp-server/server/
+# dist/server.js, so a committed bundle that lags the source ships broken/old
+# code. This rebuilds it and fails if the committed artifact is out of date.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '25'
+      - run: npm ci
+      - name: Lint + typecheck + test
+        run: npm run check
+
+  bundle-not-stale:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '25'
+      - run: npm ci
+      - name: Rebuild the MCP-server bundle from source
+        run: |
+          rm -rf packages/mcp-server/server/dist
+          npm run build -w @lazy-flow/mcp-server
+      - name: Fail if the committed bundle differs from a fresh build
+        run: |
+          if [ -n "$(git status --porcelain packages/mcp-server/server/dist)" ]; then
+            echo "::error::Committed MCP-server bundle is stale. Run 'npm run build -w @lazy-flow/mcp-server' and commit packages/mcp-server/server/dist."
+            git --no-pager diff --stat packages/mcp-server/server/dist
+            exit 1
+          fi
+          echo "Bundle is up to date."

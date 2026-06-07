@@ -1,0 +1,17 @@
+{
+  "name": "@lazy-flow/orchestrator",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@lazy-flow/core": "*",
+    "@lazy-flow/ingest-github": "*",
+    "@lazy-flow/ingest-jira": "*"
+  },
+  "devDependencies": {
+    "@lazy-flow/testkit": "*"
+  }
+}
