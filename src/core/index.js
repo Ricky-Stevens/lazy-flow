@@ -27,8 +27,15 @@ export {
   stitchPersons,
   unmergeIdentities,
 } from './identity/index.js'
+
 // PR ↔ Jira issue linking (SPEC WP-LINKING)
 
+// Deploy ↔ incident linking (DORA CFR / recovery / rework attribution)
+export {
+  INCIDENT_DEPLOY_PROXIMITY_MS,
+  linkDeployIncidents,
+  linkDeploysToIncidents,
+} from './linking/linkDeployIncidents.js'
 export { linkageRate, linkIssues } from './linking/linkIssues.js'
 
 // Migration runner

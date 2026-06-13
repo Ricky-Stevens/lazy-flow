@@ -533,9 +533,54 @@ CREATE TABLE IF NOT EXISTS sync_state (
   error        TEXT,
   PRIMARY KEY (source, resource, scope_id)
 );
+
+-- Deploy ↔ incident attribution (DORA CFR / recovery / rework). Recomputed each
+-- sync from temporal-proximity linkage; stored so it is query_db-inspectable.
+CREATE TABLE IF NOT EXISTS deploy_incident_links (
+  deploy_id         TEXT NOT NULL REFERENCES deployments(id),
+  incident_issue_id TEXT NOT NULL REFERENCES issues(id),
+  link_type         TEXT NOT NULL CHECK (link_type IN ('proximity', 'explicit')),
+  linked_at         TEXT NOT NULL,
+  PRIMARY KEY (deploy_id, incident_issue_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_deploy_incident_links_deploy ON deploy_incident_links(deploy_id);
+CREATE INDEX IF NOT EXISTS idx_deploy_incident_links_incident ON deploy_incident_links(incident_issue_id);
+
+-- Whole-file complexity cache (code.complexity_delta / maintainability_index).
+-- Keyed by (repo, sha, path): commits are immutable, so analysed once.
+CREATE TABLE IF NOT EXISTS file_complexity (
+  repo_id          TEXT    NOT NULL REFERENCES repositories(id),
+  sha              TEXT    NOT NULL,
+  path             TEXT    NOT NULL,
+  language         TEXT    NOT NULL,
+  loc              INTEGER NOT NULL,
+  total_cyclomatic INTEGER NOT NULL,
+  function_count   INTEGER NOT NULL,
+  functions        TEXT    NOT NULL,
+  computed_at      TEXT    NOT NULL,
+  PRIMARY KEY (repo_id, sha, path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_file_complexity_repo_sha ON file_complexity(repo_id, sha);
+
+-- Each PR's base/head SHA (pull_requests stores only mutable branch names) so the
+-- metric layer can pair base↔head file complexity for a PR's changed files.
+CREATE TABLE IF NOT EXISTS pr_refs (
+  pr_id      TEXT NOT NULL PRIMARY KEY REFERENCES pull_requests(id),
+  repo_id    TEXT NOT NULL REFERENCES repositories(id),
+  base_sha   TEXT,
+  head_sha   TEXT,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pr_refs_repo ON pr_refs(repo_id);
 `
 
 export const MIGRATION_0001_DOWN = /* sql */ `
+DROP TABLE IF EXISTS pr_refs;
+DROP TABLE IF EXISTS file_complexity;
+DROP TABLE IF EXISTS deploy_incident_links;
 DROP TABLE IF EXISTS sync_state;
 DROP TABLE IF EXISTS status_category_history;
 DROP TABLE IF EXISTS flow_state_models;

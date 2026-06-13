@@ -332,6 +332,12 @@ export class BunSqliteStore {
     )
   }
 
+  /** Set of commit SHAs already stored for a repo — lets sync skip re-detailing immutable commits. */
+  async getCommitShasByRepo(repoId) {
+    const rows = this.stmt(`SELECT sha FROM commits WHERE repo_id = ?`).all(repoId)
+    return new Set(rows.map((r) => String(r.sha)))
+  }
+
   async getCommitsByRepo(repoId, since, until) {
     let sql =
       `SELECT repo_id, sha, author_identity_id, authored_at, committed_at,` +
@@ -764,6 +770,138 @@ export class BunSqliteStore {
     }))
   }
 
+  /** All deployments in the store (single-org DB). Used by the deploy↔incident linker. */
+  async listAllDeployments() {
+    const rows = this.stmt(
+      `SELECT id, repo_id, sha, environment, status, created_at, finished_at, source, raw, updated_at
+       FROM deployments ORDER BY created_at ASC`,
+    ).all()
+    return rows.map((r) => ({
+      id: String(r.id),
+      repoId: String(r.repo_id),
+      sha: String(r.sha),
+      environment: String(r.environment),
+      status: String(r.status),
+      createdAt: String(r.created_at),
+      finishedAt: rstr(r.finished_at),
+      source: r.source,
+      raw: String(r.raw),
+      updatedAt: String(r.updated_at),
+    }))
+  }
+
+  // ---------------------------------------------------------------------------
+  // Deploy ↔ incident links (DORA CFR / recovery / rework attribution)
+  // ---------------------------------------------------------------------------
+
+  async upsertDeployIncidentLink(link) {
+    this.stmt(`
+      INSERT INTO deploy_incident_links (deploy_id, incident_issue_id, link_type, linked_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(deploy_id, incident_issue_id) DO UPDATE SET
+        link_type = excluded.link_type,
+        linked_at = excluded.linked_at
+    `).run(link.deployId, link.incidentIssueId, link.linkType, link.linkedAt)
+  }
+
+  async getDeployIncidentLinks() {
+    const rows = this.stmt(
+      `SELECT deploy_id, incident_issue_id, link_type, linked_at FROM deploy_incident_links`,
+    ).all()
+    return rows.map((r) => ({
+      deployId: String(r.deploy_id),
+      incidentIssueId: String(r.incident_issue_id),
+      linkType: String(r.link_type),
+      linkedAt: String(r.linked_at),
+    }))
+  }
+
+  /** Delete all links of a given type — used to recompute proximity links idempotently. */
+  async clearDeployIncidentLinks(linkType) {
+    this.stmt(`DELETE FROM deploy_incident_links WHERE link_type = ?`).run(linkType)
+  }
+
+  // ---------------------------------------------------------------------------
+  // File complexity (code.complexity_delta / code.maintainability_index)
+  // ---------------------------------------------------------------------------
+
+  async upsertFileComplexity(fc) {
+    this.stmt(`
+      INSERT INTO file_complexity
+        (repo_id, sha, path, language, loc, total_cyclomatic, function_count, functions, computed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(repo_id, sha, path) DO UPDATE SET
+        language = excluded.language, loc = excluded.loc,
+        total_cyclomatic = excluded.total_cyclomatic, function_count = excluded.function_count,
+        functions = excluded.functions, computed_at = excluded.computed_at
+    `).run(
+      fc.repoId,
+      fc.sha,
+      fc.path,
+      fc.language,
+      fc.loc,
+      fc.totalCyclomatic,
+      fc.functionCount,
+      JSON.stringify(fc.functions),
+      fc.computedAt,
+    )
+  }
+
+  /** Whether a (sha, path) complexity row already exists — lets sync skip re-analysis (immutable). */
+  async hasFileComplexity(repoId, sha, path) {
+    return (
+      this.stmt(
+        `SELECT 1 FROM file_complexity WHERE repo_id = ? AND sha = ? AND path = ? LIMIT 1`,
+      ).get(repoId, sha, path) !== null
+    )
+  }
+
+  /** One file's complexity at a given sha, or null. `functions` is parsed back to an array. */
+  async getFileComplexity(repoId, sha, path) {
+    const r = this.stmt(
+      `SELECT repo_id, sha, path, language, loc, total_cyclomatic, function_count, functions, computed_at
+       FROM file_complexity WHERE repo_id = ? AND sha = ? AND path = ?`,
+    ).get(repoId, sha, path)
+    if (!r) return null
+    return {
+      repoId: String(r.repo_id),
+      sha: String(r.sha),
+      path: String(r.path),
+      language: String(r.language),
+      loc: Number(r.loc),
+      totalCyclomatic: Number(r.total_cyclomatic),
+      functionCount: Number(r.function_count),
+      functions: JSON.parse(String(r.functions)),
+      computedAt: String(r.computed_at),
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // PR base/head refs (SHA pairing for complexity deltas)
+  // ---------------------------------------------------------------------------
+
+  async upsertPrRef(ref) {
+    this.stmt(`
+      INSERT INTO pr_refs (pr_id, repo_id, base_sha, head_sha, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(pr_id) DO UPDATE SET
+        base_sha = excluded.base_sha, head_sha = excluded.head_sha, updated_at = excluded.updated_at
+    `).run(ref.prId, ref.repoId, ref.baseSha ?? null, ref.headSha ?? null, ref.updatedAt)
+  }
+
+  async getPrRef(prId) {
+    const r = this.stmt(
+      `SELECT pr_id, repo_id, base_sha, head_sha FROM pr_refs WHERE pr_id = ?`,
+    ).get(prId)
+    if (!r) return null
+    return {
+      prId: String(r.pr_id),
+      repoId: String(r.repo_id),
+      baseSha: rstr(r.base_sha),
+      headSha: rstr(r.head_sha),
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Jira projects
   // ---------------------------------------------------------------------------
@@ -876,6 +1014,18 @@ export class BunSqliteStore {
               raw, updated_at
        FROM issues WHERE project_id = ? AND deleted_at IS NULL ORDER BY key ASC`,
     ).all(projectId)
+    return rows.map((r) => this._rowToIssue(r))
+  }
+
+  /** All incident-type issues across projects (single-org DB). For deploy↔incident linking. */
+  async listIncidentIssues() {
+    const rows = this.stmt(
+      `SELECT id, project_id, key, type, status_id, status_category, story_points,
+              story_points_field_id, story_points_raw, parent_id, epic_key, is_subtask,
+              hierarchy_level, assignee_identity_id, created_at, resolved_at, deleted_at,
+              raw, updated_at
+       FROM issues WHERE lower(type) = 'incident' AND deleted_at IS NULL ORDER BY created_at ASC`,
+    ).all()
     return rows.map((r) => this._rowToIssue(r))
   }
 

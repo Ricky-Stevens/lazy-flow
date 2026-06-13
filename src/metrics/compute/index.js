@@ -8,7 +8,13 @@ import {
   goodhartWarning,
 } from '../antigaming/index.js'
 
-import { codeChangeImpact, halocAggregate, nagappanBall } from '../code/index.js'
+import {
+  codeChangeImpact,
+  complexityDelta,
+  halocAggregate,
+  maintainabilityIndex,
+  nagappanBall,
+} from '../code/index.js'
 
 import {
   changeFailureRate,
@@ -91,11 +97,11 @@ export const COMPUTE_METRIC_IDS = [
   'agile.sprint_velocity',
   'agile.sprint_predictability',
   'agile.estimation_accuracy',
-  // Code (Group D) — computed from ingested pr_files diffs. complexity_delta /
-  // maintainability_index / rework_churn require inputs we do not yet ingest
-  // (full-file ASTs / git blame); they are routed here so computeMetric returns
-  // a SPECIFIC no_data reason naming the missing input rather than a blanket
-  // short-circuit. See the switch cases below.
+  // Code (Group D). haloc_aggregate / nagappan_ball / change_impact compute from
+  // ingested pr_files diffs. complexity_delta + maintainability_index compute from
+  // per-PR whole-file ASTs (file_complexity, ingested via tree-sitter). rework_churn
+  // still needs per-line git blame (not ingested) — it returns a SPECIFIC no_data
+  // reason naming the missing input rather than a blanket short-circuit.
   'code.haloc_aggregate',
   'code.nagappan_ball',
   'code.change_impact',
@@ -879,15 +885,15 @@ function defaultUnitFor(metricId) {
 // yet ingest. These name the EXACT missing input (honest scoping, SPEC §8.4),
 // not a blanket "code metrics unsupported" short-circuit.
 const COMPLEXITY_DELTA_NO_DATA =
-  'code.complexity_delta requires whole-file source ASTs at the base and head ' +
-  'refs (analyzeComplexity over full file contents@ref), which we do not ingest ' +
-  '— pr_files carries only unified-diff hunks, not complete file contents. ' +
-  'Returns no_data until whole-file contents@ref ingestion is added (SPEC §8.4).'
+  'code.complexity_delta has no ingested whole-file complexity for this window: ' +
+  'no supported-language (JS/TS/Python/Go) files were analysed at the PRs base/head ' +
+  'refs — either no such files changed, or their contents were unavailable (binary, ' +
+  '>1MB, or fetch failure). Returns no_data until such files are ingested (SPEC §8.4).'
 const MAINTAINABILITY_INDEX_NO_DATA =
-  'code.maintainability_index requires average cyclomatic complexity and average ' +
-  'LOC per file from whole-file AST analysis (analyzeComplexity), which we do not ' +
-  'ingest — pr_files carries only diff hunks, not complete file contents. ' +
-  'Returns no_data until whole-file contents@ref ingestion is added (SPEC §8.4).'
+  'code.maintainability_index has no ingested whole-file complexity for this window: ' +
+  'no supported-language (JS/TS/Python/Go) files were analysed at the PR head refs to ' +
+  'derive average cyclomatic complexity and LOC. Returns no_data until such files are ' +
+  'ingested (SPEC §8.4).'
 const REWORK_CHURN_NO_DATA =
   'code.rework_churn requires per-line git blame (author + commit age) to classify ' +
   'New / Legacy-Refactor / Help-Others / Rework lines; the GitHub API does not ' +
@@ -983,9 +989,13 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
       const prodDeploys = data.deploys
         .map(toDeployRecord)
         .filter((d) => d.environment === 'production')
-      // dataSource 'proxy': MTTR anchors on the proximity-linked incident set.
+      // Prefer REAL deployment-to-recovery time (failed→next-success deploy) from
+      // ingested statuses; fall back to the proximity-linked incident set when no
+      // failed deployment is observed. dataSource follows the signal actually used.
       const result = recoveryTime.compute(
         {
+          deploys: prodDeploys,
+          environment: 'production',
           incidents: buildIncidents(
             data.issues,
             data.transitionsByIssue,
@@ -997,7 +1007,7 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
         },
         now,
       )
-      return { ...result, dataSource: 'proxy' }
+      return { ...result, dataSource: result.recoverySource === 'deployment' ? 'real' : 'proxy' }
     }
 
     case 'dora.incident_reopen_rate': {
@@ -1467,13 +1477,63 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
       )
     }
 
-    case 'code.complexity_delta':
-      // Needs whole-file ASTs at base+head; we only ingest diff hunks.
-      return noDataResult(metricId, scopeType, now, COMPLEXITY_DELTA_NO_DATA)
+    case 'code.complexity_delta': {
+      // Pair base↔head file complexity (ingested per-PR via tree-sitter) for each
+      // changed code file of the window's PRs. Paths are namespaced by PR id so
+      // the same file touched by two PRs is matched within its own PR, not across.
+      const head = []
+      const base = []
+      for (const [prId, files] of data.prFilesByPr) {
+        const ref = await store.getPrRef(prId)
+        if (!ref?.headSha) continue
+        for (const f of files) {
+          const headC = await store.getFileComplexity(ref.repoId, ref.headSha, f.path)
+          if (!headC) continue
+          const key = `${prId}::${f.path}`
+          head.push({ path: key, complexity: { functions: headC.functions } })
+          const baseC = ref.baseSha
+            ? await store.getFileComplexity(ref.repoId, ref.baseSha, f.path)
+            : null
+          if (baseC) base.push({ path: key, complexity: { functions: baseC.functions } })
+        }
+      }
+      if (head.length === 0) {
+        return noDataResult(metricId, scopeType, now, COMPLEXITY_DELTA_NO_DATA)
+      }
+      return complexityDelta.compute({ head, base }, now)
+    }
 
-    case 'code.maintainability_index':
-      // Needs avg cyclomatic + avg LOC from whole-file AST analysis.
-      return noDataResult(metricId, scopeType, now, MAINTAINABILITY_INDEX_NO_DATA)
+    case 'code.maintainability_index': {
+      // Average cyclomatic-per-function + LOC over the head-side complexity of the
+      // window's changed code files; avgHaloc from the same files' ingested diffs.
+      const seen = new Set()
+      let sumCyclomatic = 0
+      let sumLoc = 0
+      let sumHaloc = 0
+      let n = 0
+      for (const [prId, files] of data.prFilesByPr) {
+        const ref = await store.getPrRef(prId)
+        if (!ref?.headSha) continue
+        for (const f of files) {
+          const key = `${ref.headSha}::${f.path}`
+          if (seen.has(key)) continue
+          const c = await store.getFileComplexity(ref.repoId, ref.headSha, f.path)
+          if (!c) continue
+          seen.add(key)
+          sumCyclomatic += c.functionCount > 0 ? c.totalCyclomatic / c.functionCount : 0
+          sumLoc += c.loc
+          sumHaloc += f.haloc ?? 0
+          n++
+        }
+      }
+      if (n === 0) {
+        return noDataResult(metricId, scopeType, now, MAINTAINABILITY_INDEX_NO_DATA)
+      }
+      return maintainabilityIndex.compute(
+        { avgCyclomatic: sumCyclomatic / n, avgLoc: sumLoc / n, avgHaloc: sumHaloc / n },
+        now,
+      )
+    }
 
     case 'code.rework_churn':
       // Needs per-line git blame; the GitHub API does not expose it.

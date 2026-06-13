@@ -335,10 +335,44 @@ export class GitHubClient {
     return this.restGetAll(`/repos/${owner}/${repo}/releases`)
   }
 
+  /**
+   * Whole-file contents at a specific ref (GET …/contents/{path}?ref={sha}),
+   * decoded from base64. Returns null when the path is absent at that ref (404 —
+   * e.g. a file added in a PR has no base version), is a directory/submodule, or
+   * exceeds the contents API's ~1 MB inline limit. Best-effort: complexity
+   * analysis is optional, so any fetch failure yields null rather than throwing.
+   */
+  async getFileContentAtRef(owner, repo, path, ref) {
+    const encodedPath = path.split('/').map(encodeURIComponent).join('/')
+    try {
+      const { body } = await this.restGet(
+        `/repos/${owner}/${repo}/contents/${encodedPath}?ref=${encodeURIComponent(ref)}`,
+      )
+      if (body?.encoding === 'base64' && typeof body.content === 'string') {
+        return Buffer.from(body.content, 'base64').toString('utf8')
+      }
+      return null
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * Deployment STATUS history for one deployment (GET …/deployments/{id}/statuses).
+   * GitHub's deployments LIST carries no outcome — the success/failure/error/inactive
+   * state lives only here. Returned newest-first by the API; callers take [0] as the
+   * latest state. Returns [] when a deployment has no statuses yet (pending).
+   */
+  async listDeploymentStatuses(owner, repo, deploymentId) {
+    return this.restGetAll(`/repos/${owner}/${repo}/deployments/${deploymentId}/statuses`)
+  }
+
   async listCheckRuns(owner, repo, ref) {
     const { body } = await this.restGet(`/repos/${owner}/${repo}/commits/${ref}/check-runs`)
     const typed = body
-    return typed.check_runs
+    // Default to [] when the response omits check_runs (permissions / API variance)
+    // so callers can iterate without an undefined-crash.
+    return typed.check_runs ?? []
   }
 
   // -------------------------------------------------------------------------

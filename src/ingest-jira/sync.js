@@ -125,8 +125,19 @@ export async function syncJira(store, client, scope, mode, now = new Date().toIS
       projectIds.push(projectId)
       projectKeyToId.set(rawProject.key, projectId)
 
-      // Discover story-point field
+      // Discover story-point field. When it can't be found, EVERY issue gets
+      // story_points=null and the whole agile suite (velocity, say/do,
+      // predictability, estimation accuracy) silently returns no_data. Surface
+      // that loudly so the operator knows to map the field rather than assuming
+      // the metrics are simply empty.
       const storyPointFieldId = await client.discoverStoryPointField(projectId)
+      if (!storyPointFieldId) {
+        result.errors.push(
+          `Story-point field not found for project ${projectKey} — velocity, say/do, ` +
+            `predictability and estimation-accuracy metrics will be empty for it. Check the ` +
+            `custom-field name/permissions or set the project's storyPointsFieldId property.`,
+        )
+      }
 
       // Ingest workflows for this project. Workflow discovery is auxiliary
       // (status-mapping enrichment); a failure is reported but must NOT abort
@@ -462,12 +473,27 @@ async function ingestSprintMembership(store, report, sprintId, now) {
       sprintId,
       issueId: i.id,
       change: 'added',
-      pointsAtEvent: null, // Points not available in the report payload
+      // Greenhopper sprint reports DO carry the points per issue: estimateStatistic
+      // is the estimate at sprint start (the committed scope), currentEstimateStatistic
+      // the current value. Capture the start estimate so membership rows record the
+      // committed points, not null. (NB: velocity currently sums CURRENT issue
+      // story_points for present-at-start issues; this stored value enables a
+      // committed-at-start computation and is surfaced for inspection.)
+      pointsAtEvent: reportIssuePoints(i),
       transitionedAt: sprintStart,
       wasPresentAtStart: true,
     }
     await store.appendSprintMembershipEvent(event)
   }
+}
+
+/** Extract the story-point estimate from a Greenhopper sprint-report issue, or null. */
+export function reportIssuePoints(issue) {
+  const v =
+    issue.estimateStatistic?.statFieldValue?.value ??
+    issue.currentEstimateStatistic?.statFieldValue?.value ??
+    null
+  return typeof v === 'number' && Number.isFinite(v) ? v : null
 }
 
 function normalizeSprintState(raw) {

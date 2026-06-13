@@ -3,9 +3,9 @@ import { MIGRATION_0001_DOWN, MIGRATION_0001_UP } from './migrations/0001_initia
 /**
  * The ordered list of all migrations.
  *
- * Pre-launch, the history was flattened to this single consolidated baseline
- * (the former 0001–0006 + 0008). Once v1 ships, append new migrations here at
- * version 2 and upward — never edit this baseline again.
+ * Pre-launch, the history is kept flattened to this single consolidated baseline
+ * (no need for incremental migrations yet). Once v1 ships, append new migrations
+ * here at version 2 and upward — never edit the baseline again.
  */
 export const MIGRATIONS = [
   {

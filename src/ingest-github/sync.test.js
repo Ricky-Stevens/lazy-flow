@@ -94,6 +94,30 @@ describe('idempotency', () => {
     expect(new Set(shas).size).toBe(shas.length)
   })
 
+  it('re-sync preserves commit stats and does not re-detail immutable commits', async () => {
+    const client = makeClient()
+    await syncGitHub(store, client, scope, 'backfill')
+    const before = await store.getCommitsByRepo(SYNCED_REPO_ALPHA)
+    const detailed = before.find((c) => c.additions > 0 || c.deletions > 0 || c.haloc > 0)
+    expect(detailed).toBeDefined() // backfill populated real stats
+
+    // Spy: a second backfill must skip already-ingested commits (no DETAIL refetch)
+    // and must NOT zero out the previously-captured stats.
+    let detailCalls = 0
+    const origDetail = client.getCommitDetail.bind(client)
+    client.getCommitDetail = async (...args) => {
+      detailCalls++
+      return origDetail(...args)
+    }
+    await syncGitHub(store, client, scope, 'backfill')
+
+    expect(detailCalls).toBe(0) // every commit already stored → no re-detailing
+    const after = await store.getCommitsByRepo(SYNCED_REPO_ALPHA)
+    const sameSha = after.find((c) => c.sha === detailed?.sha)
+    expect(sameSha?.additions).toBe(detailed?.additions)
+    expect(sameSha?.haloc).toBe(detailed?.haloc)
+  })
+
   it('backfill then incremental produces no duplicate reviews', async () => {
     const client = makeClient()
 
@@ -382,6 +406,58 @@ describe('deployment source', () => {
     expect(alphaDeployments.some((d) => d.id === IDS.deploy1)).toBe(true)
     expect(alphaDeployments.some((d) => d.id === IDS.deploy3)).toBe(true)
     expect(betaDeployments.some((d) => d.id === IDS.deploy2)).toBe(true)
+  })
+
+  it('captures CI check runs for default-branch commits that are not open-PR heads', async () => {
+    // commitSquash is an alpha commit but NOT any PR's head. Pre-fix, check runs
+    // were only fetched for PR heads, so its CI was never captured. Now check
+    // runs are fetched per default-branch commit → longitudinal ci_health.
+    const store = makeStore()
+    server.use(
+      http.get(
+        'https://api.github.com/repos/:owner/:repo/commits/:ref/check-runs',
+        ({ params }) => {
+          if (params.ref === IDS.commitSquash) {
+            return HttpResponse.json({
+              total_count: 1,
+              check_runs: [
+                {
+                  id: 'cs',
+                  node_id: 'cs-build',
+                  name: 'build',
+                  status: 'completed',
+                  conclusion: 'success',
+                  started_at: '2024-05-01T08:00:00Z',
+                  completed_at: '2024-05-01T08:10:00Z',
+                },
+              ],
+            })
+          }
+          return HttpResponse.json({ total_count: 0, check_runs: [] })
+        },
+      ),
+    )
+
+    await syncGitHub(store, makeClient(), scope, 'backfill', '2024-06-01T00:00:00Z')
+
+    const checks = await store.getCheckRunsByRepo(SYNCED_REPO_ALPHA)
+    expect(checks.some((c) => c.headSha === IDS.commitSquash && c.conclusion === 'success')).toBe(
+      true,
+    )
+  })
+
+  it('captures the REAL deployment outcome from the statuses sub-resource', async () => {
+    // Regression: the deployments LIST carries no outcome, so without fetching
+    // per-deployment statuses every deploy defaulted to 'success' — failures were
+    // structurally invisible. deploy-3 is a failure and must now be recorded as such.
+    const store = makeStore()
+    await syncGitHub(store, makeClient(), scope, 'backfill')
+
+    const alpha = await store.getDeploymentsByRepo(SYNCED_REPO_ALPHA)
+    const deploy1 = alpha.find((d) => d.id === IDS.deploy1)
+    const deploy3 = alpha.find((d) => d.id === IDS.deploy3)
+    expect(deploy1?.status).toBe('success')
+    expect(deploy3?.status).toBe('failure')
   })
 })
 

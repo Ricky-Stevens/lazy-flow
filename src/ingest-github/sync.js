@@ -32,6 +32,7 @@
 import { computeHaloc } from '../code-analysis/index.js'
 
 import { buildIdentityId, scrubFreeText } from '../core/index.js'
+import { ingestPrComplexity } from './complexity.js'
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -104,6 +105,14 @@ export async function syncGitHub(store, client, scope, mode, now = new Date().to
  */
 const INCREMENTAL_OVERLAP_MINUTES = 10
 
+/**
+ * GitHub deployment-status states that are FINAL — once a deployment reaches one
+ * of these its outcome won't change, so the status sub-resource need not be
+ * re-fetched on subsequent syncs. (`in_progress`/`queued`/`pending` are not here:
+ * they're transient and get re-checked next sync.)
+ */
+const TERMINAL_DEPLOY_STATES = new Set(['success', 'failure', 'error', 'inactive'])
+
 function subtractMinutes(iso, minutes) {
   return new Date(new Date(iso).getTime() - minutes * 60_000).toISOString()
 }
@@ -138,10 +147,18 @@ async function syncRepo(store, client, repo, mode, now) {
   // merge its `stats` onto the raw before mapping. Only windowed commits are
   // detailed (the LIST already applied the `since` filter), so the rate-limit
   // cost is bounded to the incremental delta on reconciliation runs.
+  // Commits are immutable: once a SHA is stored its stats never change. Skip the
+  // per-commit DETAIL request (and the upsert below) for SHAs already ingested so
+  // re-syncs only pay for genuinely-new commits, bounding the rate-limit cost of
+  // the overlap window. (NOTE: GitHub's `since` filters on COMMITTER date, so a
+  // commit authored/committed long ago but pushed recently — rebase, cherry-pick,
+  // long-lived branch merge — can be absent from the LIST and thus missed here;
+  // capturing those would require enumerating each merged PR's commits.)
+  const existingShas = await store.getCommitShasByRepo(repoId)
   const detailBySha = new Map()
   for (const raw of rawCommits) {
     const sha = raw.sha
-    if (!sha) continue
+    if (!sha || existingShas.has(sha)) continue
     const detail = await client.getCommitDetail(owner, name, sha)
     const additions = detail.stats?.additions ?? 0
     const deletions = detail.stats?.deletions ?? 0
@@ -155,6 +172,19 @@ async function syncRepo(store, client, repo, mode, now) {
     }
     if (haloc === 0) haloc = Math.max(additions, deletions)
     detailBySha.set(sha, { additions, deletions, haloc })
+
+    // Longitudinal CI: capture check runs for this default-branch commit, not
+    // just open-PR heads. This gives pr.ci_health post-merge + main-branch
+    // history and lets flakiness (same sha+name flipping conclusion) be detected
+    // across all commits. Bounded to NEW commits (above) + resilient: a missing
+    // or failed CI fetch for one commit must not abort the repo sync.
+    try {
+      for (const rawCheck of await client.listCheckRuns(owner, name, sha)) {
+        await store.upsertCheckRun(mapCheckRun(rawCheck, repoId, sha, now))
+      }
+    } catch {
+      // No CI / transient error for this commit — skip, don't fail the sync.
+    }
   }
   // Anchor the watermark on the max committer date actually seen (robust to
   // local/GitHub clock skew), not the local sync-start clock.
@@ -166,6 +196,9 @@ async function syncRepo(store, client, repo, mode, now) {
       if (committedAt && (maxCommitAt === null || committedAt > maxCommitAt)) {
         maxCommitAt = committedAt
       }
+      // Already-ingested commit: watermark above still accounts for it, but its
+      // rows are immutable and present, so skip the redundant re-writes.
+      if (raw.sha && existingShas.has(raw.sha)) continue
       // Upsert author identity BEFORE the commit row — the commits table has
       // author_identity_id TEXT NOT NULL REFERENCES identities(id).
       const login = raw.author?.login
@@ -275,12 +308,37 @@ async function syncRepo(store, client, repo, mode, now) {
     mode === 'incremental' ? await store.getSyncState('github', 'deployments', repoId) : null
   const priorDeployWatermark = deployCursor?.watermarkAt ?? null
   const rawDeploys = await client.listDeployments(owner, name)
-  // Anchor the deployments watermark on the max server-provided updated_at.
+  // The deployments LIST endpoint carries NO outcome — success/failure/error/
+  // inactive lives only in the per-deployment statuses sub-resource. Without it
+  // every deployment defaults to 'success', so failures are invisible and DORA
+  // change-failure / frequency are wrong. Fetch the latest status per deployment.
+  // Bounded + idempotent: skip deployments already recorded with a terminal
+  // outcome (it can't change), so re-syncs don't re-pay the per-deploy request.
+  const existingDeployStatus = new Map(
+    (await store.getDeploymentsByRepo(repoId)).map((d) => [d.id, d.status]),
+  )
   let maxDeployUpdatedAt = null
   for (const rawDeploy of rawDeploys) {
     const u = rawDeploy.updated_at ?? rawDeploy.created_at
     if (u && (maxDeployUpdatedAt === null || u > maxDeployUpdatedAt)) maxDeployUpdatedAt = u
     const deploy = mapDeployment(rawDeploy, repoId, now, 'deployments_api')
+
+    const stored = existingDeployStatus.get(deploy.id)
+    if (!TERMINAL_DEPLOY_STATES.has(stored ?? '')) {
+      try {
+        const statuses = await client.listDeploymentStatuses(owner, name, rawDeploy.id)
+        const latest = statuses[0]
+        if (latest?.state) {
+          deploy.status = String(latest.state)
+          if (TERMINAL_DEPLOY_STATES.has(deploy.status)) {
+            deploy.finishedAt = latest.created_at ?? deploy.finishedAt
+          }
+        }
+      } catch {
+        // Resilience: a single deployment's status fetch failing (permissions,
+        // transient error) must not abort the repo sync — keep the mapped record.
+      }
+    }
     await store.upsertDeployment(deploy)
   }
 
@@ -475,6 +533,23 @@ async function syncPr(store, client, rawPr, owner, repoName, repoId, defaultBran
   for (const rawFile of rawFiles) {
     if (!rawFile.filename) continue
     await store.upsertPrFile(mapPrFile(rawFile, prId, repoId, now))
+  }
+
+  // Record base/head SHAs + analyse changed-file complexity at both refs (feeds
+  // code.complexity_delta + code.maintainability_index). Best-effort + bounded —
+  // a failure here must not abort PR ingestion.
+  try {
+    await ingestPrComplexity(store, client, {
+      owner,
+      repoName,
+      repoId,
+      rawPr,
+      prId,
+      rawFiles,
+      now,
+    })
+  } catch {
+    // Complexity analysis is optional enrichment; never fail the sync over it.
   }
 
   // Persist CI check runs for the PR head sha (GET /commits/{ref}/check-runs).

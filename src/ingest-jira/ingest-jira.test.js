@@ -15,6 +15,7 @@
  */
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'bun:test'
+import { HttpResponse, http } from 'msw'
 import { setupServer } from 'msw/node'
 import { BunSqliteStore, migrate } from '../core/index.js'
 import { baseOrg, IDS, mockJira } from '../testkit/index.js'
@@ -27,6 +28,7 @@ import {
   parseChangelog,
   syncJira,
 } from './index.js'
+import { reportIssuePoints } from './sync.js'
 
 // ---------------------------------------------------------------------------
 // Test store factory
@@ -738,6 +740,23 @@ describe('sprint membership add-then-remove', () => {
     const storyEvents = events.filter((e) => e.issueId === IDS.issueStory1)
     expect(storyEvents.length).toBeGreaterThanOrEqual(1)
     expect(storyEvents[0]?.change).toBe('added')
+    // G4 regression: report-sourced membership now carries the committed points
+    // (from estimateStatistic) instead of null. story-1 is a 5-point issue.
+    expect(storyEvents.some((e) => e.pointsAtEvent === 5)).toBe(true)
+  })
+})
+
+describe('reportIssuePoints (Greenhopper sprint-report points extraction)', () => {
+  it('reads estimateStatistic, falls back to currentEstimateStatistic, else null', () => {
+    expect(reportIssuePoints({ estimateStatistic: { statFieldValue: { value: 8 } } })).toBe(8)
+    expect(reportIssuePoints({ currentEstimateStatistic: { statFieldValue: { value: 3 } } })).toBe(
+      3,
+    )
+    expect(reportIssuePoints({ id: 'x' })).toBeNull()
+    // Non-numeric (e.g. a string estimate field) must not leak through.
+    expect(
+      reportIssuePoints({ estimateStatistic: { statFieldValue: { value: 'NaN' } } }),
+    ).toBeNull()
   })
 })
 
@@ -780,6 +799,35 @@ describe('idempotent backfill', () => {
     const result2 = await syncJira(store, client, scope, 'backfill', NOW)
 
     expect(result1.issuesUpserted).toBe(result2.issuesUpserted)
+  })
+
+  it('surfaces a loud warning when the story-point field cannot be discovered', async () => {
+    const store = makeStore()
+    const client = makeClient()
+
+    // Project exposes no storyPointsFieldId property AND the field list has no
+    // story-point field → discovery returns null → agile metrics go dark.
+    server.use(
+      http.get('*/rest/api/3/project/:projectId', () =>
+        HttpResponse.json({
+          id: baseOrg.jiraProject.id,
+          key: baseOrg.jiraProject.key,
+          name: baseOrg.jiraProject.name,
+          properties: {},
+        }),
+      ),
+      http.get('*/rest/api/3/field', () => HttpResponse.json([])),
+    )
+
+    const scope = {
+      jiraCloudId: baseOrg.org.jiraCloudId,
+      projectKeys: [baseOrg.jiraProject.key],
+      boardIds: [IDS.boardId],
+    }
+    const result = await syncJira(store, client, scope, 'backfill', NOW)
+
+    // Regression: previously this failure was silent (all story_points=null).
+    expect(result.errors.some((e) => /story-point field not found/i.test(e))).toBe(true)
   })
 })
 

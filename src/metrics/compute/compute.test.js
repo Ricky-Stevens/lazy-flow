@@ -696,6 +696,74 @@ describe('computeMetric', () => {
     expect(r.formulaDoc.toLowerCase()).toContain('blame')
   })
 
+  it('code.complexity_delta → ok with REAL deltas once file complexity is ingested (G5)', async () => {
+    // pr-1 (in window) touched src/widget.ts. Seed its base+head complexity.
+    await store.upsertPrRef({
+      prId: IDS.pr1,
+      repoId: IDS.repoAlpha,
+      baseSha: 'base-sha',
+      headSha: 'head-sha',
+      updatedAt: NOW,
+    })
+    await store.upsertFileComplexity({
+      repoId: IDS.repoAlpha,
+      sha: 'base-sha',
+      path: 'src/widget.ts',
+      language: 'typescript',
+      loc: 40,
+      totalCyclomatic: 3,
+      functionCount: 1,
+      functions: [{ name: 'render', cyclomatic: 3, cognitive: 2 }],
+      computedAt: NOW,
+    })
+    await store.upsertFileComplexity({
+      repoId: IDS.repoAlpha,
+      sha: 'head-sha',
+      path: 'src/widget.ts',
+      language: 'typescript',
+      loc: 52,
+      totalCyclomatic: 6,
+      functionCount: 1,
+      functions: [{ name: 'render', cyclomatic: 6, cognitive: 5 }],
+      computedAt: NOW,
+    })
+
+    const r = await compute('code.complexity_delta')
+    expect(r.dataQuality).toBe('ok')
+    // render's cyclomatic rose 3 → 6 = +3.
+    expect(r.totalCyclomaticIncrease).toBe(3)
+  })
+
+  it('code.maintainability_index → ok once head file complexity is ingested (G5)', async () => {
+    await store.upsertPrRef({
+      prId: IDS.pr1,
+      repoId: IDS.repoAlpha,
+      baseSha: 'base-sha',
+      headSha: 'head-sha',
+      updatedAt: NOW,
+    })
+    await store.upsertFileComplexity({
+      repoId: IDS.repoAlpha,
+      sha: 'head-sha',
+      path: 'src/widget.ts',
+      language: 'typescript',
+      loc: 52,
+      totalCyclomatic: 6,
+      functionCount: 2,
+      functions: [
+        { name: 'render', cyclomatic: 4, cognitive: 3 },
+        { name: 'mount', cyclomatic: 2, cognitive: 1 },
+      ],
+      computedAt: NOW,
+    })
+
+    const r = await compute('code.maintainability_index')
+    expect(r.dataQuality).toBe('ok')
+    expect(r.value).not.toBeNull()
+    expect(r.value).toBeGreaterThanOrEqual(0)
+    expect(r.value).toBeLessThanOrEqual(100)
+  })
+
   it('pr.size → REAL median HALOC > 0 from ingested pr_files', async () => {
     // Merged PRs in window: pr-1 (HALOC 8), pr-2 (no files → size 0), pr-4 (HALOC 11).
     // Sorted sizes {0, 8, 11} → median 8 (odd count). This is the load-bearing

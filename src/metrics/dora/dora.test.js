@@ -316,6 +316,33 @@ describe('recoveryTime', () => {
     // Must not be NaN
     expect(Number.isNaN(result.value)).toBe(false)
   })
+
+  it('prefers REAL deployment recovery (failed→next-success) when deploy statuses exist', () => {
+    // A failed prod deploy recovered by the next successful prod deploy 1h later.
+    // A second failed deploy is recovered 2h later. Median = 1.5h.
+    const deploys = [
+      { id: 'd1', environment: 'production', status: 'failure', createdAt: '2024-03-01T10:00:00Z' },
+      { id: 'd2', environment: 'production', status: 'success', createdAt: '2024-03-01T11:00:00Z' },
+      { id: 'd3', environment: 'production', status: 'error', createdAt: '2024-03-02T10:00:00Z' },
+      { id: 'd4', environment: 'production', status: 'success', createdAt: '2024-03-02T12:00:00Z' },
+    ]
+    // Incidents present too, but the deployment signal takes precedence.
+    const result = recoveryTime.compute({ deploys, incidents }, AS_OF)
+    expect(result.recoverySource).toBe('deployment')
+    expect(result.sampleSize).toBe(2)
+    expect(result.p50Seconds).toBeCloseTo((3600 + 7200) / 2, 0)
+    expect(result.deployRecoveryP50Seconds).toBeCloseTo((3600 + 7200) / 2, 0)
+  })
+
+  it('falls back to incident recovery when no failed deployment is observed', () => {
+    // All deploys succeeded → no deployment-recovery sample → incident signal used.
+    const deploys = [
+      { id: 'd1', environment: 'production', status: 'success', createdAt: '2024-03-01T10:00:00Z' },
+    ]
+    const result = recoveryTime.compute({ deploys, incidents }, AS_OF)
+    expect(result.recoverySource).toBe('incident')
+    expect(result.p50Seconds).toBeCloseTo((3600 + 7200) / 2, 0)
+  })
 })
 
 // ---------------------------------------------------------------------------

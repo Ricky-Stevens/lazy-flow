@@ -322,19 +322,29 @@ function sprintHandlers() {
         }
       }
 
+      // Greenhopper report issues carry the points estimate per issue.
+      const toReportIssue = (i) => ({
+        id: i.id,
+        key: i.key,
+        estimateStatistic:
+          i.storyPoints !== null && i.storyPoints !== undefined
+            ? { statFieldValue: { value: i.storyPoints } }
+            : undefined,
+      })
+
       const completedIssues = baseOrg.jiraIssues
         .filter(
           (i) =>
             addedIssueIds.has(i.id) && !removedIssueIds.has(i.id) && i.statusCategory === 'done',
         )
-        .map((i) => ({ id: i.id, key: i.key }))
+        .map(toReportIssue)
 
       const incompleteIssues = baseOrg.jiraIssues
         .filter(
           (i) =>
             addedIssueIds.has(i.id) && !removedIssueIds.has(i.id) && i.statusCategory !== 'done',
         )
-        .map((i) => ({ id: i.id, key: i.key }))
+        .map(toReportIssue)
 
       const sprint = baseOrg.sprints.find((s) => s.id === sprintId)
 

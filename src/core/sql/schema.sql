@@ -1,6 +1,6 @@
 -- lazy-flow schema — SQLite dialect
 --
--- GENERATED REFERENCE: this file is regenerated from the migration in
+-- GENERATED REFERENCE: regenerated from the migration in
 -- src/core/migrate/migrations/ and is NOT executed at runtime. The
 -- migration runner is the source of truth; the live DDL is also exposed
 -- via the lazy-flow://schema MCP resource (read from sqlite_master).
@@ -10,9 +10,7 @@
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
--- ---------------------------------------------------------------------------
 -- Tables
--- ---------------------------------------------------------------------------
 
 CREATE TABLE ai_verdicts (
   id                      TEXT NOT NULL PRIMARY KEY,
@@ -100,6 +98,14 @@ CREATE TABLE commits (
   PRIMARY KEY (repo_id, sha)
 );
 
+CREATE TABLE deploy_incident_links (
+  deploy_id         TEXT NOT NULL REFERENCES deployments(id),
+  incident_issue_id TEXT NOT NULL REFERENCES issues(id),
+  link_type         TEXT NOT NULL CHECK (link_type IN ('proximity', 'explicit')),
+  linked_at         TEXT NOT NULL,
+  PRIMARY KEY (deploy_id, incident_issue_id)
+);
+
 CREATE TABLE deployments (
   id           TEXT NOT NULL PRIMARY KEY,
   repo_id      TEXT NOT NULL REFERENCES repositories(id),
@@ -111,6 +117,19 @@ CREATE TABLE deployments (
   source       TEXT NOT NULL CHECK (source IN ('deployments_api', 'release', 'workflow', 'merge_proxy')),
   raw          TEXT NOT NULL,
   updated_at   TEXT NOT NULL
+);
+
+CREATE TABLE file_complexity (
+  repo_id          TEXT    NOT NULL REFERENCES repositories(id),
+  sha              TEXT    NOT NULL,
+  path             TEXT    NOT NULL,
+  language         TEXT    NOT NULL,
+  loc              INTEGER NOT NULL,
+  total_cyclomatic INTEGER NOT NULL,
+  function_count   INTEGER NOT NULL,
+  functions        TEXT    NOT NULL,
+  computed_at      TEXT    NOT NULL,
+  PRIMARY KEY (repo_id, sha, path)
 );
 
 CREATE TABLE flow_state_models (
@@ -273,6 +292,14 @@ CREATE TABLE pr_issue_links (
   PRIMARY KEY (pr_id, issue_id, link_source)
 );
 
+CREATE TABLE pr_refs (
+  pr_id      TEXT NOT NULL PRIMARY KEY REFERENCES pull_requests(id),
+  repo_id    TEXT NOT NULL REFERENCES repositories(id),
+  base_sha   TEXT,
+  head_sha   TEXT,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE pull_requests (
   id                    TEXT    NOT NULL PRIMARY KEY,
   repo_id               TEXT    NOT NULL REFERENCES repositories(id),
@@ -416,9 +443,7 @@ CREATE TABLE workflows (
   updated_at   TEXT NOT NULL
 );
 
--- ---------------------------------------------------------------------------
 -- Indexes
--- ---------------------------------------------------------------------------
 
 CREATE INDEX idx_ai_verdicts_created_at ON ai_verdicts(created_at);
 CREATE INDEX idx_ai_verdicts_metric ON ai_verdicts(metric, created_at);
@@ -428,7 +453,10 @@ CREATE INDEX idx_candidate_matches_status ON candidate_matches(status);
 CREATE INDEX idx_check_runs_repo_head ON check_runs(repo_id, head_sha);
 CREATE INDEX idx_commit_authors_identity ON commit_authors(identity_id);
 CREATE INDEX idx_commits_authored_at ON commits(authored_at);
+CREATE INDEX idx_deploy_incident_links_deploy ON deploy_incident_links(deploy_id);
+CREATE INDEX idx_deploy_incident_links_incident ON deploy_incident_links(incident_issue_id);
 CREATE INDEX idx_deployments_repo_created ON deployments(repo_id, created_at);
+CREATE INDEX idx_file_complexity_repo_sha ON file_complexity(repo_id, sha);
 CREATE INDEX idx_flow_state_models_workflow ON flow_state_models(workflow_id, status_id);
 CREATE INDEX idx_identities_external ON identities(kind, external_id);
 CREATE INDEX idx_identities_person_id ON identities(person_id);
@@ -448,6 +476,7 @@ CREATE INDEX idx_metric_snapshots_scope ON metric_snapshots(scope_type, scope_id
 CREATE INDEX idx_pr_files_pr   ON pr_files(pr_id);
 CREATE INDEX idx_pr_files_repo ON pr_files(repo_id);
 CREATE INDEX idx_pr_issue_links_issue ON pr_issue_links(issue_id);
+CREATE INDEX idx_pr_refs_repo ON pr_refs(repo_id);
 CREATE INDEX idx_pull_requests_created_at ON pull_requests(created_at);
 CREATE INDEX idx_pull_requests_repo_id ON pull_requests(repo_id);
 CREATE INDEX idx_repositories_org_id ON repositories(org_id);

@@ -1,4 +1,4 @@
-import { linkIssues, resolveIdentities, stitchPersons } from '../core/index.js'
+import { linkDeployIncidents, linkIssues, resolveIdentities, stitchPersons } from '../core/index.js'
 
 import { syncGitHub } from '../ingest-github/index.js'
 
@@ -85,6 +85,19 @@ export async function runSync(
   const linkResult = await linkIssues(store, { now })
 
   // -------------------------------------------------------------------------
+  // 5b. Link deployments ↔ incidents (populate deploy_incident_links) for DORA
+  //     CFR / recovery / rework attribution + insight joins. Best-effort: a
+  //     failure here does not fail the sync (the metric engine derives its own
+  //     linkage independently).
+  // -------------------------------------------------------------------------
+  let deployIncidentLinks = { linksUpserted: 0 }
+  try {
+    deployIncidentLinks = await linkDeployIncidents(store, { now })
+  } catch (err) {
+    errors.push(`deploy-incident link: ${err instanceof Error ? err.message : String(err)}`)
+  }
+
+  // -------------------------------------------------------------------------
   // 6. Engine-version-bump re-derivation (SPEC §8.6).
   //    Runs AFTER raw sync (so freshly-synced rows feed the recompute) but is a
   //    no-op unless a stored snapshot carries a stale engine_version. Inverted
@@ -138,6 +151,7 @@ export async function runSync(
     linking: {
       linksUpserted: linkResult.linksUpserted,
       falsePositivesDropped: linkResult.falsePositivesDropped,
+      deployIncidentLinks: deployIncidentLinks.linksUpserted,
     },
     rederive,
     errors,

@@ -230,6 +230,17 @@ function deploymentsHandlers() {
       const bodies = repoDeploys.map((d) => JSON.parse(d.raw))
       return HttpResponse.json(bodies, { headers: rateLimitHeaders })
     }),
+    // Per-deployment status history — the real outcome lives here, not on the
+    // LIST. Newest-first: a single terminal status carrying the fixture's state.
+    http.get('https://api.github.com/repos/:owner/:repo/deployments/:id/statuses', ({ params }) => {
+      const { id } = params
+      const deploy = baseOrg.deployments.find((d) => d.id === id)
+      if (!deploy) return HttpResponse.json([], { headers: rateLimitHeaders })
+      return HttpResponse.json(
+        [{ state: deploy.status, created_at: deploy.finishedAt ?? deploy.createdAt }],
+        { headers: rateLimitHeaders },
+      )
+    }),
   ]
 }
 
@@ -245,6 +256,21 @@ function releasesHandlers() {
       if (!repoRecord) return new HttpResponse(null, { status: 404 })
       // Base dataset has no explicit releases
       return HttpResponse.json([], { headers: rateLimitHeaders })
+    }),
+  ]
+}
+
+// ---------------------------------------------------------------------------
+// REST — file contents (whole-file source at a ref, for complexity analysis)
+// ---------------------------------------------------------------------------
+
+function contentsHandlers() {
+  return [
+    // The base dataset ships no file-source fixtures, so contents 404 → the
+    // complexity ingester records nothing (honest). Tests that exercise the
+    // complexity path override this handler with real base64 source.
+    http.get('https://api.github.com/repos/:owner/:repo/contents/*', () => {
+      return new HttpResponse(null, { status: 404 })
     }),
   ]
 }
@@ -450,6 +476,7 @@ export function mockGitHub() {
     ...pullsHandlers(),
     ...deploymentsHandlers(),
     ...releasesHandlers(),
+    ...contentsHandlers(),
     ...checkRunsHandlers(),
     ...graphQLHandlers(),
   ]
