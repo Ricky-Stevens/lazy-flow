@@ -96,6 +96,11 @@ function buildViewModel(model) {
     blindSpots: model.blindSpots,
     prov: model.provenance,
     sections,
+    // The full report model, baked in as inert JSON so the file is fully
+    // self-contained (no DB link at view time) and Claude can re-compose
+    // charts/tables from the underlying numbers later. `<` is escaped so the
+    // payload can never break out of the <script> element.
+    reportDataJson: JSON.stringify(model).replace(/</g, '\\u003c'),
   }
 }
 
@@ -178,6 +183,7 @@ Engine <%= it.prov.engineVersion %> · trust: <%= it.prov.trustTier %> · data q
 <br>Published formulas, trust tiers, and AI contestability per the lazy-flow methodology. Generated locally; no data left this machine.
 </footer>
 </div>
+<script type="application/json" id="lazy-flow-report-data"><%~ it.reportDataJson %></script>
 </body>
 </html>`
 

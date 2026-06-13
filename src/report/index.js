@@ -26,14 +26,13 @@ export {
 } from './baseline/index.js'
 // Industry benchmarks (DORA)
 export { buildBenchmarkProvider, DORA_SOURCE } from './benchmark/index.js'
-// Charts (vega-lite → inline SVG)
+// Charts (d3 scale/shape → static inline SVG)
 
 export {
   CHART_CONFIG,
   cfdAreaChart,
   distributionBarChart,
   doraBandGaugeChart,
-  renderVegaLiteToSvg,
   sparklineChart,
   stackedBarChart,
   trendLineChart,
