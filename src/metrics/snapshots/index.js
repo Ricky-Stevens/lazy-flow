@@ -119,7 +119,12 @@ export async function computeSnapshotDay(opts, scopeType, scopeId, metricIds, da
       metric: metricId,
       day,
       value: result.value,
-      window: result.asOf,
+      // `window` is a rolling-window DESCRIPTOR (e.g. '30d'), not a timestamp.
+      // Using result.asOf here wrote the wall-clock time into the field, both
+      // breaking the documented schema (consumers expect '<n>d') and making the
+      // snapshot content depend on `now` instead of the data. Default to '1d'
+      // (single-day compute) when the caller doesn't declare a window.
+      window: opts.windowDays ? `${opts.windowDays}d` : '1d',
       trustTier: result.trustTier,
       dataQuality: result.dataQuality,
       engineVersion: ENGINE_VERSION,

@@ -41,8 +41,11 @@ function pivot(points, catKey, groupKey, valKey, categories, groups) {
 
 /** A time/period trend line. */
 export async function trendLineChart(opts) {
+  // Filter to FINITE values, not just non-null: undefined/NaN would slip past a
+  // `!== null` check, make d3min/d3max return undefined, and produce SVG paths
+  // with literal 'NaN' coordinates (a silently-blank chart).
   const values = opts.points
-    .filter((p) => p.value !== null)
+    .filter((p) => Number.isFinite(p.value))
     .map((p) => ({ label: p.label, value: p.value }))
   const alt = `${opts.title} trend — ${
     values.length === 0 ? 'no data' : values.map((v) => `${v.label}: ${fmtNum(v.value)}`).join('; ')
@@ -87,7 +90,10 @@ export async function trendLineChart(opts) {
 
 /** A compact, axis-less sparkline. */
 export async function sparklineChart(opts) {
-  const values = opts.points.filter((p) => p.value !== null).map((p, i) => ({ i, value: p.value }))
+  // Finite-only (see trendLineChart): guards d3min/d3max against undefined/NaN.
+  const values = opts.points
+    .filter((p) => Number.isFinite(p.value))
+    .map((p, i) => ({ i, value: p.value }))
   const alt = `${opts.title} sparkline — ${
     values.length === 0 ? 'no data' : values.map((v) => fmtNum(v.value)).join(', ')
   }`

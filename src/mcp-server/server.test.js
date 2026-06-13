@@ -356,6 +356,41 @@ describe('MCP server — reporting tools', () => {
     expect(sc.content).toContain('Monthly Delivery Report')
   })
 
+  it('generate_report refuses an out_path without a report extension (path-write guard)', async () => {
+    const { client, ctx } = await makeConnectedPair()
+    const today = new Date().toISOString().slice(0, 10)
+    await ctx.store.putSnapshot({
+      scopeType: 'team',
+      scopeId: 'platform',
+      metric: 'flow.cycle_time',
+      day: today,
+      value: 5,
+      window: '30d',
+      trustTier: 'deterministic',
+      dataQuality: 'ok',
+      engineVersion: ENGINE_VERSION,
+      ingestWatermarkVersion: '1',
+      coverageFingerprint: 'cov-1',
+      computedAt: `${today}T00:00:00.000Z`,
+      isStale: false,
+    })
+
+    // A poisoned out_path (no report extension) must be rejected BEFORE any
+    // write, so the tool can't be steered into overwriting e.g. a dotfile.
+    const result = await client.callTool({
+      name: 'generate_report',
+      arguments: {
+        preset: 'monthly:team',
+        scope: 'platform',
+        format: 'html',
+        out_path: '/tmp/lazyflow-test-pwned',
+      },
+    })
+    expect(result.isError).toBe(true)
+    const text = result.content?.map((c) => c.text).join(' ') ?? ''
+    expect(text).toContain('report extension')
+  })
+
   it('generate_report supports markdown + csv + json formats', async () => {
     const { client } = await makeConnectedPair()
     for (const format of ['markdown', 'csv', 'json']) {
@@ -489,6 +524,21 @@ describe('MCP server — tool: query_db', () => {
     const sc = result.structuredContent
     expect(typeof sc.error).toBe('string')
   })
+
+  it('allows a SELECT with a forbidden keyword inside a string literal (regression)', async () => {
+    const { client } = await makeConnectedPair()
+
+    // 'DELETE' and ';' appear only as DATA inside a string literal — the
+    // read-only guard used to scan the raw text and wrongly reject this.
+    const result = await client.callTool({
+      name: 'query_db',
+      arguments: { sql: "SELECT 'DELETE; DROP' AS note, 'a@b.com' AS email" },
+    })
+    const sc = result.structuredContent
+    expect(sc.error).toBeUndefined()
+    expect(sc.row_count).toBe(1)
+    expect(sc.rows[0]?.note).toBe('DELETE; DROP')
+  })
 })
 
 describe('MCP server — resources', () => {
@@ -545,5 +595,49 @@ describe('MCP server — run_sync (no clients configured)', () => {
     })
     const sc = result.structuredContent
     expect(sc.skipped).toBe(true)
+  })
+
+  it('syncs github-only without requiring a jira client (regression: Client unexpectedly null)', async () => {
+    // github IS configured, jira is NOT. Requesting sources=['github'] must run a
+    // github-only sync, not throw. Previously runSync required BOTH clients
+    // regardless of requested sources and threw "Client unexpectedly null".
+    const ctx = makeTestCtx()
+    // Minimal stub: no repos → syncGitHub is a clean no-op, so none of the other
+    // client methods are reached. Each is still present so a future code path
+    // change surfaces as a clear failure rather than an undefined-call crash.
+    const empty = async () => []
+    ctx.githubClient = {
+      listOrgRepos: empty,
+      listCommits: empty,
+      getCommitDetail: async () => null,
+      listPullRequests: empty,
+      listPullRequestsUpdatedSince: empty,
+      listReviews: empty,
+      listReviewComments: empty,
+      listPrFiles: empty,
+      listCheckRuns: empty,
+      listDeployments: empty,
+      listReleases: empty,
+    }
+    ctx.jiraClient = null
+
+    const server = createServer(ctx)
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+    await server.connect(serverTransport)
+    const client = new Client({ name: 'test-client', version: '0.0.0' })
+    await client.connect(clientTransport)
+
+    const result = await client.callTool({
+      name: 'run_sync',
+      arguments: { sources: ['github'] },
+    })
+
+    expect(result.isError).toBeFalsy()
+    const sc = result.structuredContent
+    expect(sc).toBeDefined()
+    expect(sc.skipped).toBe(false)
+    // jira was skipped → empty jira results, no jira error.
+    expect(sc.jira.issues_upserted).toBe(0)
+    expect(sc.jira.errors).toEqual([])
   })
 })

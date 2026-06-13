@@ -501,6 +501,52 @@ describe('stitchPersons — distinct-humans-same-name', () => {
     expect(matchEntry?.reason).toBe('local_part_name')
     expect(matchEntry?.status).toBe('pending')
   })
+
+  it('queues identical single-word names for fuzzy review (regression: mononyms)', async () => {
+    const store = freshStore()
+    // Person anchored to a single-word-named identity.
+    await store.upsertPerson({
+      id: 'person-madonna',
+      displayName: 'Madonna',
+      primaryAccountRef: 'jira:madonna-acct',
+      updatedAt: NOW,
+    })
+    await store.upsertIdentity({
+      id: 'commit_email:madonna1@label.com',
+      personId: 'person-madonna',
+      kind: 'commit_email',
+      externalId: 'madonna1@label.com',
+      isBot: false,
+      confidence: 1,
+      raw: '{"email":"madonna1@label.com","name":"Madonna"}',
+      updatedAt: NOW,
+    })
+    // A second, unlinked single-word "Madonna" with a DIFFERENT local-part, so
+    // only the fuzzy-name tier (2d) — not the local-part tier (2c) — can match it.
+    await store.upsertIdentity({
+      id: 'commit_email:madonna2@other.com',
+      personId: null,
+      kind: 'commit_email',
+      externalId: 'madonna2@other.com',
+      isBot: false,
+      confidence: 1,
+      raw: '{"email":"madonna2@other.com","name":"Madonna"}',
+      updatedAt: NOW,
+    })
+
+    await stitchPersons(store, { now: NOW })
+
+    const queue = await listCandidateMatches(store, { status: 'pending' })
+    const m = queue.find(
+      (q) =>
+        q.identityIdA === 'commit_email:madonna2@other.com' ||
+        q.identityIdB === 'commit_email:madonna2@other.com',
+    )
+    // Regression: namesAreSimilar required >= 2 shared tokens, so single-word
+    // names could never reach the fuzzy-name review queue at all.
+    expect(m).toBeDefined()
+    expect(m?.reason).toBe('fuzzy_name')
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -591,6 +637,40 @@ describe('stitchPersons — verified email merge', () => {
       '999002+devuser@users.noreply.github.com',
     )
     expect(noreply?.personId).toBeNull()
+  })
+
+  it('autoMerged counts only real merges, not Pass-1 person creation (regression)', async () => {
+    const store = freshStore()
+
+    // Two account-anchored identities with no person yet and no overlapping
+    // emails — Pass 1 creates a person for each, Pass 2/3 find nothing to merge.
+    await store.upsertIdentity({
+      id: 'github_login:alice',
+      personId: null,
+      kind: 'github_login',
+      externalId: 'alice',
+      isBot: false,
+      confidence: 1,
+      raw: '{"login":"alice","id":1}',
+      updatedAt: NOW,
+    })
+    await store.upsertIdentity({
+      id: 'jira_account:acct-2',
+      personId: null,
+      kind: 'jira_account',
+      externalId: 'acct-2',
+      isBot: false,
+      confidence: 1,
+      raw: '{"accountId":"acct-2","emailAddress":"bob@corp.com"}',
+      updatedAt: NOW,
+    })
+
+    const result = await stitchPersons(store, { now: NOW })
+
+    expect(result.personsCreated).toBe(2)
+    // No verified-email links exist, so NO auto-merge occurred. Previously this
+    // was wrongly reported as 2 because Pass-1 creation incremented autoMerged.
+    expect(result.autoMerged).toBe(0)
   })
 })
 
@@ -771,6 +851,58 @@ describe('CandidateMatch queue API', () => {
     const matchRecord = await store.getCandidateMatch('match-003')
     expect(matchRecord).not.toBeNull()
     expect(matchRecord?.status).toBe('confirmed')
+  })
+
+  it('unmergeIdentities throws when a referenced identity is missing (regression)', async () => {
+    const store = freshStore()
+
+    await store.upsertPerson({
+      id: 'person-y',
+      displayName: 'Dev Y',
+      primaryAccountRef: 'gh:300002',
+      updatedAt: NOW,
+    })
+    await store.upsertIdentity({
+      id: 'github_login:dev-y',
+      personId: 'person-y',
+      kind: 'github_login',
+      externalId: 'dev-y',
+      isBot: false,
+      confidence: 1,
+      raw: '{"login":"dev-y","id":300002}',
+      updatedAt: NOW,
+    })
+    await store.upsertIdentity({
+      id: 'commit_email:dev-y@old.com',
+      personId: null,
+      kind: 'commit_email',
+      externalId: 'dev-y@old.com',
+      isBot: false,
+      confidence: 1,
+      raw: '{"email":"dev-y@old.com"}',
+      updatedAt: NOW,
+    })
+    await store.appendCandidateMatch({
+      id: 'match-004',
+      identityIdA: 'github_login:dev-y',
+      identityIdB: 'commit_email:dev-y@old.com',
+      reason: 'local_part_name',
+      confidence: 0.8,
+      status: 'pending',
+      decidedAt: null,
+      decidedBy: null,
+      createdAt: NOW,
+      updatedAt: NOW,
+    })
+    await confirmCandidateMatch(store, 'match-004', 'admin', NOW)
+
+    // Simulate data inconsistency: the secondary identity vanished from the DB.
+    // Previously unmergeIdentities silently de-linked the WRONG identity
+    // (defaulting to identityB); now it must fail loudly instead of corrupting
+    // the person graph.
+    store.db.run('DELETE FROM identities WHERE id = ?', 'commit_email:dev-y@old.com')
+
+    await expect(unmergeIdentities(store, 'match-004', NOW)).rejects.toThrow(/identity not found/i)
   })
 
   it('listCandidateMatches filters by status', async () => {

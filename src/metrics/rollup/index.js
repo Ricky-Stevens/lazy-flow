@@ -33,7 +33,15 @@ export function computeRollupDistribution(values) {
     return { min: null, p25: null, median: null, p75: null, p90: null, max: null, count: 0 }
   }
 
-  const sorted = [...values].sort((a, b) => a - b)
+  // Filter non-finite values BEFORE sorting so min/max, percentiles and count
+  // are all derived from the same clean set (percentile() filters internally,
+  // so an unfiltered array here would make min/max inconsistent with the
+  // percentiles — a determinism violation per SPEC §8.6). Mirrors quantiles().
+  const clean = values.filter(Number.isFinite)
+  if (clean.length === 0) {
+    return { min: null, p25: null, median: null, p75: null, p90: null, max: null, count: 0 }
+  }
+  const sorted = [...clean].sort((a, b) => a - b)
 
   return {
     min: sorted[0] ?? null,
@@ -42,7 +50,7 @@ export function computeRollupDistribution(values) {
     p75: percentile(sorted, 0.75),
     p90: percentile(sorted, 0.9),
     max: sorted[sorted.length - 1] ?? null,
-    count: values.length,
+    count: clean.length,
   }
 }
 

@@ -482,10 +482,15 @@ function registerRunSyncTool(server, ctx) {
       const jiraMode = syncMode === 'full' ? 'backfill' : 'incremental'
       const ghMode = syncMode === 'full' ? 'backfill' : 'incremental'
 
-      // Both clients are guaranteed non-null at this point — we checked above.
-      const ghClient = ctx.githubClient
-      const jrClient = ctx.jiraClient
-      if (!ghClient || !jrClient) throw new Error('Client unexpectedly null')
+      // Honor the requested `sources`: pass only the clients for the sources the
+      // caller asked to sync, null for the rest. Any *requested* source was
+      // already validated as configured above (returning skipped=true otherwise),
+      // so a requested source always has a non-null client here. A non-requested
+      // source's client is passed as null and skipped inside runSync — this is
+      // what lets a single-source sync (e.g. github-only on a github-only install)
+      // run without requiring the other source's token to be configured.
+      const ghClient = syncSources.includes('github') ? ctx.githubClient : null
+      const jrClient = syncSources.includes('jira') ? ctx.jiraClient : null
 
       const result = await runSync(
         ctx.store,
@@ -629,8 +634,16 @@ async function stalenessCheck(ctx) {
     if (result.warnResources.length > 0)
       return { warning: 'Sync data may be outdated', refuse: false }
     return { refuse: false }
-  } catch {
-    return { refuse: false }
+  } catch (err) {
+    // The freshness check itself failed (e.g. DB locked/corrupt). Do NOT silently
+    // pass it off as fresh — surface a warning so the caller knows freshness is
+    // unverified. We do not refuse outright: a transient diagnostic failure
+    // should not block all reporting, but it must not be invisible either.
+    const msg = err instanceof Error ? err.message : String(err)
+    return {
+      warning: `Sync freshness check failed (${msg}) — data freshness unverified`,
+      refuse: false,
+    }
   }
 }
 
@@ -1067,6 +1080,48 @@ function stripSqlComments(sql) {
     .trim()
 }
 
+/**
+ * Blank out the CONTENTS of string literals and quoted identifiers (length is
+ * preserved; delimiters are kept) so the keyword/semicolon read-only checks
+ * scan only real SQL, not data. Without this, a legitimate read query like
+ * `SELECT * WHERE name = 'DELETE'` or `... LIKE '%;%'` is wrongly rejected.
+ * Operates on already-comment-stripped SQL. SQLite escapes a quote by doubling
+ * it ('' / "" / ``), which is handled by staying inside the quoted run.
+ * Masking only ever HIDES characters from the scan, so it can never let a real
+ * write keyword/extra statement that sits OUTSIDE quotes slip through.
+ */
+function maskSqlLiterals(sql) {
+  let out = ''
+  let quote = null // active closing delimiter: "'", '"', '`', or ']'
+  for (let i = 0; i < sql.length; i++) {
+    const ch = sql[i]
+    if (quote) {
+      if (ch === quote) {
+        // A doubled delimiter inside '..', ".." or `..` is an escaped literal
+        // quote — stay inside and mask both characters.
+        if (quote !== ']' && sql[i + 1] === quote) {
+          out += '  '
+          i++
+        } else {
+          quote = null
+          out += ch
+        }
+      } else {
+        out += ' '
+      }
+    } else if (ch === "'" || ch === '"' || ch === '`') {
+      quote = ch
+      out += ch
+    } else if (ch === '[') {
+      quote = ']'
+      out += ch
+    } else {
+      out += ch
+    }
+  }
+  return out
+}
+
 /** Thrown when a query_db request fails validation; message is safe to return. */
 class QueryDbError extends Error {}
 
@@ -1080,15 +1135,22 @@ function assertReadOnlyQuery(sql) {
     throw new QueryDbError('Empty query after stripping comments.')
   }
 
+  // Run the structural checks against a copy with string-literal/identifier
+  // CONTENTS blanked out, so keywords/semicolons that appear only inside data
+  // (e.g. `WHERE name = 'DELETE'`) don't trip the guard. Real keywords and
+  // statement separators outside quotes are untouched. Length is preserved, so
+  // the semicolon index still lines up with the original.
+  const masked = maskSqlLiterals(stripped)
+
   // Reject multiple statements: a ';' is only allowed as the final character.
-  const semicolonIdx = stripped.indexOf(';')
-  if (semicolonIdx !== -1 && semicolonIdx !== stripped.length - 1) {
+  const semicolonIdx = masked.indexOf(';')
+  if (semicolonIdx !== -1 && semicolonIdx !== masked.length - 1) {
     throw new QueryDbError(
       'Multiple statements are not allowed — submit a single SELECT/WITH query.',
     )
   }
 
-  const firstKeywordMatch = stripped.match(/^([a-zA-Z]+)/)
+  const firstKeywordMatch = masked.match(/^([a-zA-Z]+)/)
   const firstKeyword = firstKeywordMatch?.[1]?.toUpperCase() ?? ''
   if (firstKeyword !== 'SELECT' && firstKeyword !== 'WITH') {
     throw new QueryDbError(
@@ -1098,7 +1160,7 @@ function assertReadOnlyQuery(sql) {
 
   // Reject any forbidden write/DDL/PRAGMA keyword anywhere (word-boundary match).
   // This blocks e.g. `WITH x AS (...) DELETE ...` and `PRAGMA writable_schema`.
-  const upper = stripped.toUpperCase()
+  const upper = masked.toUpperCase()
   for (const kw of FORBIDDEN_SQL_KEYWORDS) {
     if (new RegExp(`\\b${kw}\\b`).test(upper)) {
       throw new QueryDbError(`Disallowed keyword "${kw}" — query_db is read-only.`)
@@ -1440,6 +1502,23 @@ function registerGenerateReportTool(server, ctx) {
 
       let written = null
       if (out_path !== undefined) {
+        // Guard the write target. This tool runs locally as the user, but it is
+        // driven by an LLM, so a poisoned prompt could try to make it overwrite an
+        // arbitrary file (e.g. ~/.bashrc, an SSH key) with attacker-chosen content.
+        // A report writer should only ever write a report file: reject NUL bytes
+        // and require a known report extension. This blocks dotfiles/system files
+        // (no report extension) while leaving the legitimate "write my report
+        // anywhere" use case intact.
+        if (out_path.includes('\0')) {
+          throw new Error('out_path must not contain NUL bytes')
+        }
+        const ALLOWED_REPORT_EXTS = ['.html', '.htm', '.md', '.markdown', '.csv', '.json']
+        const lower = out_path.toLowerCase()
+        if (!ALLOWED_REPORT_EXTS.some((ext) => lower.endsWith(ext))) {
+          throw new Error(
+            `out_path must end with a report extension (${ALLOWED_REPORT_EXTS.join(', ')}) — refusing to write to "${out_path}"`,
+          )
+        }
         // Bun.write — recommended file-write API; creates parent dirs as needed.
         await Bun.write(out_path, res.content)
         written = out_path

@@ -46,12 +46,19 @@ export async function runSync(
   // Pass the orchestrator's `now` so GitHub, Jira and the full-cycle watermark
   // all stamp one coherent timestamp for the cycle (and so deterministic
   // replays/tests that pin options.now also pin GitHub freshness).
-  const ghResult = await syncGitHub(store, githubClient, githubScope, githubMode, now)
+  // A null client means the caller did not request (or has not configured) that
+  // source — skip its sync and return empty results rather than crashing. The
+  // downstream identity/linking passes still run over whatever is already stored.
+  const ghResult = githubClient
+    ? await syncGitHub(store, githubClient, githubScope, githubMode, now)
+    : { org: githubScope.org ?? '', repos: [], mode: githubMode }
 
   // -------------------------------------------------------------------------
   // 2. Jira sync
   // -------------------------------------------------------------------------
-  const jiraResult = await syncJira(store, jiraClient, jiraScope, jiraMode, now)
+  const jiraResult = jiraClient
+    ? await syncJira(store, jiraClient, jiraScope, jiraMode, now)
+    : { projectsProcessed: [], issuesUpserted: 0, transitionsAppended: 0, errors: [] }
   if (jiraResult.errors.length > 0) {
     errors.push(...jiraResult.errors.map((e) => `jira: ${e}`))
   }

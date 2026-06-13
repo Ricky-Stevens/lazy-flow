@@ -56,6 +56,17 @@ export async function unmergeIdentities(store, matchId, now) {
   const identityA = identities.find((id) => id.id === match.identityIdA)
   const identityB = identities.find((id) => id.id === match.identityIdB)
 
+  // Both identities must still exist. Without this guard, a missing identityA
+  // silently falls through to de-linking identityB (the default) — corrupting
+  // the person graph by un-linking the wrong identity. Fail loudly instead.
+  if (!identityA || !identityB) {
+    throw new Error(
+      `Cannot un-merge ${matchId}: identity not found ` +
+        `(identityIdA=${match.identityIdA} found=${!!identityA}, ` +
+        `identityIdB=${match.identityIdB} found=${!!identityB})`,
+    )
+  }
+
   // Determine which to de-link: prefer to de-link the commit_email (less-anchored).
   // Anchor strength order (highest first): github_login = jira_account > commit_email.
   function anchorStrength(identity) {
@@ -63,17 +74,13 @@ export async function unmergeIdentities(store, matchId, now) {
     return 1
   }
 
-  let toDelink = identityB // default: de-link the lexicographically-second one
-  if (identityA && identityB) {
-    if (anchorStrength(identityA) > anchorStrength(identityB)) {
-      toDelink = identityB
-    } else if (anchorStrength(identityB) > anchorStrength(identityA)) {
-      toDelink = identityA
-    }
-    // If equal strength, keep default (identityB)
+  // Default: de-link the lexicographically-second one (identityB). If one side
+  // is more strongly anchored, keep it and de-link the weaker side instead.
+  let toDelink = identityB
+  if (anchorStrength(identityB) > anchorStrength(identityA)) {
+    toDelink = identityA
   }
+  // If equal strength, keep default (identityB).
 
-  if (toDelink) {
-    await store.upsertIdentity({ ...toDelink, personId: null, updatedAt })
-  }
+  await store.upsertIdentity({ ...toDelink, personId: null, updatedAt })
 }

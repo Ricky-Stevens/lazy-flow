@@ -118,8 +118,10 @@ async function syncRepo(store, client, repo, mode, now) {
   // is re-captured rather than skipped forever — GitHub's `since` filters on
   // committer date, so a watermark with no margin permanently drops them.
   let since
+  let priorCommitWatermark = null
   if (mode === 'incremental') {
     const cursor = await store.getSyncState('github', 'commits', repoId)
+    priorCommitWatermark = cursor?.watermarkAt ?? null
     since = cursor?.watermarkAt
       ? subtractMinutes(cursor.watermarkAt, INCREMENTAL_OVERLAP_MINUTES)
       : undefined
@@ -212,18 +214,31 @@ async function syncRepo(store, client, repo, mode, now) {
   })
 
   // Persist commits watermark anchored on the max committer date seen (with the
-  // overlap margin applied on the next read), falling back to local now only
-  // when no commits were processed.
+  // overlap margin applied on the next read). When NO commits were processed
+  // (e.g. a transient empty list), keep the PRIOR watermark rather than jumping
+  // to local now — advancing past unseen commits would skip them forever, since
+  // GitHub's `since` filter would exclude them on the next incremental run.
   await store.putSyncState(
-    buildSyncState('github', 'commits', repoId, null, maxCommitAt ?? now, now, 'idle', null),
+    buildSyncState(
+      'github',
+      'commits',
+      repoId,
+      null,
+      maxCommitAt ?? priorCommitWatermark ?? now,
+      now,
+      'idle',
+      null,
+    ),
   )
 
   // ---- Pull requests ----
   // Incremental mode uses the prs watermark to fetch only changed PRs (and stop
   // pagination early) instead of re-paginating the entire PR history each cycle.
   let prsSince
+  let priorPrWatermark = null
   if (mode === 'incremental') {
     const prCursor = await store.getSyncState('github', 'prs', repoId)
+    priorPrWatermark = prCursor?.watermarkAt ?? null
     prsSince = prCursor?.watermarkAt
       ? subtractMinutes(prCursor.watermarkAt, INCREMENTAL_OVERLAP_MINUTES)
       : undefined
@@ -241,11 +256,24 @@ async function syncRepo(store, client, repo, mode, now) {
     )
   }
 
+  // Keep the prior watermark when no PRs were processed (see commits rationale).
   await store.putSyncState(
-    buildSyncState('github', 'prs', repoId, null, maxPrUpdatedAt ?? now, now, 'idle', null),
+    buildSyncState(
+      'github',
+      'prs',
+      repoId,
+      null,
+      maxPrUpdatedAt ?? priorPrWatermark ?? now,
+      now,
+      'idle',
+      null,
+    ),
   )
 
   // ---- Deployments (priority chain D9) ----
+  const deployCursor =
+    mode === 'incremental' ? await store.getSyncState('github', 'deployments', repoId) : null
+  const priorDeployWatermark = deployCursor?.watermarkAt ?? null
   const rawDeploys = await client.listDeployments(owner, name)
   // Anchor the deployments watermark on the max server-provided updated_at.
   let maxDeployUpdatedAt = null
@@ -285,7 +313,7 @@ async function syncRepo(store, client, repo, mode, now) {
       'deployments',
       repoId,
       null,
-      maxDeployUpdatedAt ?? now,
+      maxDeployUpdatedAt ?? priorDeployWatermark ?? now,
       now,
       'idle',
       null,

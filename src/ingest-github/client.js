@@ -180,7 +180,16 @@ export class GitHubClient {
         throw new Error(`GitHub REST ${response.status}: ${url}`)
       }
 
-      const body = await response.json()
+      // A 200 with a malformed body must not crash the whole sync with a bare
+      // SyntaxError (syncGitHub has no try/catch); surface it as an API error.
+      let body
+      try {
+        body = await response.json()
+      } catch (err) {
+        throw new Error(
+          `GitHub REST invalid JSON from ${url}: ${err instanceof Error ? err.message : String(err)}`,
+        )
+      }
       return { body, response }
     }
   }
@@ -370,7 +379,14 @@ export class GitHubClient {
       throw new Error(`GitHub GraphQL HTTP ${response.status}`)
     }
 
-    const json = await response.json()
+    let json
+    try {
+      json = await response.json()
+    } catch (err) {
+      throw new Error(
+        `GitHub GraphQL invalid JSON: ${err instanceof Error ? err.message : String(err)}`,
+      )
+    }
 
     if (json.errors && json.errors.length > 0) {
       throw new Error(`GitHub GraphQL error: ${json.errors[0]?.message ?? 'unknown'}`)

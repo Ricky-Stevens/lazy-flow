@@ -175,6 +175,43 @@ describe('computeSnapshotDay — basic write', () => {
     expect(snapshots[0]?.value).toBe(42)
     expect(snapshots[0]?.engineVersion).toBe(ENGINE_VERSION)
     expect(snapshots[0]?.isStale).toBe(false)
+    // `window` is a rolling-window descriptor, NOT a wall-clock timestamp.
+    // Regression: it used to be set to result.asOf (a timestamp), which both
+    // broke the schema and made snapshot content depend on `now`.
+    expect(snapshots[0]?.window).toBe('1d')
+  })
+
+  it('writes the declared windowDays as the window descriptor', async () => {
+    const store = makeStore()
+    await store.putSyncState({
+      source: 'github',
+      resource: 'pulls',
+      scopeId: 'team-win',
+      cursor: null,
+      watermarkAt: '2024-05-30T00:00:00Z',
+      lastRunAt: NOW,
+      status: 'idle',
+      error: null,
+    })
+
+    const opts = { store, now: '2024-05-31T00:00:00Z', windowDays: 30 }
+    await computeSnapshotDay(
+      opts,
+      'team',
+      'team-win',
+      ['flow.throughput'],
+      '2024-05-29',
+      makeComputeFn(),
+    )
+
+    const snapshots = await store.getSnapshots(
+      'team',
+      'team-win',
+      'flow.throughput',
+      '2024-05-29',
+      '2024-05-29',
+    )
+    expect(snapshots[0]?.window).toBe('30d')
   })
 
   it('idempotently upserts on the same watermark version', async () => {

@@ -76,8 +76,14 @@ function normaliseName(name) {
 }
 
 /**
- * Simple name similarity check: returns true if normalised names share
- * at least 2 tokens (first/last name components).
+ * Simple name similarity check for the Tier 2d human-review queue.
+ *
+ * Multi-word names need >= 2 shared tokens, so "John Smith" vs "John Doe"
+ * (one shared token) do NOT match. But a mononym (single-token name on either
+ * side) can never reach 2 shared tokens, so requiring 2 made identical
+ * single-word names (e.g. "Madonna" vs "Madonna") never match at all. For those
+ * we require >= 1 shared token instead — these only land in the review queue,
+ * never an auto-merge, so a human still confirms.
  */
 function namesAreSimilar(a, b) {
   const tokensA = new Set(normaliseName(a).split(' ').filter(Boolean))
@@ -86,8 +92,7 @@ function namesAreSimilar(a, b) {
   for (const t of tokensA) {
     if (tokensB.has(t)) shared++
   }
-  // Require at least 2 shared tokens to avoid single-word collisions
-  return shared >= 2
+  return shared >= 2 || (shared >= 1 && (tokensA.size === 1 || tokensB.size === 1))
 }
 
 /**
@@ -170,7 +175,9 @@ export async function stitchPersons(store, options = {}) {
 
       await store.upsertIdentity({ ...identity, personId: person.id, updatedAt: now })
       personIdOf.set(identity.id, person.id)
-      autoMerged++
+      // NOT an auto-merge: this is the initial creation+linking of a person for
+      // an account-anchored identity. autoMerged counts only Pass 2/3 merges of a
+      // commit_email/github_login into an *existing* person via verified email.
     }
 
     // ------------------------------------------------------------------------

@@ -130,8 +130,8 @@ export function computePerIssueEfficiency(
     issueId: issue.id,
     issueType: issue.type,
     efficiency,
-    activeSeconds: activeMs / 1000,
-    waitSeconds: waitMs / 1000,
+    activeSeconds: safeRatio(activeMs, 1000) ?? 0,
+    waitSeconds: safeRatio(waitMs, 1000) ?? 0,
     isZombie,
   }
 }

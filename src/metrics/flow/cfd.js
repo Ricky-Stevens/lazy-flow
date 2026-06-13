@@ -59,6 +59,18 @@ export const cfd = {
       }
     }
 
+    // Pre-parse and sort each issue's transitions ONCE (ascending by time). The
+    // per-day loop below then does a cheap linear scan instead of re-filtering
+    // and re-sorting every issue's transitions on every single day (the old code
+    // even sorted a second time in the no-transitions-yet branch).
+    const preparedIssues = inputs.issues.map((issue) => ({
+      issue,
+      createdMs: new Date(issue.createdAt).getTime(),
+      sorted: issue.transitions
+        .map((t) => ({ ms: new Date(t.transitionedAt).getTime(), t }))
+        .sort((a, b) => a.ms - b.ms),
+    }))
+
     // For each issue, determine what status it was in at end of each day.
     // We do this by finding the latest transition <= end-of-day.
     const cfdEntries = []
@@ -68,31 +80,24 @@ export const cfd = {
       const byStatus = {}
       const byFlowState = { new: 0, active: 0, wait: 0, done: 0 }
 
-      for (const issue of inputs.issues) {
-        // Find the most recent transition <= end-of-day
-        const applicableTransitions = issue.transitions
-          .filter((t) => new Date(t.transitionedAt).getTime() <= endOfDayMs)
-          .sort(
-            (a, b) => new Date(a.transitionedAt).getTime() - new Date(b.transitionedAt).getTime(),
-          )
-
+      for (const { issue, createdMs, sorted } of preparedIssues) {
         // Only count issues that existed by end of day
-        if (new Date(issue.createdAt).getTime() > endOfDayMs) continue
+        if (createdMs > endOfDayMs) continue
 
-        const statusId =
-          applicableTransitions.length > 0
-            ? (applicableTransitions[applicableTransitions.length - 1]?.toStatusId ??
-              issue.currentStatusId)
-            : // Issue existed but no transitions yet → use first transition's fromStatusId
-              // or currentStatusId as initial
-              issue.transitions.length > 0
-              ? (issue.transitions
-                  .slice()
-                  .sort(
-                    (a, b) =>
-                      new Date(a.transitionedAt).getTime() - new Date(b.transitionedAt).getTime(),
-                  )[0]?.fromStatusId ?? issue.currentStatusId)
-              : issue.currentStatusId
+        // Most recent transition <= end-of-day (sorted ascending → last match wins).
+        let latest = null
+        for (const e of sorted) {
+          if (e.ms <= endOfDayMs) latest = e.t
+          else break
+        }
+
+        const statusId = latest
+          ? (latest.toStatusId ?? issue.currentStatusId)
+          : // Issue existed but no transitions yet → use first transition's
+            // fromStatusId or currentStatusId as initial.
+            sorted.length > 0
+            ? (sorted[0].t.fromStatusId ?? issue.currentStatusId)
+            : issue.currentStatusId
 
         byStatus[statusId] = (byStatus[statusId] ?? 0) + 1
 

@@ -384,3 +384,41 @@ describe('deployment source', () => {
     expect(betaDeployments.some((d) => d.id === IDS.deploy2)).toBe(true)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Watermark advancement on empty result sets (data-loss guard)
+// ---------------------------------------------------------------------------
+
+describe('watermark advancement on empty result', () => {
+  it('preserves the prior commits watermark when an incremental run returns no commits', async () => {
+    const store = makeStore()
+    const SEEDED = '2024-01-01T00:00:00.000Z'
+    const NOW = '2024-06-01T00:00:00.000Z'
+
+    // Seed an existing commits watermark for one repo.
+    await store.putSyncState({
+      source: 'github',
+      resource: 'commits',
+      scopeId: SYNCED_REPO_ALPHA,
+      cursor: null,
+      watermarkAt: SEEDED,
+      lastRunAt: SEEDED,
+      status: 'idle',
+      error: null,
+    })
+
+    // Force the commits LIST endpoint to return empty for every repo (simulating
+    // a transient empty response while the rest of the API works).
+    server.use(
+      http.get('https://api.github.com/repos/:owner/:repo/commits', () => HttpResponse.json([])),
+    )
+
+    await syncGitHub(store, makeClient(), scope, 'incremental', NOW)
+
+    const cursor = await store.getSyncState('github', 'commits', SYNCED_REPO_ALPHA)
+    // Regression: an empty list used to advance the watermark to `now`, which
+    // would permanently skip any commits the API transiently omitted (the next
+    // `since` filter excludes them). It must stay at the prior watermark.
+    expect(cursor?.watermarkAt).toBe(SEEDED)
+  })
+})

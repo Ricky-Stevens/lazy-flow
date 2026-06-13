@@ -31,6 +31,39 @@ describe('chart builders', () => {
     expect(c.alt).toContain('no data')
   })
 
+  it('never emits NaN coordinates when values are non-finite (regression)', async () => {
+    // undefined / NaN slip past a `!== null` filter and make d3min/d3max return
+    // undefined → literal 'NaN' in the SVG path (a silently-blank chart).
+    const mixed = await trendLineChart({
+      title: 'Cycle time',
+      points: [
+        { label: 'Mar', value: Number.NaN },
+        { label: 'Apr', value: undefined },
+        { label: 'May', value: 6 },
+      ],
+    })
+    expect(mixed.svg).not.toContain('NaN')
+
+    // All non-finite → behaves like no-data (empty svg), never a NaN path.
+    const allBad = await trendLineChart({
+      title: 'Cycle time',
+      points: [
+        { label: 'a', value: Number.NaN },
+        { label: 'b', value: undefined },
+      ],
+    })
+    expect(allBad.svg).toBe('')
+
+    const spark = await sparklineChart({
+      title: 'Throughput',
+      points: [
+        { label: 'a', value: undefined },
+        { label: 'b', value: 3 },
+      ],
+    })
+    expect(spark.svg).not.toContain('NaN')
+  })
+
   it('sparklineChart renders compact SVG', async () => {
     const c = await sparklineChart({
       title: 'Throughput',

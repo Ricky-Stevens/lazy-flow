@@ -347,7 +347,7 @@ export class BunSqliteStore {
       params.push(until)
     }
     sql += ` ORDER BY authored_at ASC`
-    const rows = this.db.prepare(sql).all(...params)
+    const rows = this.stmt(sql).all(...params)
     return rows.map((r) => ({
       repoId: String(r.repo_id),
       sha: String(r.sha),
@@ -467,7 +467,7 @@ export class BunSqliteStore {
       params.push(until)
     }
     sql += ` ORDER BY created_at ASC`
-    const rows = this.db.prepare(sql).all(...params)
+    const rows = this.stmt(sql).all(...params)
     return rows.map((r) => this._rowToPullRequest(r))
   }
 
@@ -552,7 +552,7 @@ export class BunSqliteStore {
       params.push(until)
     }
     sql += ` ORDER BY f.pr_id ASC, f.path ASC`
-    const rows = this.db.prepare(sql).all(...params)
+    const rows = this.stmt(sql).all(...params)
     return rows.map((r) => this._rowToPrFile(r))
   }
 
@@ -693,7 +693,7 @@ export class BunSqliteStore {
       sql += ` AND head_sha = ?`
       params.push(headSha)
     }
-    const rows = this.db.prepare(sql).all(...params)
+    const rows = this.stmt(sql).all(...params)
     return rows.map((r) => ({
       nodeId: String(r.node_id),
       repoId: String(r.repo_id),
@@ -749,7 +749,7 @@ export class BunSqliteStore {
       params.push(until)
     }
     sql += ` ORDER BY created_at ASC`
-    const rows = this.db.prepare(sql).all(...params)
+    const rows = this.stmt(sql).all(...params)
     return rows.map((r) => ({
       id: String(r.id),
       repoId: String(r.repo_id),
@@ -1236,7 +1236,7 @@ export class BunSqliteStore {
       sql += ` AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?)`
       params.push(at, at)
     }
-    const rows = this.db.prepare(sql).all(...params)
+    const rows = this.stmt(sql).all(...params)
     return rows.map((r) => ({
       teamId: String(r.team_id),
       personId: String(r.person_id),

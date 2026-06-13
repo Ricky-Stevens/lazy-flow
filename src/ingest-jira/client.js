@@ -135,7 +135,15 @@ export class JiraClient {
     if (!res.ok) {
       throw new Error(`Jira GET ${path} → HTTP ${res.status}`)
     }
-    return res.json()
+    try {
+      return await res.json()
+    } catch (err) {
+      // A 200 with a malformed/partial body (proxy error, truncated transfer)
+      // would otherwise throw a bare SyntaxError. Surface it as an API error.
+      throw new Error(
+        `Jira GET ${path} → invalid JSON: ${err instanceof Error ? err.message : String(err)}`,
+      )
+    }
   }
 
   async postJson(path, body) {
@@ -146,7 +154,13 @@ export class JiraClient {
     if (!res.ok) {
       throw new Error(`Jira POST ${path} → HTTP ${res.status}`)
     }
-    return res.json()
+    try {
+      return await res.json()
+    } catch (err) {
+      throw new Error(
+        `Jira POST ${path} → invalid JSON: ${err instanceof Error ? err.message : String(err)}`,
+      )
+    }
   }
 
   // ---------------------------------------------------------------------------
