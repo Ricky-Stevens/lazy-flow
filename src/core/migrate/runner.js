@@ -1,60 +1,18 @@
 import { MIGRATION_0001_DOWN, MIGRATION_0001_UP } from './migrations/0001_initial_schema.js'
-import { MIGRATION_0002_DOWN, MIGRATION_0002_UP } from './migrations/0002_candidate_matches.js'
-import { MIGRATION_0003_DOWN, MIGRATION_0003_UP } from './migrations/0003_survey_responses.js'
-import { MIGRATION_0004_DOWN, MIGRATION_0004_UP } from './migrations/0004_indexes_and_dedup.js'
-import { MIGRATION_0005_DOWN, MIGRATION_0005_UP } from './migrations/0005_metric_baselines.js'
-import { MIGRATION_0006_DOWN, MIGRATION_0006_UP } from './migrations/0006_pr_files.js'
-import {
-  MIGRATION_0008_DOWN,
-  MIGRATION_0008_UP,
-} from './migrations/0008_metric_snapshot_data_source.js'
 
-/** The ordered list of all migrations. Add new migrations here. */
+/**
+ * The ordered list of all migrations.
+ *
+ * Pre-launch, the history was flattened to this single consolidated baseline
+ * (the former 0001–0006 + 0008). Once v1 ships, append new migrations here at
+ * version 2 and upward — never edit this baseline again.
+ */
 export const MIGRATIONS = [
   {
     version: 1,
     description: 'initial_schema',
     up: MIGRATION_0001_UP,
     down: MIGRATION_0001_DOWN,
-  },
-  {
-    version: 2,
-    description: 'candidate_matches',
-    up: MIGRATION_0002_UP,
-    down: MIGRATION_0002_DOWN,
-  },
-  {
-    version: 3,
-    description: 'survey_responses',
-    up: MIGRATION_0003_UP,
-    down: MIGRATION_0003_DOWN,
-  },
-  {
-    version: 4,
-    description: 'indexes_and_dedup',
-    up: MIGRATION_0004_UP,
-    down: MIGRATION_0004_DOWN,
-  },
-  {
-    version: 5,
-    description: 'metric_baselines',
-    up: MIGRATION_0005_UP,
-    down: MIGRATION_0005_DOWN,
-  },
-  {
-    version: 6,
-    description: 'pr_files',
-    up: MIGRATION_0006_UP,
-    down: MIGRATION_0006_DOWN,
-  },
-  // Version 7 is reserved for a concurrently-developed work-stream (WS-3). The
-  // runner applies pending migrations by un-applied version number, so the gap
-  // is harmless and 0007 can be slotted in later without reordering.
-  {
-    version: 8,
-    description: 'metric_snapshot_data_source',
-    up: MIGRATION_0008_UP,
-    down: MIGRATION_0008_DOWN,
   },
 ]
 

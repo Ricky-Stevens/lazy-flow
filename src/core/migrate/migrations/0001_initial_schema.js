@@ -1,7 +1,15 @@
 /**
- * Migration 0001 — full initial schema.
+ * Migration 0001 — full initial schema (consolidated baseline).
  *
- * The SQL is inlined as TS string constants so the bundled server.js has no
+ * Pre-launch, the migration history was flattened into this single baseline:
+ * the cumulative schema of the former migrations 0001–0006 + 0008 is expressed
+ * here as one CREATE-only migration. The one-off data-fix step from the old
+ * 0004 (de-duplicating sprint_membership_events on already-populated databases)
+ * is intentionally dropped — a fresh database has no duplicates to collapse —
+ * but its resulting UNIQUE index is preserved. Incremental migrations resume at
+ * version 2 once v1 ships.
+ *
+ * The SQL is inlined as string constants so the bundled server.js has no
  * runtime file-path dependency (bundle-safe per SPEC §12.3 / D12).
  *
  * MIGRATION_0001_UP creates all tables and indexes.
@@ -51,6 +59,25 @@ CREATE TABLE IF NOT EXISTS identities (
 
 CREATE INDEX IF NOT EXISTS idx_identities_person_id ON identities(person_id);
 CREATE INDEX IF NOT EXISTS idx_identities_external ON identities(kind, external_id);
+
+-- Human-confirm queue for identity stitching (SPEC §6.3 WP-IDENTITY)
+CREATE TABLE IF NOT EXISTS candidate_matches (
+  id              TEXT    NOT NULL PRIMARY KEY,
+  identity_id_a   TEXT    NOT NULL REFERENCES identities(id),
+  identity_id_b   TEXT    NOT NULL REFERENCES identities(id),
+  reason          TEXT    NOT NULL CHECK (reason IN ('local_part_name', 'fuzzy_name')),
+  confidence      REAL    NOT NULL,
+  status          TEXT    NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'confirmed', 'rejected')),
+  decided_at      TEXT,
+  decided_by      TEXT,
+  created_at      TEXT    NOT NULL,
+  updated_at      TEXT    NOT NULL,
+  -- Ordered-pair uniqueness: normalise so id_a < id_b lexicographically
+  UNIQUE (identity_id_a, identity_id_b, reason)
+);
+
+CREATE INDEX IF NOT EXISTS idx_candidate_matches_status ON candidate_matches(status);
+CREATE INDEX IF NOT EXISTS idx_candidate_matches_pair ON candidate_matches(identity_id_a, identity_id_b);
 
 -- GitHub repositories; keyed on node_id to survive renames/transfers
 CREATE TABLE IF NOT EXISTS repositories (
@@ -126,6 +153,25 @@ CREATE TABLE IF NOT EXISTS pull_requests (
 
 CREATE INDEX IF NOT EXISTS idx_pull_requests_repo_id ON pull_requests(repo_id);
 CREATE INDEX IF NOT EXISTS idx_pull_requests_created_at ON pull_requests(created_at);
+
+-- Per-PR file diffs (GET /pulls/{n}/files); source for code.* churn/HALOC metrics.
+-- ON DELETE CASCADE so a tombstoned PR's files do not linger.
+CREATE TABLE IF NOT EXISTS pr_files (
+  pr_id      TEXT NOT NULL REFERENCES pull_requests(id) ON DELETE CASCADE,
+  repo_id    TEXT NOT NULL,
+  path       TEXT NOT NULL,
+  additions  INTEGER NOT NULL DEFAULT 0,
+  deletions  INTEGER NOT NULL DEFAULT 0,
+  haloc      INTEGER NOT NULL DEFAULT 0,
+  status     TEXT NOT NULL,
+  patch      TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (pr_id, path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pr_files_repo ON pr_files(repo_id);
+CREATE INDEX IF NOT EXISTS idx_pr_files_pr   ON pr_files(pr_id);
 
 -- Reviews; keyed on GraphQL node_id
 CREATE TABLE IF NOT EXISTS reviews (
@@ -222,6 +268,7 @@ CREATE TABLE IF NOT EXISTS issues (
 
 CREATE INDEX IF NOT EXISTS idx_issues_project_id ON issues(project_id);
 CREATE INDEX IF NOT EXISTS idx_issues_status_id ON issues(status_id);
+CREATE INDEX IF NOT EXISTS idx_issues_created_at ON issues(created_at);
 
 -- Issue key history for project moves
 CREATE TABLE IF NOT EXISTS issue_keys (
@@ -273,6 +320,11 @@ CREATE TABLE IF NOT EXISTS sprint_membership_events (
 
 CREATE INDEX IF NOT EXISTS idx_sprint_membership_sprint ON sprint_membership_events(sprint_id);
 CREATE INDEX IF NOT EXISTS idx_sprint_membership_issue ON sprint_membership_events(issue_id);
+
+-- Natural-key uniqueness so re-syncs are idempotent (INSERT OR IGNORE), keeping
+-- committed/added story points from being double-counted in velocity.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_sprint_membership_event
+  ON sprint_membership_events(sprint_id, issue_id, change, transitioned_at);
 
 -- Board configuration; defines cycle-time start boundary
 CREATE TABLE IF NOT EXISTS board_configs (
@@ -326,6 +378,30 @@ CREATE TABLE IF NOT EXISTS team_membership (
 
 CREATE INDEX IF NOT EXISTS idx_team_membership_person ON team_membership(person_id);
 
+-- Survey responses (WP-SURVEY, SPEC D6 / §2.2 N4)
+-- Perceptual scores are SURVEY-SOURCED ONLY; this table is the sole permitted
+-- source for any dimension score. Append-only (no UPDATE; DELETE only for
+-- subject erasure per SPEC §6.5 WP-GDPR-SCAFFOLD).
+CREATE TABLE IF NOT EXISTS survey_responses (
+  id                   TEXT NOT NULL PRIMARY KEY,
+  person_id            TEXT REFERENCES persons(id),
+  team_id              TEXT NOT NULL REFERENCES teams(id),
+  instrument_id        TEXT NOT NULL,
+  instrument_version   TEXT NOT NULL,
+  -- Per-question scores stored as a JSON object: { [questionId]: 1-5 }
+  scores_json          TEXT NOT NULL,
+  submitted_at         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_survey_responses_team
+  ON survey_responses(team_id, submitted_at);
+
+CREATE INDEX IF NOT EXISTS idx_survey_responses_person
+  ON survey_responses(person_id) WHERE person_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_survey_responses_instrument
+  ON survey_responses(instrument_id, instrument_version);
+
 -- GitHub↔Jira issue linkage
 CREATE TABLE IF NOT EXISTS pr_issue_links (
   pr_id        TEXT NOT NULL REFERENCES pull_requests(id),
@@ -352,11 +428,51 @@ CREATE TABLE IF NOT EXISTS metric_snapshots (
   coverage_fingerprint     TEXT    NOT NULL,
   computed_at              TEXT    NOT NULL,
   is_stale                 INTEGER NOT NULL DEFAULT 0,
+  -- Provenance gate: 'real' authoritative feed vs heuristic 'proxy'; NULL is
+  -- treated as proxy (conservative) so the report suppresses benchmark bands.
+  data_source              TEXT    CHECK (data_source IS NULL OR data_source IN ('real', 'proxy')),
   PRIMARY KEY (scope_type, scope_id, metric, day, ingest_watermark_version)
 );
 
 CREATE INDEX IF NOT EXISTS idx_metric_snapshots_scope ON metric_snapshots(scope_type, scope_id, metric);
 CREATE INDEX IF NOT EXISTS idx_metric_snapshots_day ON metric_snapshots(day);
+CREATE INDEX IF NOT EXISTS idx_metric_snapshots_computed_at ON metric_snapshots(computed_at);
+
+-- Reporting baseline layer: derived statistical summaries over snapshot values.
+-- Provenance-parallel to metric_snapshots; supersede instead of delete.
+CREATE TABLE IF NOT EXISTS metric_baselines (
+  scope_type   TEXT NOT NULL CHECK (scope_type IN ('repo','team','org','person','self')),
+  scope_id     TEXT NOT NULL,
+  metric       TEXT NOT NULL,
+  baseline_kind TEXT NOT NULL CHECK (baseline_kind IN ('self','peer')),
+  period_key   TEXT NOT NULL,
+  as_of_day    TEXT NOT NULL,
+  window_kind  TEXT NOT NULL CHECK (window_kind IN ('days','sprints','fixed')),
+  window_from  TEXT NOT NULL,
+  window_to    TEXT NOT NULL,
+  n            INTEGER NOT NULL,
+  p50 REAL, p75 REAL, p90 REAL,
+  mean REAL, sd REAL, mad REAL,
+  drift_z      REAL,
+  drift_status TEXT NOT NULL CHECK (
+    drift_status IN ('cold_start','establishing','stable','shifting','regime_change')
+  ),
+  drift_cause  TEXT,
+  superseded   INTEGER NOT NULL DEFAULT 0,
+  trust_tier   TEXT NOT NULL CHECK (trust_tier IN ('deterministic','hybrid','probabilistic')),
+  data_quality TEXT NOT NULL,
+  engine_version TEXT NOT NULL,
+  ingest_watermark_version TEXT NOT NULL,
+  coverage_fingerprint TEXT NOT NULL,
+  baseline_version TEXT NOT NULL,
+  computed_at  TEXT NOT NULL,
+  PRIMARY KEY (scope_type, scope_id, metric, baseline_kind, period_key, as_of_day, ingest_watermark_version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_metric_baselines_scope
+  ON metric_baselines(scope_type, scope_id, metric, baseline_kind);
+CREATE INDEX IF NOT EXISTS idx_metric_baselines_anchor
+  ON metric_baselines(as_of_day);
 
 -- AI verdict audit trail
 CREATE TABLE IF NOT EXISTS ai_verdicts (
@@ -379,6 +495,7 @@ CREATE TABLE IF NOT EXISTS ai_verdicts (
 
 CREATE INDEX IF NOT EXISTS idx_ai_verdicts_subject ON ai_verdicts(subject_type, subject_id);
 CREATE INDEX IF NOT EXISTS idx_ai_verdicts_metric ON ai_verdicts(metric, created_at);
+CREATE INDEX IF NOT EXISTS idx_ai_verdicts_created_at ON ai_verdicts(created_at);
 
 -- Per-workflow active/wait/done map; effective-dated
 CREATE TABLE IF NOT EXISTS flow_state_models (
@@ -423,8 +540,10 @@ DROP TABLE IF EXISTS sync_state;
 DROP TABLE IF EXISTS status_category_history;
 DROP TABLE IF EXISTS flow_state_models;
 DROP TABLE IF EXISTS ai_verdicts;
+DROP TABLE IF EXISTS metric_baselines;
 DROP TABLE IF EXISTS metric_snapshots;
 DROP TABLE IF EXISTS pr_issue_links;
+DROP TABLE IF EXISTS survey_responses;
 DROP TABLE IF EXISTS team_membership;
 DROP TABLE IF EXISTS teams;
 DROP TABLE IF EXISTS workflow_scheme_mappings;
@@ -441,10 +560,12 @@ DROP TABLE IF EXISTS deployments;
 DROP TABLE IF EXISTS check_runs;
 DROP TABLE IF EXISTS review_comments;
 DROP TABLE IF EXISTS reviews;
+DROP TABLE IF EXISTS pr_files;
 DROP TABLE IF EXISTS pull_requests;
 DROP TABLE IF EXISTS commit_authors;
 DROP TABLE IF EXISTS commits;
 DROP TABLE IF EXISTS repositories;
+DROP TABLE IF EXISTS candidate_matches;
 DROP TABLE IF EXISTS identities;
 DROP TABLE IF EXISTS persons;
 DROP TABLE IF EXISTS organisations;
