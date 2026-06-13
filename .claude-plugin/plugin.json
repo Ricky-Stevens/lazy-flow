@@ -1,11 +1,24 @@
 {
   "name": "lazy-flow",
   "displayName": "lazy-flow — Software Delivery Intelligence",
-  "description": "Open-source DORA + Flow + PR + Code + Agile metrics platform for Claude Code. Fuses GitHub and Jira into a local-first, fully-transparent delivery intelligence layer with cited AI insights.",
+  "description": "Open-source DORA + Flow + PR + Code + Agile metrics platform for Claude Code. Fuses GitHub and Jira into a local-first, fully-transparent delivery intelligence layer that Claude can query directly over SQL.",
   "author": "Ricky Stevens",
   "license": "MIT",
   "repository": "https://github.com/ORG/lazy-flow",
-  "mcpServers": "./.mcp.json",
+  "mcpServers": {
+    "lazy-flow": {
+      "command": "bun",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/src/mcp-server/index.js"],
+      "env": {
+        "LAZYFLOW_GITHUB_TOKEN": "${user_config.github_token}",
+        "LAZYFLOW_JIRA_TOKEN": "${user_config.jira_oauth_token}",
+        "LAZYFLOW_JIRA_BASE_URL": "${user_config.jira_base_url}",
+        "LAZYFLOW_REPOS": "${user_config.repos}",
+        "LAZYFLOW_JIRA_PROJECTS": "${user_config.jira_projects}",
+        "LAZYFLOW_DB_PATH": "${CLAUDE_PLUGIN_DATA}/lazy-flow.db"
+      }
+    }
+  },
   "userConfig": {
     "github_token": {
       "description": "GitHub Personal Access Token or App installation token. Required for GitHub sync.",
@@ -17,10 +30,11 @@
       "sensitive": true,
       "required": false
     },
-    "anthropic_api_key": {
-      "description": "Anthropic API key. Required for AI-powered insights (ticket alignment, effort, anomaly explanation, PR quality).",
-      "sensitive": true,
-      "required": false
+    "jira_base_url": {
+      "description": "Jira Cloud base URL, e.g. https://acme.atlassian.net. Required for Jira sync.",
+      "sensitive": false,
+      "required": false,
+      "default": ""
     },
     "repos": {
       "description": "Comma-separated list of GitHub repositories to track, e.g. ORG/app,ORG/api",
@@ -33,18 +47,6 @@
       "sensitive": false,
       "required": false,
       "default": ""
-    },
-    "visibility": {
-      "description": "Metric visibility mode: public (default, open-by-design), team, or self.",
-      "sensitive": false,
-      "required": false,
-      "default": "public"
-    },
-    "churn_window_days": {
-      "description": "Lookback window in days for churn/work-type metrics. Default 30.",
-      "sensitive": false,
-      "required": false,
-      "default": "30"
     }
   }
 }

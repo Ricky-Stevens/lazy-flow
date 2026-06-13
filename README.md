@@ -1,26 +1,29 @@
 # lazy-flow
 
-An open-source, self-hostable software-delivery intelligence platform that matches Pluralsight Flow on
-the deterministic metric catalogue and beats it on insight — by owning explainable AI judgment, a unified
-GitHub + Jira value stream, and radical transparency shipped where engineers already work (Claude Code).
-
-See [docs/SPEC.md](docs/SPEC.md) for the full product specification.
+An open-source, local-first software-delivery intelligence platform that rivals Pluralsight Flow on the
+deterministic metric catalogue (DORA, Flow, PR, Code, Agile) over a unified GitHub + Jira value stream —
+captured into a local SQLite database that **Claude queries directly over SQL**, right where engineers
+already work (Claude Code). No data ever leaves your machine; no external service, no telemetry.
 
 ## Getting started
 
+This is a Bun project — install [Bun](https://bun.sh) (>=1.3.0), then:
+
 ```sh
-npm install
+bun install
 ```
 
 ## Scripts
 
+The project is plain modern ESM JavaScript run directly under Bun — there is no
+build step and the test suite uses Bun's native test runner.
+
 | Command | Description |
 |---|---|
-| `npm run format` | Auto-format all files with Biome |
-| `npm run lint` | Lint with Biome |
-| `npm run typecheck` | Type-check with `tsc --noEmit` |
-| `npm test` | Run all tests with Vitest |
-| `npm run check` | Run lint + typecheck + test |
+| `bun run format` | Auto-format all files with Biome |
+| `bun run lint` | Lint with Biome |
+| `bun test` | Run all tests with Bun's native test runner |
+| `bun run check` | Run lint + test |
 
 ## Claude Code plugin install
 
@@ -44,8 +47,7 @@ npm install
     "lazy-flow": {
       "options": {
         "repos": ["ORG/app", "ORG/api"],
-        "jira_projects": ["ENG"],
-        "visibility": "public"
+        "jira_projects": ["ENG"]
       }
     }
   }
@@ -55,9 +57,8 @@ npm install
 3. **On first launch**, Claude Code prompts each team member once to set secrets (stored in the OS keychain):
    - `github_token` — GitHub PAT or App installation token
    - `jira_oauth_token` — Jira Cloud OAuth 2.0 token (optional)
-   - `anthropic_api_key` — Anthropic API key (optional, for AI insights)
 
-4. **The MCP server starts automatically** next session. No build/install step required — the bundled `server.js` is pre-built and ships in the repo at `packages/mcp-server/server/dist/server.js`.
+4. **The MCP server starts automatically** next session. No build/install step required — Bun runs the server straight from source at `src/mcp-server/index.js`. Once data is synced, Claude can query the local SQLite database directly via the `query_db` tool (see the `lazy-flow://schema` resource).
 
 ### Available slash commands
 
@@ -74,19 +75,18 @@ npm install
 | `/lazy-flow:team` | Team-level cross-dimension view |
 | `/lazy-flow:org` | Org-level aggregate view |
 | `/lazy-flow:explain` | Formula + methodology for any metric |
-| `/lazy-flow:anomaly` | AI-cited anomaly explanation |
-| `/lazy-flow:align` | Ticket-work alignment for a PR |
+| `/lazy-flow:report` | Generate an exportable HTML/MD/CSV/JSON report |
 | `/lazy-flow:config` | Health check + configuration guide |
 | `/lazy-flow:identities` | Review/confirm fuzzy identity matches |
-| `/lazy-flow:contest` | Contest or correct an AI verdict |
 
-### Bundled artifact
+### Runs from source under Bun
 
-The MCP server bundle (`packages/mcp-server/server/dist/server.js` + `grammars/`) is committed to the repo and excluded from `.gitignore` so it ships with no build step on the host. To rebuild it after changes:
-
-```sh
-cd packages/mcp-server && npm run build
-```
+There is no build step. The plugin runs directly from source — Bun executes
+`src/mcp-server/index.js`, which is what the plugin manifest launches. A Claude
+marketplace plugin is copied as-is with no install or build on the user's
+machine, and Bun transpiles and runs the JavaScript source on the fly. It is
+launched under the Bun runtime because it imports `bun:sqlite` and grammar WASM
+assets resolve from `node_modules/tree-sitter-wasms` at runtime.
 
 ### Org enforcement (optional)
 

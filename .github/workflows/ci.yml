@@ -1,9 +1,9 @@
 name: CI
 
-# Quality gates + a guard against shipping a stale MCP-server bundle. The plugin
-# is installed straight from this repo and launches packages/mcp-server/server/
-# dist/server.js, so a committed bundle that lags the source ships broken/old
-# code. This rebuilds it and fails if the committed artifact is out of date.
+# Quality gates for a Bun-native, run-from-source plugin. There is no build
+# step: the plugin manifest launches src/mcp-server/index.js directly under the
+# Bun runtime (which provides bun:sqlite), so there is no committed bundle to
+# keep in sync. The gates are lint (Biome) and the Bun-native test suite.
 
 on:
   push:
@@ -15,30 +15,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: oven-sh/setup-bun@v2
         with:
-          node-version: '25'
-      - run: npm ci
-      - name: Lint + typecheck + test
-        run: npm run check
-
-  bundle-not-stale:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '25'
-      - run: npm ci
-      - name: Rebuild the MCP-server bundle from source
-        run: |
-          rm -rf packages/mcp-server/server/dist
-          npm run build -w @lazy-flow/mcp-server
-      - name: Fail if the committed bundle differs from a fresh build
-        run: |
-          if [ -n "$(git status --porcelain packages/mcp-server/server/dist)" ]; then
-            echo "::error::Committed MCP-server bundle is stale. Run 'npm run build -w @lazy-flow/mcp-server' and commit packages/mcp-server/server/dist."
-            git --no-pager diff --stat packages/mcp-server/server/dist
-            exit 1
-          fi
-          echo "Bundle is up to date."
+          bun-version: 1.3.10
+      - run: bun install --frozen-lockfile
+      - name: Lint (Biome)
+        run: bunx biome check .
+      - name: Test (bun:test)
+        run: bun test

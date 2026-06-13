@@ -1,12 +1,16 @@
 node_modules/
+
+# Local-dev MCP config. The plugin declares its MCP server inline in
+# .claude-plugin/plugin.json, so this root .mcp.json is a dev-only convenience
+# and is NOT part of the shipped plugin.
+.mcp.json
+
+# Human-facing docs are not part of the shipped plugin.
+docs/
+
+# No build step: the plugin runs from source under Bun. Ignore any stray
+# build output if a tool ever emits one.
 dist/
-# Un-ignore the bundled MCP server artifact so it ships with the plugin
-# (no install/build step required on the host — SPEC §12.3, WP-E2E).
-# Git cannot re-include a file if a PARENT directory is excluded, so the dir
-# itself must be re-included BEFORE its contents — otherwise the `**` negation
-# is silently a no-op and the server.js the plugin launches is never committed.
-!packages/mcp-server/server/dist/
-!packages/mcp-server/server/dist/**
 *.db
 *.db-shm
 *.db-wal
@@ -20,3 +24,5 @@ coverage/
 .lazy-dev/
 .serena/
 .idea/
+.context-guardian/
+.claude/

@@ -1,21 +1,47 @@
 ---
-description: Review and confirm fuzzy identity matches — GitHub logins, Jira account IDs, and commit author emails that the engine has queued for human confirmation before attributing work.
+description: Review fuzzy identity matches the engine queued for human confirmation — GitHub logins, Jira account ids and commit emails it could not auto-merge. Query the local lazy-flow DB directly; there is no dedicated identity-queue tool.
 ---
 
 # /lazy-flow:identities
 
-Call `get_code_metrics` with `scope: "identities"` and metric `"identity_queue"` to retrieve the list of pending identity matches awaiting human confirmation.
+There is no built-in identity-queue tool. The pending matches live in the
+`candidate_matches` table of the local SQLite store — query them with `query_db`.
 
-Render the tool output faithfully:
+## 1. Read the schema first
 
-- For each queued match, show: the candidate identities (login/email pairs), the match `confidence` score, the `match_tier` (email-exact, local-part+name, fuzzy), and any `conflict_reason`.
-- Show the `trust_tier` badge: `deterministic` for exact matches, `hybrid` for fuzzy matches.
-- Show `as_of` and `engine_version` from the response envelope.
+Read the `lazy-flow://schema` resource before writing SQL. It documents the
+`identities`, `persons` and `candidate_matches` tables and how `person_id` links
+accounts to people.
 
-Guide the user to confirm or reject each match:
+## 2. List the pending queue
 
-- Exact email / GitHub-verified matches auto-merge and do not appear here.
-- Matches at the local-part+name tier (≥0.8) and fuzzy tier (≥0.5) require human confirmation before per-person metrics are attributed.
-- If the user confirms a match, note the `person_id` pair they are confirming and advise them to record it in the lazy-flow config or via the identity confirmation surface when it is available.
+`candidate_matches` pairs two identities the engine thinks are the same person
+but could not auto-merge (`status = 'pending'`). `reason` is 'local_part_name' or
+'fuzzy_name'; `confidence` is the match score.
 
-Do not auto-merge identities on the user's behalf. Do not display or infer PII beyond what the tool returns. If a bot account appears in the queue, advise the user it should be excluded via the `is_bot` flag.
+```sql
+SELECT cm.id,
+       a.kind AS kind_a, a.external_id AS account_a,
+       b.kind AS kind_b, b.external_id AS account_b,
+       cm.reason, cm.confidence
+FROM candidate_matches cm
+JOIN identities a ON a.id = cm.identity_id_a
+JOIN identities b ON b.id = cm.identity_id_b
+WHERE cm.status = 'pending'
+ORDER BY cm.confidence DESC;
+```
+
+## Rendering rules
+
+- For each pending match show: the two candidate accounts (kind + external_id),
+  the `reason`, and the `confidence`. Treat fuzzy-name matches as lower trust than
+  local-part+name matches.
+- Exact email / GitHub-verified matches auto-merge and never appear here.
+- Do NOT auto-merge identities or write to the DB — `query_db` is read-only and
+  this skill is review-only. If the user wants to confirm a match, note the
+  identity pair and advise recording the decision via the identity-confirmation
+  surface when available.
+- Surface only what the query returns. The store is local and single-user, so the
+  account handles shown are the user's own data — but do not infer further PII
+  beyond the rows.
+- If a bot account appears, advise excluding it via the `identities.is_bot` flag.
