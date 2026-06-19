@@ -51,6 +51,31 @@ function makeClient() {
   })
 }
 
+// ---------------------------------------------------------------------------
+// Auth scheme — Basic (API token + email) vs Bearer (OAuth). An API token
+// against a Jira Cloud site URL MUST use Basic auth; sending Bearer 403s.
+// ---------------------------------------------------------------------------
+
+describe('JiraClient auth scheme', () => {
+  it('uses Basic auth (base64 email:token) when an email is supplied', () => {
+    const client = new JiraClient({
+      baseUrl: 'https://acme.atlassian.net',
+      token: 'api-token-xyz',
+      email: 'dev@acme.com',
+    })
+    const expected = `Basic ${Buffer.from('dev@acme.com:api-token-xyz').toString('base64')}`
+    expect(client.authHeader).toBe(expected)
+  })
+
+  it('falls back to Bearer when no email is supplied (OAuth 3LO path)', () => {
+    const client = new JiraClient({
+      baseUrl: 'https://acme.atlassian.net',
+      token: 'oauth-token-abc',
+    })
+    expect(client.authHeader).toBe('Bearer oauth-token-abc')
+  })
+})
+
 // Mount the Jira mock server — set up directly (not withMockServer) so that
 // beforeAll/afterAll hooks are registered after Vitest initialises globals.
 const server = setupServer(...mockJira())
@@ -1004,5 +1029,159 @@ describe('searchJql resilience to a missing `issues` field', () => {
       collected.push(...batch)
     }
     expect(collected).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// searchJql request shape — the enhanced /search/jql endpoint requires `expand`
+// as a comma-separated STRING. Passing the array form 400s and blocks all issue
+// ingestion (regression from the live 2026-06-19 run).
+// ---------------------------------------------------------------------------
+
+describe('JiraClient searchJql expand serialization', () => {
+  it('serializes an array `expand` as a comma-separated string in the request body', async () => {
+    let captured
+    server.use(
+      http.post('*/rest/api/3/search/jql', async ({ request }) => {
+        captured = await request.json()
+        return HttpResponse.json({ issues: [], total: 0 })
+      }),
+    )
+
+    await makeClient().searchJql({
+      jql: 'project = "X"',
+      expand: ['changelog', 'renderedFields'],
+    })
+
+    expect(captured.expand).toBe('changelog,renderedFields')
+  })
+
+  it('passes a string `expand` through unchanged', async () => {
+    let captured
+    server.use(
+      http.post('*/rest/api/3/search/jql', async ({ request }) => {
+        captured = await request.json()
+        return HttpResponse.json({ issues: [], total: 0 })
+      }),
+    )
+
+    await makeClient().searchJql({ jql: 'project = "X"', expand: 'changelog' })
+
+    expect(captured.expand).toBe('changelog')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Resilience — expected, non-fatal conditions on a normal-permission token are
+// routed to `warnings`, not `errors`, so a healthy sync does not look broken.
+// (Regressions from the live 2026-06-19 run against a real instance.)
+// ---------------------------------------------------------------------------
+
+describe('syncJira resilience: benign conditions become warnings, not errors', () => {
+  const scope = {
+    jiraCloudId: baseOrg.org.jiraCloudId,
+    projectKeys: [baseOrg.jiraProject.key],
+    boardIds: [IDS.boardId],
+  }
+
+  it('downgrades a sprint-list 400 (Kanban board has no sprints) to a warning', async () => {
+    const store = makeStore()
+    server.use(
+      http.get(
+        '*/rest/agile/1.0/board/:boardId/sprint',
+        () => new HttpResponse(null, { status: 400 }),
+      ),
+    )
+
+    const result = await syncJira(store, makeClient(), scope, 'backfill', NOW)
+
+    expect(result.warnings.some((w) => w.includes('does not support sprints'))).toBe(true)
+    expect(result.errors.some((e) => e.includes('Sprint list failed'))).toBe(false)
+  })
+
+  it('downgrades a workflow-search 403 (needs admin) to a warning', async () => {
+    const store = makeStore()
+    server.use(
+      http.get('*/rest/api/3/workflow/search', () => new HttpResponse(null, { status: 403 })),
+    )
+
+    const result = await syncJira(store, makeClient(), scope, 'backfill', NOW)
+
+    expect(result.warnings.some((w) => w.includes('workflow metadata unavailable'))).toBe(true)
+    expect(result.errors.some((e) => e.includes('Workflow ingest failed'))).toBe(false)
+  })
+
+  it('aggregates sprint-report 404s into a single warning', async () => {
+    const store = makeStore()
+    server.use(
+      http.get(
+        '*/rest/agile/1.0/board/:boardId/sprint/:sprintId/report',
+        () => new HttpResponse(null, { status: 404 }),
+      ),
+    )
+
+    const result = await syncJira(store, makeClient(), scope, 'backfill', NOW)
+
+    expect(result.warnings.some((w) => /sprint report\(s\) unavailable/.test(w))).toBe(true)
+    expect(result.errors.some((e) => e.includes('Sprint report failed'))).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Parent self-FK resilience (live 2026-06-19 regression): a child issue can be
+// synced before its parent, or reference a parent in an unsynced project. The
+// parent_id FK must never abort the whole project sync. Deferred in-project
+// parents are linked in a second pass; cross-project parents stay null.
+// ---------------------------------------------------------------------------
+
+describe('syncJira parent_id FK resilience', () => {
+  function issue(id, key, createdAt, parentId) {
+    return {
+      id,
+      key,
+      fields: {
+        created: createdAt,
+        updated: createdAt,
+        status: { id: '1', statusCategory: { key: 'new' } },
+        issuetype: { name: 'Task', subtask: false },
+        parent: parentId ? { id: parentId } : undefined,
+      },
+      changelog: { histories: [], total: 0, maxResults: 100 },
+    }
+  }
+
+  it('defers an in-project parent synced after its child, drops a cross-project parent, never aborts', async () => {
+    const store = makeStore()
+    server.use(
+      // child-1's parent is in an UNSYNCED project; child-2's parent (P-3) appears
+      // AFTER it in the result set → must be deferred then linked in pass two.
+      http.post('*/rest/api/3/search/jql', async () =>
+        HttpResponse.json({
+          issues: [
+            issue('C-1', 'BP-1', '2024-01-01T00:00:00Z', 'OTHER-999'),
+            issue('C-2', 'BP-2', '2024-01-02T00:00:00Z', 'P-3'),
+            issue('P-3', 'BP-3', '2024-01-03T00:00:00Z', null),
+          ],
+          total: 3,
+        }),
+      ),
+      http.get('*/rest/api/3/field', () => HttpResponse.json([])),
+    )
+
+    const scope = {
+      jiraCloudId: baseOrg.org.jiraCloudId,
+      projectKeys: [baseOrg.jiraProject.key],
+      boardIds: [IDS.boardId],
+    }
+    const result = await syncJira(store, makeClient(), scope, 'backfill', NOW)
+
+    // All three ingested; no project-level FK abort.
+    expect(result.issuesUpserted).toBe(3)
+    expect(result.errors.some((e) => /FOREIGN KEY|sync failed/i.test(e))).toBe(false)
+
+    // Cross-project parent dropped to null; in-project deferred parent linked.
+    expect((await store.getIssue('C-1'))?.parentId).toBeNull()
+    expect((await store.getIssue('C-2'))?.parentId).toBe('P-3')
+    expect((await store.getIssue('P-3'))?.parentId).toBeNull()
   })
 })

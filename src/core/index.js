@@ -43,6 +43,7 @@ export { linkageRate, linkIssues } from './linking/linkIssues.js'
 // Migration runner
 export { currentVersion, MIGRATIONS, migrate } from './migrate/runner.js'
 // Outbound-URL safety guards for token-bearing HTTP clients (SPEC §6.5)
+export { mapWithConcurrency } from './net/concurrency.js'
 export {
   assertSafeBaseUrl,
   assertSameOrigin,

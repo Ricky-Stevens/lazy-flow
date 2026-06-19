@@ -739,6 +739,149 @@ export class BunSqliteStore {
     }))
   }
 
+  // -------------------------------------------------------------------------
+  // Bulk loaders for the metrics snapshot backfill
+  //
+  // Each returns EVERY row of its table (non-deleted where applicable) in ONE
+  // query, so the metrics layer can load the whole dataset once and slice
+  // per-day windows in memory, instead of issuing windowed + per-parent (N+1)
+  // queries for every (metric, day). Row shapes match the per-scope getters
+  // exactly so the in-memory slice is byte-for-byte equivalent.
+  // -------------------------------------------------------------------------
+
+  async getAllPullRequests() {
+    const rows = this.stmt(
+      `SELECT id, repo_id, number, author_identity_id, state, head_ref, base_ref,
+              is_draft, merged_via_queue, created_at, ready_at, first_commit_at,
+              first_review_at, approved_at, merged_at, merged_by_identity_id,
+              deleted_at, raw, updated_at
+       FROM pull_requests WHERE deleted_at IS NULL ORDER BY created_at ASC`,
+    ).all()
+    return rows.map((r) => this._rowToPullRequest(r))
+  }
+
+  async getAllReviews() {
+    const rows = this.stmt(
+      `SELECT node_id, pr_id, reviewer_identity_id, state, submitted_at, raw, updated_at
+       FROM reviews ORDER BY submitted_at ASC`,
+    ).all()
+    return rows.map((r) => ({
+      nodeId: String(r.node_id),
+      prId: String(r.pr_id),
+      reviewerIdentityId: String(r.reviewer_identity_id),
+      state: r.state,
+      submittedAt: String(r.submitted_at),
+      raw: String(r.raw),
+      updatedAt: String(r.updated_at),
+    }))
+  }
+
+  async getAllReviewComments() {
+    const rows = this.stmt(
+      `SELECT node_id, pr_id, author_identity_id, created_at, in_reply_to, path, raw, updated_at
+       FROM review_comments ORDER BY created_at ASC`,
+    ).all()
+    return rows.map((r) => ({
+      nodeId: String(r.node_id),
+      prId: String(r.pr_id),
+      authorIdentityId: String(r.author_identity_id),
+      createdAt: String(r.created_at),
+      inReplyTo: rstr(r.in_reply_to),
+      path: rstr(r.path),
+      raw: String(r.raw),
+      updatedAt: String(r.updated_at),
+    }))
+  }
+
+  async getAllPrFiles() {
+    // JOIN pull_requests to exclude soft-deleted PRs' files (matches getPrFilesByRepo).
+    const rows = this.stmt(
+      `SELECT f.pr_id, f.repo_id, f.path, f.additions, f.deletions, f.haloc,
+              f.status, f.patch, f.created_at, f.updated_at
+       FROM pr_files f
+       JOIN pull_requests p ON p.id = f.pr_id
+       WHERE p.deleted_at IS NULL
+       ORDER BY f.pr_id ASC, f.path ASC`,
+    ).all()
+    return rows.map((r) => this._rowToPrFile(r))
+  }
+
+  async getAllDeployments() {
+    const rows = this.stmt(
+      `SELECT id, repo_id, sha, environment, status, created_at, finished_at, source, raw, updated_at
+       FROM deployments ORDER BY created_at ASC`,
+    ).all()
+    return rows.map((r) => ({
+      id: String(r.id),
+      repoId: String(r.repo_id),
+      sha: String(r.sha),
+      environment: String(r.environment),
+      status: String(r.status),
+      createdAt: String(r.created_at),
+      finishedAt: rstr(r.finished_at),
+      source: r.source,
+      raw: String(r.raw),
+      updatedAt: String(r.updated_at),
+    }))
+  }
+
+  async getAllCommits() {
+    const rows = this.stmt(
+      `SELECT repo_id, sha, author_identity_id, authored_at, committed_at,
+              additions, deletions, haloc, raw, created_at, updated_at
+       FROM commits ORDER BY authored_at ASC`,
+    ).all()
+    return rows.map((r) => ({
+      repoId: String(r.repo_id),
+      sha: String(r.sha),
+      authorIdentityId: String(r.author_identity_id),
+      authoredAt: String(r.authored_at),
+      committedAt: String(r.committed_at),
+      additions: Number(r.additions),
+      deletions: Number(r.deletions),
+      haloc: Number(r.haloc),
+      raw: String(r.raw),
+      createdAt: String(r.created_at),
+      updatedAt: String(r.updated_at),
+    }))
+  }
+
+  async getAllCheckRuns() {
+    const rows = this.stmt(
+      `SELECT node_id, repo_id, head_sha, name, status, conclusion, started_at, completed_at, raw, updated_at
+       FROM check_runs`,
+    ).all()
+    return rows.map((r) => ({
+      nodeId: String(r.node_id),
+      repoId: String(r.repo_id),
+      headSha: String(r.head_sha),
+      name: String(r.name),
+      status: String(r.status),
+      conclusion: rstr(r.conclusion),
+      startedAt: rstr(r.started_at),
+      completedAt: rstr(r.completed_at),
+      raw: String(r.raw),
+      updatedAt: String(r.updated_at),
+    }))
+  }
+
+  async getAllIssueTransitions() {
+    const rows = this.stmt(
+      `SELECT id, issue_id, from_status_id, to_status_id, project_id_at_transition,
+              transitioned_at, actor_identity_id
+       FROM issue_transitions ORDER BY transitioned_at ASC`,
+    ).all()
+    return rows.map((r) => ({
+      id: String(r.id),
+      issueId: String(r.issue_id),
+      fromStatusId: String(r.from_status_id),
+      toStatusId: String(r.to_status_id),
+      projectIdAtTransition: String(r.project_id_at_transition),
+      transitionedAt: String(r.transitioned_at),
+      actorIdentityId: rstr(r.actor_identity_id),
+    }))
+  }
+
   // ---------------------------------------------------------------------------
   // Deployments
   // ---------------------------------------------------------------------------
@@ -1029,6 +1172,17 @@ export class BunSqliteStore {
     ).get(id)
     if (!row) return null
     return this._rowToIssue(row)
+  }
+
+  /**
+   * Set an issue's parent link after the fact. Used to fill a parent reference
+   * that was deferred at ingest time because the parent issue had not been
+   * written yet (parent_id is a self-FK; a child synced before its parent would
+   * otherwise violate it). A plain UPDATE — no updated_at gating — because this
+   * is a structural backfill of an already-correct row, not new event data.
+   */
+  async setIssueParent(childId, parentId) {
+    this.stmt(`UPDATE issues SET parent_id = ? WHERE id = ?`).run(parentId, childId)
   }
 
   async getIssuesByProject(projectId) {
@@ -1539,6 +1693,59 @@ export class BunSqliteStore {
       b(snapshot.isStale),
       snapshot.dataSource ?? null,
     )
+  }
+
+  /**
+   * Bulk-insert many snapshots in chunked multi-row INSERTs inside one
+   * transaction. Replaces N single-row putSnapshot calls (one prepared-statement
+   * round trip + the per-statement work each) during the backfill. Chunked to
+   * stay under SQLite's bound-parameter limit (14 cols × rows). Upsert semantics
+   * are identical to putSnapshot; the conflict key (scope,scope_id,metric,day,
+   * watermark) never repeats within a chunk because metric differs per row.
+   */
+  async putSnapshots(snapshots) {
+    if (snapshots.length === 0) return
+    const COLS = 14
+    const MAX_ROWS = Math.floor(900 / COLS) // 64 rows/chunk → ≤896 params (<999 cap)
+    const conflict =
+      ` ON CONFLICT(scope_type, scope_id, metric, day, ingest_watermark_version) DO UPDATE SET` +
+      ` value = excluded.value, window = excluded.window, trust_tier = excluded.trust_tier,` +
+      ` data_quality = excluded.data_quality, engine_version = excluded.engine_version,` +
+      ` coverage_fingerprint = excluded.coverage_fingerprint, computed_at = excluded.computed_at,` +
+      ` is_stale = excluded.is_stale, data_source = excluded.data_source`
+    const rowPlaceholder = `(${Array(COLS).fill('?').join(', ')})`
+    await this.transaction(async () => {
+      for (let i = 0; i < snapshots.length; i += MAX_ROWS) {
+        const chunk = snapshots.slice(i, i + MAX_ROWS)
+        const sql =
+          `INSERT INTO metric_snapshots` +
+          ` (scope_type, scope_id, metric, day, value, window, trust_tier, data_quality,` +
+          `  engine_version, ingest_watermark_version, coverage_fingerprint, computed_at, is_stale,` +
+          `  data_source)` +
+          ` VALUES ${chunk.map(() => rowPlaceholder).join(', ')}` +
+          conflict
+        const params = []
+        for (const s of chunk) {
+          params.push(
+            s.scopeType,
+            s.scopeId,
+            s.metric,
+            s.day,
+            s.value,
+            s.window,
+            s.trustTier,
+            s.dataQuality,
+            s.engineVersion,
+            s.ingestWatermarkVersion,
+            s.coverageFingerprint,
+            s.computedAt,
+            b(s.isStale),
+            s.dataSource ?? null,
+          )
+        }
+        this.stmt(sql).run(...params)
+      }
+    })
   }
 
   async getSnapshots(scopeType, scopeId, metric, from, to) {

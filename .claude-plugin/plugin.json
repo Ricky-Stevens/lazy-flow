@@ -12,6 +12,7 @@
       "env": {
         "LAZYFLOW_GITHUB_TOKEN": "${user_config.github_token}",
         "LAZYFLOW_JIRA_TOKEN": "${user_config.jira_oauth_token}",
+        "LAZYFLOW_JIRA_EMAIL": "${user_config.jira_email}",
         "LAZYFLOW_JIRA_BASE_URL": "${user_config.jira_base_url}",
         "LAZYFLOW_REPOS": "${user_config.repos}",
         "LAZYFLOW_JIRA_PROJECTS": "${user_config.jira_projects}",
@@ -26,9 +27,15 @@
       "required": true
     },
     "jira_oauth_token": {
-      "description": "Jira Cloud OAuth 2.0 token (read-only scopes). Required for Jira sync.",
+      "description": "Jira Cloud API token (create at id.atlassian.com → API tokens). Used with jira_email for Basic auth. Required for Jira sync.",
       "sensitive": true,
       "required": false
+    },
+    "jira_email": {
+      "description": "Atlassian account email for the API token, e.g. you@acme.com. Required alongside the Jira API token.",
+      "sensitive": false,
+      "required": false,
+      "default": ""
     },
     "jira_base_url": {
       "description": "Jira Cloud base URL, e.g. https://acme.atlassian.net. Required for Jira sync.",

@@ -49,16 +49,25 @@ export async function runSync(
   // A null client means the caller did not request (or has not configured) that
   // source — skip its sync and return empty results rather than crashing. The
   // downstream identity/linking passes still run over whatever is already stored.
+  const tGh = Date.now()
   const ghResult = githubClient
     ? await syncGitHub(store, githubClient, githubScope, githubMode, now)
-    : { org: githubScope.org ?? '', repos: [], mode: githubMode }
+    : { org: githubScope.org ?? '', repos: [], mode: githubMode, warnings: [] }
+  const githubMs = Date.now() - tGh
+  // Surface repo-resolution warnings (e.g. a configured repo the token can't see)
+  // so a zero-repo sync is visible instead of looking like a clean success.
+  if (ghResult.warnings && ghResult.warnings.length > 0) {
+    errors.push(...ghResult.warnings.map((w) => `github: ${w}`))
+  }
 
   // -------------------------------------------------------------------------
   // 2. Jira sync
   // -------------------------------------------------------------------------
+  const tJira = Date.now()
   const jiraResult = jiraClient
     ? await syncJira(store, jiraClient, jiraScope, jiraMode, now)
-    : { projectsProcessed: [], issuesUpserted: 0, transitionsAppended: 0, errors: [] }
+    : { projectsProcessed: [], issuesUpserted: 0, transitionsAppended: 0, errors: [], warnings: [] }
+  const jiraMs = Date.now() - tJira
   if (jiraResult.errors.length > 0) {
     errors.push(...jiraResult.errors.map((e) => `jira: ${e}`))
   }
@@ -139,6 +148,7 @@ export async function runSync(
       issuesUpserted: jiraResult.issuesUpserted,
       transitionsAppended: jiraResult.transitionsAppended,
       errors: jiraResult.errors,
+      warnings: jiraResult.warnings ?? [],
     },
     identity: {
       identitiesUpserted: resolveResult.identitiesUpserted,
@@ -155,5 +165,6 @@ export async function runSync(
     },
     rederive,
     errors,
+    timings: { githubMs, jiraMs },
   }
 }

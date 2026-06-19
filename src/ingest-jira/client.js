@@ -3,9 +3,14 @@
  *
  * Uses native fetch — no Jira SDK dependency (SPEC §7.2, per task scope).
  *
- * Auth: OAuth 2.0 3LO bearer token (read-only scopes) or API-token fallback —
- * both are passed via the Authorization header. The caller is responsible for
- * obtaining/refreshing the token.
+ * Auth: two schemes, selected by whether an account `email` is supplied:
+ *   - Basic (email + API token): `Authorization: Basic base64(email:token)`.
+ *     This is REQUIRED for an Atlassian API token (prefix `ATATT…`) against a
+ *     Jira Cloud SITE URL (https://<tenant>.atlassian.net). It is the common case.
+ *   - Bearer (OAuth 2.0 3LO access token): used when no email is given. Note a
+ *     3LO token only works against https://api.atlassian.com/ex/jira/{cloudId},
+ *     NOT the site URL — so this path is for callers that set baseUrl accordingly.
+ * The caller is responsible for obtaining/refreshing the token.
  *
  * Endpoints covered:
  *   POST /rest/api/3/search/jql            — cursor-paginated issue search
@@ -71,12 +76,14 @@ function parseRetryAfterMs(header) {
 export class JiraClient {
   baseUrl
   token
+  email
+  authHeader
   maxRetries
   timeoutMs
 
   constructor(opts) {
     // Validate before any token-bearing request: https-only and no private/
-    // metadata host (unless opted in), so the bearer token is never sent in
+    // metadata host (unless opted in), so the credential is never sent in
     // cleartext or used for an authenticated SSRF (e.g. 169.254.169.254).
     assertSafeBaseUrl(opts.baseUrl, {
       allowInsecure: opts.allowInsecureBaseUrl,
@@ -84,6 +91,15 @@ export class JiraClient {
     })
     this.baseUrl = opts.baseUrl.replace(/\/$/, '')
     this.token = opts.token
+    this.email = opts.email ?? ''
+    // An API token against a Jira Cloud site URL requires Basic auth
+    // (base64(email:token)); only a 3LO OAuth token uses Bearer. Pick the scheme
+    // up front so every request is consistent. The header value is a secret and
+    // is never logged.
+    this.authHeader =
+      this.email !== ''
+        ? `Basic ${Buffer.from(`${this.email}:${this.token}`).toString('base64')}`
+        : `Bearer ${this.token}`
     this.maxRetries = opts.maxRetries ?? 5
     this.timeoutMs = opts.timeoutMs ?? 30_000
   }
@@ -95,7 +111,7 @@ export class JiraClient {
   async fetch(path, init) {
     const url = `${this.baseUrl}${path}`
     const headers = {
-      Authorization: `Bearer ${this.token}`,
+      Authorization: this.authHeader,
       Accept: 'application/json',
       'Content-Type': 'application/json',
       ...init?.headers,
@@ -192,7 +208,10 @@ export class JiraClient {
       body.nextPageToken = opts.nextPageToken
     }
     if (opts.expand !== undefined) {
-      body.expand = opts.expand
+      // The enhanced /rest/api/3/search/jql endpoint expects `expand` as a
+      // comma-separated STRING. The deprecated /search accepted an array; passing
+      // an array here returns HTTP 400 and silently blocks all issue ingestion.
+      body.expand = Array.isArray(opts.expand) ? opts.expand.join(',') : opts.expand
     }
 
     const data = await this.postJson('/rest/api/3/search/jql', body)

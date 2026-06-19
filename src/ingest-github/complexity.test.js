@@ -12,12 +12,21 @@ function makeStore() {
 }
 
 // Stub client: head source has a branch (cyclomatic 2), base source is straight-line.
+// Mirrors the GraphQL fetchBlobs contract: returns a Map keyed `"<sha>:<path>"`.
 function makeClient() {
   return {
-    getFileContentAtRef: async (_owner, _repo, _path, ref) =>
-      ref === 'head1'
-        ? 'export function f(a) { if (a) { return 1 } return 2 }'
-        : 'export function f() { return 1 }',
+    fetchBlobs: async (_owner, _repo, refPaths) => {
+      const m = new Map()
+      for (const { sha, path } of refPaths) {
+        m.set(
+          `${sha}:${path}`,
+          sha === 'head1'
+            ? 'export function f(a) { if (a) { return 1 } return 2 }'
+            : 'export function f() { return 1 }',
+        )
+      }
+      return m
+    },
   }
 }
 

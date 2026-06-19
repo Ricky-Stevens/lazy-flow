@@ -170,6 +170,216 @@ async function resolveOrgId(store) {
  * check runs (completedAt/startedAt). Issues + transitions are loaded whole.
  */
 async function loadScopeData(store, windowFrom, windowTo) {
+  // Single code path for on-demand (get_* tools) AND backfill: bulk-load the whole
+  // dataset once, then slice the window in memory. The backfill passes the loaded
+  // full dataset across all days/metrics via computeMetric's `preloaded` arg, so it
+  // only pays the bulk load once per run rather than per (metric, day).
+  return sliceScopeData(await loadFullScopeData(store), windowFrom, windowTo)
+}
+
+/** Group an array into a Map keyed by `keyFn`, preserving input order within each
+ * bucket (callers rely on the bulk getters' ORDER BY to order each bucket). */
+function groupBy(rows, keyFn) {
+  const m = new Map()
+  for (const row of rows) {
+    const k = keyFn(row)
+    const arr = m.get(k)
+    if (arr) arr.push(row)
+    else m.set(k, [row])
+  }
+  return m
+}
+
+/**
+ * Bulk-load the ENTIRE scope dataset in ~10 queries (zero N+1), grouped in memory
+ * by repo / parent id so any window can be sliced with `sliceScopeData` as pure
+ * CPU (no further I/O). Window-independent and scope-independent — load it once
+ * per backfill and reuse across every day and both the team and org scopes.
+ */
+export async function loadFullScopeData(store) {
+  const orgId = await resolveOrgId(store)
+  const repos = orgId ? await store.getRepositoriesByOrg(orgId) : []
+  const repoIds = new Set(repos.map((r) => r.id))
+
+  const allIdentities = await store.listAllIdentities()
+  const botIdentityIds = new Set(allIdentities.filter((i) => i.isBot).map((i) => i.id))
+
+  // One bulk query per table; group by repo/parent, scoped to the org's repos.
+  // The getters' ORDER BY preserves the same ordering the per-scope getters used.
+  const prsByRepo = new Map()
+  for (const pr of await store.getAllPullRequests()) {
+    if (!repoIds.has(pr.repoId)) continue
+    const arr = prsByRepo.get(pr.repoId)
+    if (arr) arr.push(pr)
+    else prsByRepo.set(pr.repoId, [pr])
+  }
+
+  const reviewsByPr = groupBy(await store.getAllReviews(), (r) => r.prId)
+  const commentsByPr = groupBy(await store.getAllReviewComments(), (c) => c.prId)
+  const filesByPr = groupBy(await store.getAllPrFiles(), (f) => f.prId)
+
+  const deploysByRepo = new Map()
+  for (const d of await store.getAllDeployments()) {
+    if (!repoIds.has(d.repoId)) continue
+    const arr = deploysByRepo.get(d.repoId)
+    if (arr) arr.push(d)
+    else deploysByRepo.set(d.repoId, [d])
+  }
+
+  const commitsByRepo = new Map()
+  for (const c of await store.getAllCommits()) {
+    if (!repoIds.has(c.repoId)) continue
+    const arr = commitsByRepo.get(c.repoId)
+    if (arr) arr.push(c)
+    else commitsByRepo.set(c.repoId, [c])
+  }
+
+  const checkRunsByRepo = new Map()
+  for (const cr of await store.getAllCheckRuns()) {
+    if (!repoIds.has(cr.repoId)) continue
+    const arr = checkRunsByRepo.get(cr.repoId)
+    if (arr) arr.push(cr)
+    else checkRunsByRepo.set(cr.repoId, [cr])
+  }
+
+  // Issues per project (few projects — NOT an N+1 over issues); transitions bulk.
+  const projects = await store.listJiraProjects()
+  const issuesByProject = new Map()
+  for (const project of projects) {
+    issuesByProject.set(project.id, await store.getIssuesByProject(project.id))
+  }
+  const transitionsByIssue = groupBy(await store.getAllIssueTransitions(), (t) => t.issueId)
+
+  return {
+    repos,
+    prsByRepo,
+    reviewsByPr,
+    commentsByPr,
+    filesByPr,
+    deploysByRepo,
+    commitsByRepo,
+    checkRunsByRepo,
+    projectIds: projects.map((p) => p.id),
+    issuesByProject,
+    transitionsByIssue,
+    botIdentityIds,
+  }
+}
+
+/**
+ * Slice a window out of the full dataset, producing the exact ScopeData shape the
+ * metric computations consume. Every predicate mirrors the corresponding store
+ * getter's SQL EXACTLY (string compares on the same ISO bounds; numeric inWindow
+ * for check runs) so the result is equivalent to the old per-window SQL load —
+ * see loadScopeDataWindowed and its equivalence test.
+ */
+export function sliceScopeData(full, windowFrom, windowTo) {
+  const fromMs = dayStartMs(windowFrom)
+  const toMs = dayEndMs(windowTo)
+  const fromIso = dayStartIso(windowFrom)
+  const toIso = dayEndIso(windowTo)
+  // Prior rolling-HALOC boundary (Nagappan-Ball denominator): PRs created strictly
+  // before the window. Mirrors getPrFilesByRepo(repo, undefined, priorUntilIso).
+  const priorUntilIso = new Date(fromMs - 1).toISOString()
+
+  const prs = []
+  const deploys = []
+  const commits = []
+  const checkRuns = []
+  const reviewsByPr = new Map()
+  const reviewCommentsByPr = new Map()
+  const prFilesByPr = new Map()
+  let priorHaloc = 0
+
+  for (const repo of full.repos) {
+    const repoPrs = full.prsByRepo.get(repo.id) ?? []
+
+    // Mirror getPullRequestsForMetrics: created-in-window OR merged-in-window OR
+    // still-open (created on/before the window end).
+    for (const pr of repoPrs) {
+      const match =
+        (pr.createdAt >= fromIso && pr.createdAt <= toIso) ||
+        (pr.mergedAt != null && pr.mergedAt >= fromIso && pr.mergedAt <= toIso) ||
+        (pr.state === 'open' && pr.createdAt <= toIso)
+      if (!match) continue
+      prs.push(pr)
+      reviewsByPr.set(pr.id, full.reviewsByPr.get(pr.id) ?? [])
+      reviewCommentsByPr.set(pr.id, full.commentsByPr.get(pr.id) ?? [])
+    }
+
+    // pr_files + prior HALOC window on the PR's created_at (mirror getPrFilesByRepo,
+    // which is independent of the PR-list predicate above).
+    for (const pr of repoPrs) {
+      const files = full.filesByPr.get(pr.id)
+      if (!files || files.length === 0) continue
+      if (pr.createdAt >= fromIso && pr.createdAt <= toIso) {
+        prFilesByPr.set(pr.id, files)
+      }
+      if (pr.createdAt <= priorUntilIso) {
+        for (const f of files) priorHaloc += f.haloc
+      }
+    }
+
+    for (const d of full.deploysByRepo.get(repo.id) ?? []) {
+      if (d.createdAt >= fromIso && d.createdAt <= toIso) deploys.push(d)
+    }
+
+    for (const c of full.commitsByRepo.get(repo.id) ?? []) {
+      if (c.authoredAt >= fromIso && c.authoredAt <= toIso) {
+        commits.push({ repoId: c.repoId, sha: c.sha, authoredAt: c.authoredAt })
+      }
+    }
+
+    for (const cr of full.checkRunsByRepo.get(repo.id) ?? []) {
+      const stamp = cr.completedAt ?? cr.startedAt
+      if (!inWindow(stamp, fromMs, toMs)) continue
+      checkRuns.push({
+        nodeId: cr.nodeId,
+        repoId: cr.repoId,
+        headSha: cr.headSha,
+        name: cr.name,
+        status: cr.status,
+        conclusion: cr.conclusion,
+        startedAt: cr.startedAt,
+        completedAt: cr.completedAt,
+      })
+    }
+  }
+
+  // Issues + transitions are window-independent (metrics window them internally).
+  const issues = []
+  const transitionsByIssue = new Map()
+  for (const projectId of full.projectIds) {
+    for (const issue of full.issuesByProject.get(projectId) ?? []) {
+      issues.push(issue)
+      transitionsByIssue.set(issue.id, full.transitionsByIssue.get(issue.id) ?? [])
+    }
+  }
+
+  return {
+    prs,
+    reviewsByPr,
+    reviewCommentsByPr,
+    deploys,
+    commits,
+    checkRuns,
+    issues,
+    transitionsByIssue,
+    projectIds: full.projectIds,
+    botIdentityIds: full.botIdentityIds,
+    prFilesByPr,
+    priorHaloc,
+  }
+}
+
+/**
+ * REFERENCE IMPLEMENTATION (oracle): the original per-window SQL loader, kept as
+ * the correctness oracle for `loadFullScopeData`+`sliceScopeData`. The equivalence
+ * test asserts the in-memory slice yields identical metric values for every metric
+ * over a range of windows. Not used on the hot path (it carries the per-PR /
+ * per-issue N+1 the bulk loader eliminates).
+ */
+export async function loadScopeDataWindowed(store, windowFrom, windowTo) {
   const fromMs = dayStartMs(windowFrom)
   const toMs = dayEndMs(windowTo)
   const fromIso = dayStartIso(windowFrom)
@@ -198,7 +408,6 @@ async function loadScopeData(store, windowFrom, windowTo) {
       reviewCommentsByPr.set(pr.id, await store.getReviewCommentsByPullRequest(pr.id))
     }
 
-    // Per-file diffs for PRs created in the window (code.* metric inputs).
     const repoPrFiles = await store.getPrFilesByRepo(repo.id, fromIso, toIso)
     for (const f of repoPrFiles) {
       const arr = prFilesByPr.get(f.prId)
@@ -206,8 +415,6 @@ async function loadScopeData(store, windowFrom, windowTo) {
       else prFilesByPr.set(f.prId, [f])
     }
 
-    // Prior rolling HALOC: pr_files of PRs created strictly BEFORE the window
-    // (Nagappan-Ball M1 relative-churn denominator). Bounded by until=fromMs-1ms.
     const priorUntilIso = new Date(fromMs - 1).toISOString()
     const repoPriorFiles = await store.getPrFilesByRepo(repo.id, undefined, priorUntilIso)
     for (const f of repoPriorFiles) priorHaloc += f.haloc
@@ -1744,6 +1951,7 @@ export async function computeMetric(
   windowFrom,
   windowTo,
   now,
+  preloaded,
 ) {
   // Unknown / unwired metric id — valid no_data result, never throw.
   if (!COMPUTE_METRIC_IDS.includes(metricId)) {
@@ -1758,11 +1966,15 @@ export async function computeMetric(
     const identities = await store.getIdentitiesByPerson(scopeId)
     const identityIds = new Set(identities.map((i) => i.id))
     if (identityIds.size === 0) return noDataResult(metricId, scopeType, now)
-    const personData = await loadScopeData(store, windowFrom, windowTo)
+    const personData = preloaded ?? (await loadScopeData(store, windowFrom, windowTo))
     return computePersonRaw(store, metricId, windowFrom, windowTo, now, personData, identityIds)
   }
 
-  const data = await loadScopeData(store, windowFrom, windowTo)
+  // `loadScopeData` depends ONLY on (windowFrom, windowTo) — not on the metric or
+  // scope — so a caller computing many metrics for the same window (e.g. the
+  // snapshot backfill: 39 metrics × 2 scopes per day) can load it ONCE and pass it
+  // in via `preloaded`, instead of re-reading the whole scope dataset per metric.
+  const data = preloaded ?? (await loadScopeData(store, windowFrom, windowTo))
   const result = await computeRaw(store, scopeType, metricId, windowFrom, windowTo, now, data)
 
   // Goodhart caution for pin-target-sensitive metrics (independent of data).
@@ -1799,6 +2011,14 @@ export async function backfillSnapshots(store, opts) {
   let written = 0
 
   const nowMs = new Date(opts.now).getTime()
+
+  // Bulk-load the ENTIRE dataset ONCE for the whole backfill (~10 queries, zero
+  // N+1). Every day's window is then sliced from it in memory (pure CPU, no I/O),
+  // and each day's snapshots are bulk-inserted. This replaces what was ~16M
+  // queries (9,360 (metric,day) × ~1,700 reads each) with ~10 reads + chunked
+  // writes.
+  const full = await loadFullScopeData(store)
+
   for (const day of days) {
     const windowFrom = shiftDay(day, -(window - 1))
     // Clock each day's snapshot to the END of that day (clamped to the real
@@ -1808,6 +2028,11 @@ export async function backfillSnapshots(store, opts) {
     // every backfilled snapshot identical to the latest one.
     const dayEnd = dayEndIso(day)
     const dayNow = new Date(dayEnd).getTime() <= nowMs ? dayEnd : opts.now
+
+    // In-memory window slice — no DB reads. Shared by all metrics for this day.
+    const data = sliceScopeData(full, windowFrom, day)
+
+    const snapshots = []
     for (const metricId of opts.metricIds) {
       const result = await computeMetric(
         store,
@@ -1817,8 +2042,9 @@ export async function backfillSnapshots(store, opts) {
         windowFrom,
         day,
         dayNow,
+        data,
       )
-      await store.putSnapshot({
+      snapshots.push({
         scopeType: opts.scopeType,
         scopeId: opts.scopeId,
         metric: metricId,
@@ -1834,8 +2060,11 @@ export async function backfillSnapshots(store, opts) {
         isStale: false,
         dataSource: result.dataSource,
       })
-      written++
     }
+
+    // One chunked, multi-row INSERT per day (was 39 single-row writes/fsyncs).
+    await store.putSnapshots(snapshots)
+    written += snapshots.length
   }
 
   return written

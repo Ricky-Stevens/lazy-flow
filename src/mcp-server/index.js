@@ -34,7 +34,11 @@ async function main() {
 
   const jiraClient =
     config.jiraToken !== null && config.jiraBaseUrl !== ''
-      ? new JiraClient({ baseUrl: config.jiraBaseUrl, token: config.jiraToken })
+      ? new JiraClient({
+          baseUrl: config.jiraBaseUrl,
+          token: config.jiraToken,
+          email: config.jiraEmail,
+        })
       : null
 
   const ctx = {

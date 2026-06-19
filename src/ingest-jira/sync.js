@@ -1,4 +1,4 @@
-import { scrubFreeText } from '../core/index.js'
+import { mapWithConcurrency, scrubFreeText } from '../core/index.js'
 import { ingestBoardConfig } from './boardconfig.js'
 import { buildStatusCategoryHistory, buildStatusCategoryMap, parseChangelog } from './changelog.js'
 
@@ -24,6 +24,15 @@ function escapeJqlString(value) {
   return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
 }
 
+/** Extract the HTTP status embedded in a JiraClient error message, or null. */
+function httpStatusOf(err) {
+  const m = err instanceof Error ? err.message.match(/HTTP (\d{3})\b/) : null
+  return m ? Number(m[1]) : null
+}
+
+/** Concurrent Jira read round trips in flight at once (sprint reports, etc.). */
+const JIRA_FETCH_CONCURRENCY = 8
+
 // ---------------------------------------------------------------------------
 // syncJira
 // ---------------------------------------------------------------------------
@@ -36,6 +45,10 @@ export async function syncJira(store, client, scope, mode, now = new Date().toIS
     transitionsAppended: 0,
     sprintEventsAppended: 0,
     errors: [],
+    // Expected, non-fatal conditions on a normal-permission token (kanban boards
+    // have no sprints, workflow search needs admin, future/empty sprints have no
+    // report). These must NOT pollute `errors` or a healthy sync looks broken.
+    warnings: [],
   }
 
   // -------------------------------------------------------------------------
@@ -92,7 +105,13 @@ export async function syncJira(store, client, scope, mode, now = new Date().toIS
           if (rawSprint.startDate) sprintStarts.set(String(rawSprint.id), rawSprint.startDate)
         }
       } catch (err) {
-        result.errors.push(`Sprint list failed for board ${boardId}: ${String(err)}`)
+        // A 400 here means the board has no sprint support (e.g. a Kanban board) —
+        // expected, not a failure.
+        if (httpStatusOf(err) === 400) {
+          result.warnings.push(`board ${boardId} does not support sprints (skipped)`)
+        } else {
+          result.errors.push(`Sprint list failed for board ${boardId}: ${String(err)}`)
+        }
       }
     }
   }
@@ -146,7 +165,16 @@ export async function syncJira(store, client, scope, mode, now = new Date().toIS
         try {
           await ingestWorkflows(store, client, projectId, now)
         } catch (err) {
-          result.errors.push(`Workflow ingest failed for project ${projectKey}: ${String(err)}`)
+          // Workflow search requires Jira admin; a 403/404 on a read-only token is
+          // expected. Flow metrics fall back to the status-category heuristic.
+          const status = httpStatusOf(err)
+          if (status === 403 || status === 404) {
+            result.warnings.push(
+              `workflow metadata unavailable for ${projectKey} (needs admin or not present; skipped)`,
+            )
+          } else {
+            result.errors.push(`Workflow ingest failed for project ${projectKey}: ${String(err)}`)
+          }
         }
       }
 
@@ -194,6 +222,12 @@ export async function syncJira(store, client, scope, mode, now = new Date().toIS
       // server-provided timestamps (robust to local/Jira clock skew) rather than
       // the local sync-start clock.
       let maxUpdatedAt = null
+      // parent_id is a self-FK. A child issue can be synced before its parent
+      // (created-ASC ordering isn't a guarantee, and the parent may be in an
+      // unsynced project), so we write parent_id=null when the parent isn't
+      // present yet and fill it in a second pass once the project is fully
+      // ingested. Without this, the parent FK aborts the whole project sync.
+      const deferredParents = []
 
       // expand=changelog returns the first changelog page inline with each issue,
       // eliminating the per-issue changelog round trip (N+1) for issues whose
@@ -203,25 +237,40 @@ export async function syncJira(store, client, scope, mode, now = new Date().toIS
         for (const rawIssue of issuesBatch) {
           seenIssueIds.add(rawIssue.id)
 
-          const issue = mapRawIssue(rawIssue, projectId, storyPointFieldId, statusCategoryMap, now)
-          await store.upsertIssue(issue)
-          result.issuesUpserted++
-          if (issue.updatedAt && (maxUpdatedAt === null || issue.updatedAt > maxUpdatedAt)) {
-            maxUpdatedAt = issue.updatedAt
-          }
-
-          // Upsert current key
-          const issueKey = {
-            issueId: rawIssue.id,
-            key: rawIssue.key,
-            validFrom: issue.createdAt,
-            validTo: null,
-          }
-          await store.upsertIssueKey(issueKey)
-
-          // Use the inline changelog when expand returned a complete one; only
-          // paginate via getChangelogAll for issues whose history was truncated.
+          // One try PER ISSUE: a single bad issue (FK edge, malformed payload)
+          // must never abort ingestion of the rest of the project.
           try {
+            const issue = mapRawIssue(
+              rawIssue,
+              projectId,
+              storyPointFieldId,
+              statusCategoryMap,
+              now,
+            )
+
+            // Defer a parent link whose parent isn't in the store yet (see above).
+            if (issue.parentId && (await store.getIssue(issue.parentId)) === null) {
+              deferredParents.push({ childId: issue.id, parentId: issue.parentId })
+              issue.parentId = null
+            }
+
+            await store.upsertIssue(issue)
+            result.issuesUpserted++
+            if (issue.updatedAt && (maxUpdatedAt === null || issue.updatedAt > maxUpdatedAt)) {
+              maxUpdatedAt = issue.updatedAt
+            }
+
+            // Upsert current key
+            const issueKey = {
+              issueId: rawIssue.id,
+              key: rawIssue.key,
+              validFrom: issue.createdAt,
+              validTo: null,
+            }
+            await store.upsertIssueKey(issueKey)
+
+            // Use the inline changelog when expand returned a complete one; only
+            // paginate via getChangelogAll for issues whose history was truncated.
             const inline = rawIssue.changelog
             let histories
             // Trust the inline page only when we can PROVE it is complete:
@@ -262,14 +311,27 @@ export async function syncJira(store, client, scope, mode, now = new Date().toIS
               await store.upsertIssueKey(k)
             }
 
-            // Append sprint events from Sprint-field changelog
+            // Append sprint events from Sprint-field changelog. Guard the
+            // sprint FK: a changelog can reference a sprint we never fetched
+            // (a Kanban board skipped, or a sprint on an un-enumerated board);
+            // skip those rather than violate sprint_membership_events → sprints.
             for (const evt of sprintEvents) {
+              if ((await store.getSprint(evt.sprintId)) === null) continue
               await store.appendSprintMembershipEvent(evt)
               result.sprintEventsAppended++
             }
           } catch (err) {
-            result.errors.push(`Changelog fetch failed for issue ${rawIssue.key}: ${String(err)}`)
+            result.errors.push(`Issue ${rawIssue.key} sync failed: ${String(err)}`)
           }
+        }
+      }
+
+      // Second pass: fill the parent links we deferred, now that every issue in
+      // the project has been written. A parent still absent here lives in an
+      // unsynced project — leave it null rather than fabricate a row.
+      for (const { childId, parentId } of deferredParents) {
+        if ((await store.getIssue(parentId)) !== null) {
+          await store.setIssueParent(childId, parentId)
         }
       }
 
@@ -328,15 +390,37 @@ export async function syncJira(store, client, scope, mode, now = new Date().toIS
   //    issue loop (FK). Reuses the sprints fetched in 1b (no re-list).
   // -------------------------------------------------------------------------
   if (mode !== 'tombstone') {
-    for (const { boardId, sprints } of boardSprints) {
-      for (const rawSprint of sprints) {
-        try {
-          const report = await client.getSprintReport(boardId, String(rawSprint.id))
-          await ingestSprintMembership(store, report, String(rawSprint.id), now)
-        } catch (err) {
-          result.errors.push(`Sprint report failed for sprint ${rawSprint.id}: ${String(err)}`)
-        }
+    // The agile sprint-report endpoint 404s for sprints without an available
+    // report (future/empty sprints, or instances on the newer report variant).
+    // That is expected and high-volume, so aggregate it into a single warning
+    // rather than emitting one error per sprint.
+    // Fetch every sprint's report CONCURRENTLY (was the main serial Jira N+1),
+    // then ingest membership sequentially (SQLite single-writer).
+    const sprintTasks = boardSprints.flatMap(({ boardId, sprints }) =>
+      sprints.map((rawSprint) => ({ boardId, sprintId: String(rawSprint.id) })),
+    )
+    const reports = await mapWithConcurrency(sprintTasks, JIRA_FETCH_CONCURRENCY, async (t) => {
+      try {
+        return { sprintId: t.sprintId, report: await client.getSprintReport(t.boardId, t.sprintId) }
+      } catch (err) {
+        return { sprintId: t.sprintId, error: err }
       }
+    })
+    let reportsUnavailable = 0
+    for (const r of reports) {
+      if (r.error) {
+        if (httpStatusOf(r.error) === 404) reportsUnavailable++
+        else result.errors.push(`Sprint report failed for sprint ${r.sprintId}: ${String(r.error)}`)
+        continue
+      }
+      try {
+        await ingestSprintMembership(store, r.report, r.sprintId, now)
+      } catch (err) {
+        result.errors.push(`Sprint report failed for sprint ${r.sprintId}: ${String(err)}`)
+      }
+    }
+    if (reportsUnavailable > 0) {
+      result.warnings.push(`${reportsUnavailable} sprint report(s) unavailable (skipped)`)
     }
   }
 
@@ -468,6 +552,12 @@ async function ingestSprintMembership(store, report, sprintId, now) {
   for (const i of allIssues) {
     if (seen.has(i.id)) continue
     seen.add(i.id)
+
+    // sprint_membership_events.issue_id is a FK. A sprint report can list issues
+    // outside the synced project/window (cross-project sprints, issues filtered
+    // out by the JQL) — skip those rather than violate the FK and abort the
+    // sprint's membership ingest.
+    if ((await store.getIssue(i.id)) === null) continue
 
     const event = {
       sprintId,

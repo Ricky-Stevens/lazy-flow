@@ -12,6 +12,20 @@ function nextLink(url, page) {
   return `<${next.toString()}>; rel="next"`
 }
 
+/** Build a GraphQL repository node from a dataset repo record. databaseId is the
+ * node id the old REST raw carried, so the stored githubNodeId is unchanged. */
+function repoMetaNode(r) {
+  return {
+    databaseId: r.githubNodeId,
+    nameWithOwner: `${r.owner}/${r.name}`,
+    defaultBranchRef: { name: r.defaultBranch },
+    isArchived: r.isArchived,
+    isFork: r.isFork,
+    createdAt: r.createdAt,
+    updatedAt: r.updatedAt,
+  }
+}
+
 /** Standard rate-limit headers appended to every REST response. */
 const rateLimitHeaders = {
   'X-RateLimit-Limit': '5000',
@@ -445,23 +459,258 @@ function graphQLHandlers() {
       return HttpResponse.json(result)
     }),
 
-    // Convenience query: list all PRs for a repo
-    graphql.query('RepoPullRequests', ({ variables }) => {
-      const vars = variables
-      const owner = vars.owner
-      const name = vars.name
-      const repoRecord = baseOrg.repositories.find((r) => r.owner === owner && r.name === name)
-      if (!repoRecord) {
-        return HttpResponse.json({ errors: [{ message: 'repo not found' }] })
-      }
-      const prs = baseOrg.pullRequests.filter((p) => p.repoId === repoRecord.id)
+    // Repo metadata (replaces REST GET /repos/{o}/{r}). databaseId mirrors the
+    // node id the REST raw carried so the stored githubNodeId is unchanged.
+    graphql.query('RepoMeta', ({ variables }) => {
+      const { owner, name } = variables
+      const r = baseOrg.repositories.find((x) => x.owner === owner && x.name === name)
+      return HttpResponse.json({
+        data: {
+          repository: r ? repoMetaNode(r) : null,
+          rateLimit: { cost: 1, remaining: 4999, resetAt: new Date().toISOString() },
+        },
+      })
+    }),
+
+    // Org repo discovery (replaces REST GET /orgs/{org}/repos).
+    graphql.query('OrgRepos', ({ variables }) => {
+      const { org } = variables
+      const nodes = baseOrg.repositories.filter((r) => r.owner === org).map(repoMetaNode)
+      return HttpResponse.json({
+        data: {
+          organization: {
+            repositories: { pageInfo: { hasNextPage: false, endCursor: null }, nodes },
+          },
+          rateLimit: { cost: 1, remaining: 4999, resetAt: new Date().toISOString() },
+        },
+      })
+    }),
+
+    // Releases (replaces REST GET /repos/{o}/{r}/releases). Base dataset has none.
+    graphql.query('RepoReleases', () => {
       return HttpResponse.json({
         data: {
           repository: {
-            pullRequests: {
-              nodes: prs.map((p) => ({ id: p.id, number: p.number, state: p.state })),
-              pageInfo: { hasNextPage: false, endCursor: null },
+            releases: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] },
+          },
+          rateLimit: { cost: 1, remaining: 4999, resetAt: new Date().toISOString() },
+        },
+      })
+    }),
+
+    // Bulk default-branch commit history with line stats + check runs inline
+    // (replaces REST list + per-commit detail + per-commit check-runs). additions/
+    // deletions mirror the REST commit-DETAIL fixture (so stored stats match);
+    // check runs are nested per commit by head sha, with UPPER-case enums the
+    // client adapter lower-cases.
+    graphql.query('CommitHistory', ({ variables }) => {
+      const { owner, name } = variables
+      const repo = baseOrg.repositories.find((r) => r.owner === owner && r.name === name)
+      if (!repo) {
+        return HttpResponse.json({
+          data: {
+            repository: null,
+            rateLimit: { cost: 1, remaining: 4999, resetAt: new Date().toISOString() },
+          },
+        })
+      }
+      const nodes = baseOrg.commits
+        .filter((c) => c.repoId === repo.id)
+        .map((c) => {
+          const detail = baseOrg.commitDetails.find((d) => d.sha === c.sha)
+          const rawObj = JSON.parse(c.raw)
+          const login = rawObj.author?.login ?? null
+          const checkRuns = baseOrg.checkRuns
+            .filter((cr) => cr.headSha === c.sha)
+            .map((cr) => ({
+              databaseId: cr.nodeId,
+              name: cr.name,
+              status: cr.status ? cr.status.toUpperCase() : null,
+              conclusion: cr.conclusion ? cr.conclusion.toUpperCase() : null,
+              startedAt: cr.startedAt ?? null,
+              completedAt: cr.completedAt ?? null,
+            }))
+          return {
+            oid: c.sha,
+            committedDate: c.committedAt,
+            authoredDate: c.authoredAt,
+            additions: detail?.additions ?? 0,
+            deletions: detail?.deletions ?? 0,
+            message: c.message ?? '',
+            author: { name: null, email: 'unknown', user: login ? { login } : null },
+            checkSuites: { nodes: [{ checkRuns: { nodes: checkRuns } }] },
+          }
+        })
+      return HttpResponse.json({
+        data: {
+          repository: {
+            defaultBranchRef: {
+              target: { history: { pageInfo: { hasNextPage: false, endCursor: null }, nodes } },
             },
+          },
+          rateLimit: { cost: 1, remaining: 4999, resetAt: new Date().toISOString() },
+        },
+      })
+    }),
+
+    // Bulk file-content blobs. The base dataset carries no file contents (the
+    // REST contents endpoint 404'd here too), so every alias resolves to null —
+    // complexity analysis finds no source and writes nothing, exactly as before.
+    graphql.query('FileBlobs', () => {
+      return HttpResponse.json({
+        data: {
+          repository: {},
+          rateLimit: { cost: 1, remaining: 4999, resetAt: new Date().toISOString() },
+        },
+      })
+    }),
+
+    // Bulk deployments with inline latestStatus (replaces REST list + per-deploy
+    // status N+1). databaseId mirrors the REST numeric id so String(databaseId)
+    // equals the row id the engine stored via the old REST path; the latest
+    // status state is the upper-case GraphQL enum the mapper lower-cases.
+    graphql.query('RepoDeployments', ({ variables }) => {
+      const { owner, name } = variables
+      const repoRecord = baseOrg.repositories.find((r) => r.owner === owner && r.name === name)
+      if (!repoRecord) {
+        return HttpResponse.json({
+          data: {
+            repository: null,
+            rateLimit: { cost: 1, remaining: 4999, resetAt: new Date().toISOString() },
+          },
+        })
+      }
+      const deploys = baseOrg.deployments.filter((d) => d.repoId === repoRecord.id)
+      const nodes = deploys.map((d) => {
+        const raw = JSON.parse(d.raw)
+        return {
+          databaseId: d.id,
+          environment: raw.environment ?? 'production',
+          commitOid: raw.sha ?? '',
+          createdAt: d.createdAt ?? raw.created_at ?? null,
+          updatedAt: d.updatedAt ?? raw.updated_at ?? d.createdAt ?? null,
+          latestStatus: {
+            state: String(d.status).toUpperCase(),
+            createdAt: d.finishedAt ?? d.createdAt ?? null,
+          },
+        }
+      })
+      return HttpResponse.json({
+        data: {
+          repository: {
+            deployments: { pageInfo: { hasNextPage: false, endCursor: null }, nodes },
+          },
+          rateLimit: { cost: 1, remaining: 4999, resetAt: new Date().toISOString() },
+        },
+      })
+    }),
+
+    // Bulk PRs with reviews, review-thread comments, files and head-commit check
+    // runs nested inline (replaces REST PR list + per-PR reviews/comments/files/
+    // check-runs N+1). Enums are UPPER-case as real GitHub returns them; the
+    // client adapter normalises. The fixture PR `raw` omits `user`/`merged_by`,
+    // so author/mergedBy are null here too (parity with the old REST list path).
+    graphql.query('RepoPullRequests', ({ variables }) => {
+      const { owner, name } = variables
+      const repoRecord = baseOrg.repositories.find((r) => r.owner === owner && r.name === name)
+      if (!repoRecord) {
+        return HttpResponse.json({
+          data: {
+            repository: null,
+            rateLimit: { cost: 1, remaining: 4999, resetAt: new Date().toISOString() },
+          },
+        })
+      }
+      const stateEnum = { merged: 'MERGED', closed: 'CLOSED', open: 'OPEN' }
+      const nodes = baseOrg.pullRequests
+        .filter((p) => p.repoId === repoRecord.id)
+        .map((p) => {
+          const raw = JSON.parse(p.raw)
+          const headSha = raw.head?.sha ?? null
+          const reviews = baseOrg.reviews
+            .filter((r) => r.prId === p.id)
+            .map((r) => {
+              const rraw = JSON.parse(r.raw)
+              return {
+                databaseId: r.nodeId,
+                state: rraw.state ?? r.state.toUpperCase(),
+                submittedAt: r.submittedAt,
+                author: rraw.user?.login ? { login: rraw.user.login } : null,
+              }
+            })
+          const threads = baseOrg.reviewComments
+            .filter((c) => c.prId === p.id)
+            .map((c) => {
+              const craw = JSON.parse(c.raw)
+              return {
+                comments: {
+                  nodes: [
+                    {
+                      databaseId: craw.id ?? c.nodeId,
+                      createdAt: c.createdAt,
+                      updatedAt: c.updatedAt,
+                      path: c.path ?? null,
+                      author: craw.user?.login ? { login: craw.user.login } : null,
+                      replyTo: c.inReplyTo ? { databaseId: c.inReplyTo } : null,
+                    },
+                  ],
+                },
+              }
+            })
+          const files = baseOrg.prFiles
+            .filter((f) => f.prId === p.id)
+            .map((f) => ({
+              path: f.path,
+              additions: f.additions,
+              deletions: f.deletions,
+              changeType: (f.status ?? 'modified').toUpperCase(),
+            }))
+          const headCheckRuns = baseOrg.checkRuns
+            .filter((cr) => cr.headSha === headSha)
+            .map((cr) => ({
+              databaseId: cr.nodeId,
+              name: cr.name,
+              status: cr.status ? cr.status.toUpperCase() : null,
+              conclusion: cr.conclusion ? cr.conclusion.toUpperCase() : null,
+              startedAt: cr.startedAt ?? null,
+              completedAt: cr.completedAt ?? null,
+            }))
+          return {
+            number: p.number,
+            title: raw.title ?? null,
+            body: raw.body ?? null,
+            state: stateEnum[p.state] ?? 'OPEN',
+            isDraft: raw.draft ?? false,
+            createdAt: p.createdAt,
+            updatedAt: p.updatedAt,
+            mergedAt: p.mergedAt ?? null,
+            baseRefName: p.baseRef,
+            baseRefOid: null,
+            headRefName: p.headRef,
+            headRefOid: headSha,
+            author: null,
+            mergedBy: null,
+            reviews: { pageInfo: { hasNextPage: false }, nodes: reviews },
+            reviewThreads: { pageInfo: { hasNextPage: false }, nodes: threads },
+            files: { pageInfo: { hasNextPage: false }, nodes: files },
+            headChecks: {
+              nodes: headSha
+                ? [
+                    {
+                      commit: {
+                        oid: headSha,
+                        checkSuites: { nodes: [{ checkRuns: { nodes: headCheckRuns } }] },
+                      },
+                    },
+                  ]
+                : [],
+            },
+          }
+        })
+      return HttpResponse.json({
+        data: {
+          repository: {
+            pullRequests: { pageInfo: { hasNextPage: false, endCursor: null }, nodes },
           },
           rateLimit: { cost: 1, remaining: 4999, resetAt: new Date().toISOString() },
         },

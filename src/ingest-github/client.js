@@ -1,24 +1,29 @@
 /**
- * GitHub REST + GraphQL client for lazy-flow ingestion (WP-GH-CLIENT).
+ * GitHub GraphQL client for lazy-flow ingestion (WP-GH-CLIENT).
  *
- * REST: bulk discovery — commits (since-paginated), PRs, reviews, review
- *   comments, timeline, deployments, releases, check runs, repo metadata.
+ * 100% GraphQL — every ingestion path is a bulk, nested query so a repo's data
+ * comes back in O(pages) requests instead of the per-item REST N+1 (~2000
+ * requests/repo before). Queries:
+ *   - RepoMeta / OrgRepos     — repo metadata + discovery
+ *   - CommitHistory           — default-branch commits with line stats + check runs inline
+ *   - RepoPullRequests        — PRs with reviews / comments / files / head-checks nested
+ *       (+ PrConnections continuation for a PR whose inline page overflows)
+ *   - RepoDeployments         — deployments with latestStatus inline
+ *   - RepoReleases            — release-tag deploy fallback
+ *   - FileBlobs               — batched file contents for complexity analysis
+ * Adapter functions normalise GraphQL nodes into the REST-ish shapes the sync
+ * mappers consume, so the write layer is transport-agnostic. GraphQL exposes no
+ * per-file patch text, so HALOC is derived from additions/deletions.
  *
- * GraphQL: per-PR object graph with cursor-paginated inner connections
- *   (reviews / comments / timeline / commits) exhausted page by page so a
- *   fat PR never silently caps at the first page (SPEC §7.1).
- *
- * Rate-limit: exposes remaining headroom from REST headers and the GraphQL
- *   rateLimit field. Callers can inspect `client.rateLimitRemaining`.
- *
- * Access scope: records which repos are visible via `listOrgRepos()` for the
- *   coverage fingerprint (SPEC §5.3).
+ * Rate-limit: GraphQL has its own point budget; graphqlRequest retries on HTTP
+ *   429/403 and body-level RATE_LIMITED with bounded backoff. `rateLimitRemaining`
+ *   is updated from each response's `rateLimit` field.
  *
  * Base URL is configurable so tests can point at the MSW mock server which
- *   intercepts `https://api.github.com` by default.
+ *   intercepts `https://api.github.com/graphql` by default.
  */
 
-import { assertSafeBaseUrl, assertSameOrigin } from '../core/index.js'
+import { assertSafeBaseUrl } from '../core/index.js'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -84,6 +89,348 @@ const PR_GRAPH_QUERY = /* graphql */ `
   }
 `
 
+/**
+ * Bulk deployments with their outcome INLINE (`latestStatus`), paginated 100 at
+ * a time. Replaces the REST list + per-deployment status N+1 with O(pages)
+ * queries. `databaseId` is the REST numeric id (kept as the stable row id);
+ * `state` is an upper-case enum the mapper lower-cases to match the REST states.
+ */
+const DEPLOYMENTS_QUERY = /* graphql */ `
+  query RepoDeployments($owner: String!, $name: String!, $after: String) {
+    repository(owner: $owner, name: $name) {
+      deployments(first: 100, after: $after, orderBy: { field: CREATED_AT, direction: DESC }) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          databaseId
+          environment
+          commitOid
+          createdAt
+          updatedAt
+          latestStatus { state createdAt }
+        }
+      }
+    }
+    rateLimit { cost remaining resetAt }
+  }
+`
+
+/**
+ * Bulk commit history (default branch) with line stats AND check runs INLINE,
+ * paginated 100 commits at a time. Replaces the REST list + per-commit DETAIL +
+ * per-commit check-runs N+1 (~2 REST calls PER commit) with O(commits/100)
+ * GraphQL requests. GraphQL exposes no per-file PATCH text, so HALOC is derived
+ * from additions/deletions (the documented fallback) rather than per-hunk.
+ */
+const COMMIT_HISTORY_QUERY = /* graphql */ `
+  query CommitHistory($owner: String!, $name: String!, $since: GitTimestamp, $after: String) {
+    repository(owner: $owner, name: $name) {
+      defaultBranchRef {
+        target {
+          ... on Commit {
+            history(first: 100, since: $since, after: $after) {
+              pageInfo { hasNextPage endCursor }
+              nodes {
+                oid
+                committedDate
+                authoredDate
+                additions
+                deletions
+                message
+                author { name email user { login } }
+                checkSuites(first: 10) {
+                  nodes {
+                    checkRuns(first: 100) {
+                      nodes { databaseId name status conclusion startedAt completedAt }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    rateLimit { cost remaining resetAt }
+  }
+`
+
+/**
+ * Bulk pull requests with reviews, review-thread comments, changed files and the
+ * head commit's check runs ALL nested inline, paginated 50 PRs at a time, ordered
+ * by UPDATED_AT desc for watermark early-exit. Replaces the REST PR list + the
+ * per-PR reviews/comments/files/check-runs N+1 (4 REST calls PER pr). Inner
+ * connections take first:100; a PR that overflows that is re-fetched via the
+ * paginated REST methods (rare — 100+ reviews/files on one PR). GraphQL files
+ * carry no patch, so pr_files HALOC uses additions/deletions.
+ */
+const REPO_PULL_REQUESTS_QUERY = /* graphql */ `
+  query RepoPullRequests($owner: String!, $name: String!, $after: String) {
+    repository(owner: $owner, name: $name) {
+      pullRequests(first: 50, after: $after, orderBy: { field: UPDATED_AT, direction: DESC }) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          number
+          title
+          body
+          state
+          isDraft
+          createdAt
+          updatedAt
+          mergedAt
+          baseRefName
+          baseRefOid
+          headRefName
+          headRefOid
+          author { login }
+          mergedBy { login }
+          reviews(first: 100) {
+            pageInfo { hasNextPage endCursor }
+            nodes { databaseId state submittedAt author { login } }
+          }
+          reviewThreads(first: 100) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              comments(first: 50) {
+                nodes { databaseId createdAt updatedAt path author { login } replyTo { databaseId } }
+              }
+            }
+          }
+          files(first: 100) {
+            pageInfo { hasNextPage endCursor }
+            nodes { path additions deletions changeType }
+          }
+          headChecks: commits(last: 1) {
+            nodes {
+              commit {
+                oid
+                checkSuites(first: 10) {
+                  nodes {
+                    checkRuns(first: 100) {
+                      nodes { databaseId name status conclusion startedAt completedAt }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    rateLimit { cost remaining resetAt }
+  }
+`
+
+/** Repo metadata via GraphQL (replaces REST GET /repos/{o}/{r} and the org repo
+ * list). Selected fields map 1:1 onto the REST-ish raw `mapRepository` consumes. */
+const REPO_META_FIELDS = /* graphql */ `
+  databaseId
+  nameWithOwner
+  defaultBranchRef { name }
+  isArchived
+  isFork
+  createdAt
+  updatedAt
+`
+const REPO_META_QUERY = /* graphql */ `
+  query RepoMeta($owner: String!, $name: String!) {
+    repository(owner: $owner, name: $name) { ${REPO_META_FIELDS} }
+    rateLimit { cost remaining resetAt }
+  }
+`
+const ORG_REPOS_QUERY = /* graphql */ `
+  query OrgRepos($org: String!, $after: String) {
+    organization(login: $org) {
+      repositories(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { ${REPO_META_FIELDS} }
+      }
+    }
+    rateLimit { cost remaining resetAt }
+  }
+`
+const RELEASES_QUERY = /* graphql */ `
+  query RepoReleases($owner: String!, $name: String!, $after: String) {
+    repository(owner: $owner, name: $name) {
+      releases(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { tagName createdAt tagCommit { oid } }
+      }
+    }
+    rateLimit { cost remaining resetAt }
+  }
+`
+
+// Continuation query for a SINGLE PR whose reviews/comments/files overflowed the
+// bulk query's first:100 inline page. Each connection is paged independently to
+// exhaustion (only the still-live cursors advance) — keeping fat PRs 100% GraphQL.
+const PR_CONNECTIONS_QUERY = /* graphql */ `
+  query PrConnections(
+    $owner: String!
+    $name: String!
+    $number: Int!
+    $reviewsAfter: String
+    $threadsAfter: String
+    $filesAfter: String
+  ) {
+    repository(owner: $owner, name: $name) {
+      pullRequest(number: $number) {
+        reviews(first: 100, after: $reviewsAfter) {
+          pageInfo { hasNextPage endCursor }
+          nodes { databaseId state submittedAt author { login } }
+        }
+        reviewThreads(first: 100, after: $threadsAfter) {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            comments(first: 50) {
+              nodes { databaseId createdAt updatedAt path author { login } replyTo { databaseId } }
+            }
+          }
+        }
+        files(first: 100, after: $filesAfter) {
+          pageInfo { hasNextPage endCursor }
+          nodes { path additions deletions changeType }
+        }
+      }
+    }
+    rateLimit { cost remaining resetAt }
+  }
+`
+
+// Hard cap on Link-followed REST pages. A misbehaving proxy / non-advancing
+// `rel="next"` would otherwise loop forever firing authenticated requests. At
+// 100 items/page this bounds collection at ~1M items — far beyond any real repo.
+const MAX_PAGES = 10_000
+
+/** Adapt a GraphQL repository node to the REST-ish raw shape mapRepository reads. */
+function adaptRepoNode(node) {
+  return {
+    node_id: node.databaseId != null ? String(node.databaseId) : node.nameWithOwner,
+    full_name: node.nameWithOwner,
+    default_branch: node.defaultBranchRef?.name ?? 'main',
+    archived: node.isArchived ?? false,
+    fork: node.isFork ?? false,
+    created_at: node.createdAt ?? null,
+    updated_at: node.updatedAt ?? null,
+  }
+}
+
+/** Flatten a GraphQL commit/PR-head checkSuites connection into REST-shaped
+ * check-run objects (lower-cased status/conclusion to match the REST states). */
+function adaptCheckRuns(checkSuites) {
+  const checks = []
+  for (const suite of checkSuites?.nodes ?? []) {
+    for (const cr of suite?.checkRuns?.nodes ?? []) {
+      checks.push({
+        node_id: cr.databaseId != null ? String(cr.databaseId) : undefined,
+        name: cr.name,
+        status: cr.status != null ? String(cr.status).toLowerCase() : undefined,
+        conclusion: cr.conclusion != null ? String(cr.conclusion).toLowerCase() : null,
+        started_at: cr.startedAt ?? null,
+        completed_at: cr.completedAt ?? null,
+      })
+    }
+  }
+  return checks
+}
+
+/** Adapt a GraphQL commit-history node to the REST-ish raw shape mapCommit +
+ * the commit write loop already consume, plus `__detail` (stats, no patch →
+ * HALOC = max(add,del)) and `__checks` (REST-shaped). */
+function adaptCommitNode(node) {
+  const additions = node.additions ?? 0
+  const deletions = node.deletions ?? 0
+  return {
+    sha: node.oid,
+    commit: {
+      committer: { date: node.committedDate },
+      author: {
+        date: node.authoredDate,
+        email: node.author?.email ?? 'unknown',
+        name: node.author?.name,
+      },
+      message: node.message ?? '',
+    },
+    author: node.author?.user?.login ? { login: node.author.user.login } : null,
+    stats: { additions, deletions },
+    __detail: { additions, deletions, haloc: Math.max(additions, deletions) },
+    __checks: adaptCheckRuns(node.checkSuites),
+  }
+}
+
+/** Adapt a GraphQL pull-request node into the REST-ish shapes writePr consumes:
+ * `rawPr` (PR metadata), `reviews`, `comments`, `files`, `headChecks`, plus
+ * `__overflow` flags so the caller can REST-paginate any connection that
+ * exceeded its inline page. GraphQL enums (state, review state, changeType) are
+ * preserved/lower-cased to match what the REST mappers expect. */
+// Field mappers shared by adaptPrNode and the overflow continuation.
+const adaptReviewNode = (r) => ({
+  id: r.databaseId,
+  user: r.author?.login ? { login: r.author.login } : null,
+  state: r.state, // UPPER enum; normaliseReviewState upper-cases anyway
+  submitted_at: r.submittedAt,
+})
+const adaptThreadComments = (threadNodes) => {
+  const comments = []
+  for (const thread of threadNodes ?? []) {
+    for (const c of thread?.comments?.nodes ?? []) {
+      comments.push({
+        id: c.databaseId,
+        user: c.author?.login ? { login: c.author.login } : null,
+        created_at: c.createdAt,
+        updated_at: c.updatedAt,
+        path: c.path ?? null,
+        in_reply_to_id: c.replyTo?.databaseId ?? null,
+      })
+    }
+  }
+  return comments
+}
+const adaptFileNode = (f) => ({
+  filename: f.path,
+  additions: f.additions ?? 0,
+  deletions: f.deletions ?? 0,
+  status: f.changeType ? String(f.changeType).toLowerCase() : 'modified',
+  // GraphQL exposes no per-file patch — mapPrFile falls back to max(add,del).
+})
+
+function adaptPrNode(node) {
+  const merged = node.state === 'MERGED'
+  const reviews = (node.reviews?.nodes ?? []).map(adaptReviewNode)
+  const comments = adaptThreadComments(node.reviewThreads?.nodes)
+  const files = (node.files?.nodes ?? []).map(adaptFileNode)
+  const headCommit = node.headChecks?.nodes?.[0]?.commit
+  const headSha = node.headRefOid ?? headCommit?.oid ?? null
+  return {
+    rawPr: {
+      number: node.number,
+      title: node.title,
+      body: node.body,
+      // REST `state` is open|closed (merged shown via merged_at). resolveState
+      // keys off merged/merged_at, so set both.
+      state: merged ? 'closed' : node.state ? String(node.state).toLowerCase() : 'open',
+      merged,
+      merged_at: node.mergedAt ?? null,
+      draft: node.isDraft ?? false,
+      created_at: node.createdAt,
+      updated_at: node.updatedAt,
+      base: { ref: node.baseRefName, sha: node.baseRefOid ?? null },
+      head: { ref: node.headRefName, sha: headSha },
+      user: node.author?.login ? { login: node.author.login } : null,
+      merged_by: node.mergedBy?.login ? { login: node.mergedBy.login } : null,
+    },
+    reviews,
+    comments,
+    files,
+    headChecks: adaptCheckRuns(headCommit?.checkSuites),
+    headSha,
+    __overflow: {
+      reviews: node.reviews?.pageInfo?.hasNextPage ?? false,
+      comments: node.reviewThreads?.pageInfo?.hasNextPage ?? false,
+      files: node.files?.pageInfo?.hasNextPage ?? false,
+    },
+  }
+}
+
 // ---------------------------------------------------------------------------
 // GitHubClient
 // ---------------------------------------------------------------------------
@@ -120,219 +467,202 @@ export class GitHubClient {
   }
 
   // -------------------------------------------------------------------------
-  // Shared REST fetch
-  // -------------------------------------------------------------------------
-
-  /**
-   * Perform a single REST GET, update rate-limit tracking, and return the
-   * parsed JSON body together with the raw Response so callers can read the
-   * Link header for pagination.
-   */
-  async restGet(path) {
-    let url = path.startsWith('http') ? path : `${this.baseUrl}${path}`
-    // Never attach the token to a URL outside the configured origin (an absolute
-    // URL only reaches here via paginator next-links, which are server-controlled).
-    if (path.startsWith('http')) assertSameOrigin(url, this.baseOrigin)
-
-    const maxAttempts = 4
-    let redirects = 0
-    for (let attempt = 0; ; attempt++) {
-      const response = await fetch(url, {
-        headers: {
-          Authorization: `Bearer ${this.token}`,
-          Accept: 'application/vnd.github+json',
-          'X-GitHub-Api-Version': '2022-11-28',
-        },
-        signal: AbortSignal.timeout(this.timeoutMs),
-        // Do NOT auto-follow redirects: a server-controlled 30x Location would
-        // otherwise be fetched (with the bearer token) without passing through
-        // the SSRF/same-origin guards. We validate the target explicitly below.
-        redirect: 'manual',
-      })
-
-      // Handle redirects manually: only follow a same-origin target (cross-origin
-      // is an SSRF/token-leak vector and never legitimate for the GitHub REST API).
-      if (response.status >= 300 && response.status < 400) {
-        const location = response.headers.get('Location')
-        if (!location || redirects >= 3) {
-          throw new Error(`GitHub REST ${response.status} with no/too-many redirects: ${url}`)
-        }
-        const resolved = new URL(location, url).toString()
-        assertSameOrigin(resolved, this.baseOrigin) // throws on cross-origin
-        url = resolved
-        redirects++
-        continue
-      }
-
-      this.updateRateLimitFromHeaders(response.headers)
-
-      // Honour primary (403 + X-RateLimit-Remaining:0) and secondary (429)
-      // rate limits with bounded Retry-After / X-RateLimit-Reset backoff.
-      if ((response.status === 429 || response.status === 403) && attempt < maxAttempts) {
-        const waitMs = rateLimitWaitMs(response.headers)
-        if (waitMs !== null) {
-          await sleep(waitMs)
-          continue
-        }
-      }
-
-      if (!response.ok) {
-        throw new Error(`GitHub REST ${response.status}: ${url}`)
-      }
-
-      // A 200 with a malformed body must not crash the whole sync with a bare
-      // SyntaxError (syncGitHub has no try/catch); surface it as an API error.
-      let body
-      try {
-        body = await response.json()
-      } catch (err) {
-        throw new Error(
-          `GitHub REST invalid JSON from ${url}: ${err instanceof Error ? err.message : String(err)}`,
-        )
-      }
-      return { body, response }
-    }
-  }
-
-  /**
-   * Follow Link header pagination, collecting all pages into a flat array.
-   * The per-page default mirrors what the MSW mock uses (small pages) so
-   * tests exercise the paginator with the real base dataset.
-   */
-  async restGetAll(path) {
-    const results = []
-    let next = `${this.baseUrl}${path}`
-
-    while (next !== null) {
-      // Reject a cross-origin next-link before it reaches restGet (defence in depth).
-      assertSameOrigin(next, this.baseOrigin)
-      const { body, response } = await this.restGet(next)
-      const page = body
-      results.push(...page)
-      next = parseLinkNext(response.headers.get('Link'))
-    }
-
-    return results
-  }
-
-  updateRateLimitFromHeaders(headers) {
-    const remaining = headers.get('X-RateLimit-Remaining')
-    if (remaining !== null) {
-      this.rateLimitRemaining = Number(remaining)
-    }
-  }
-
-  // -------------------------------------------------------------------------
   // Repo metadata
   // -------------------------------------------------------------------------
 
   async getRepo(owner, repo) {
-    const { body } = await this.restGet(`/repos/${owner}/${repo}`)
-    return body
+    const { data } = await this.graphqlRequest(REPO_META_QUERY, 'RepoMeta', { owner, name: repo })
+    if (!data.repository) throw new Error(`GitHub repo not found: ${owner}/${repo}`)
+    return adaptRepoNode(data.repository)
   }
 
   async listOrgRepos(org) {
-    const repos = await this.restGetAll(`/orgs/${org}/repos`)
+    const repos = []
+    let after = null
+    for (let pages = 0; pages < MAX_PAGES; pages++) {
+      const { data } = await this.graphqlRequest(ORG_REPOS_QUERY, 'OrgRepos', { org, after })
+      const conn = data.organization?.repositories
+      if (!conn) break
+      for (const node of conn.nodes ?? []) repos.push(adaptRepoNode(node))
+      if (!conn.pageInfo?.hasNextPage || !conn.pageInfo?.endCursor) break
+      after = conn.pageInfo.endCursor
+    }
     this.visibleRepos = repos.map((r) => r.full_name)
     return repos
-  }
-
-  // -------------------------------------------------------------------------
-  // Commits (since-paginated)
-  // -------------------------------------------------------------------------
-
-  async listCommits(owner, repo, since) {
-    const qs = since ? `?since=${encodeURIComponent(since)}` : ''
-    return this.restGetAll(`/repos/${owner}/${repo}/commits${qs}`)
-  }
-
-  /**
-   * Fetch the per-commit DETAIL payload (GET /repos/{o}/{r}/commits/{sha}).
-   *
-   * The commit LIST endpoint (`listCommits`) carries no per-commit stats or
-   * file diffs, so commit volume (additions/deletions/HALOC) is only available
-   * via this detail fetch. It costs one request per commit, so callers must
-   * only invoke it for commits inside the sync window (see syncRepo) to respect
-   * the rate limit.
-   */
-  async getCommitDetail(owner, repo, sha) {
-    const { body } = await this.restGet(
-      `/repos/${owner}/${repo}/commits/${encodeURIComponent(sha)}`,
-    )
-    return body
-  }
-
-  // -------------------------------------------------------------------------
-  // Pull requests
-  // -------------------------------------------------------------------------
-
-  async listPullRequests(owner, repo) {
-    return this.restGetAll(`/repos/${owner}/${repo}/pulls?state=all`)
-  }
-
-  /**
-   * Incremental PR fetch: returns only PRs updated at/after `since`, sorted by
-   * `updated` descending so pagination stops as soon as a page crosses the
-   * watermark. Without this an incremental run re-paginates the entire PR
-   * history every cycle. Falls back to the full list when `since` is absent.
-   */
-  async listPullRequestsUpdatedSince(owner, repo, since) {
-    if (!since) return this.listPullRequests(owner, repo)
-    const sinceMs = new Date(since).getTime()
-    const collected = []
-    let next = `${this.baseUrl}/repos/${owner}/${repo}/pulls?state=all&sort=updated&direction=desc&per_page=100`
-    while (next !== null) {
-      assertSameOrigin(next, this.baseOrigin)
-      const { body, response } = await this.restGet(next)
-      const page = body
-      let crossedWatermark = false
-      for (const pr of page) {
-        const updated = pr.updated_at
-        if (updated && new Date(updated).getTime() < sinceMs) {
-          crossedWatermark = true
-          break
-        }
-        collected.push(pr)
-      }
-      if (crossedWatermark) break
-      next = parseLinkNext(response.headers.get('Link'))
-    }
-    return collected
-  }
-
-  async listReviews(owner, repo, prNumber) {
-    return this.restGetAll(`/repos/${owner}/${repo}/pulls/${prNumber}/reviews`)
-  }
-
-  async listReviewComments(owner, repo, prNumber) {
-    return this.restGetAll(`/repos/${owner}/${repo}/pulls/${prNumber}/comments`)
-  }
-
-  /**
-   * List the changed files of a PR (GET /repos/{o}/{r}/pulls/{n}/files),
-   * following Link pagination. Each entry carries filename, additions,
-   * deletions, changes, status and the unified-diff `patch` (absent for binary
-   * files / oversized diffs). This is the source for the per-file diffs the
-   * code.* metrics aggregate.
-   */
-  async listPrFiles(owner, repo, prNumber) {
-    return this.restGetAll(`/repos/${owner}/${repo}/pulls/${prNumber}/files`)
-  }
-
-  async listTimeline(owner, repo, prNumber) {
-    return this.restGetAll(`/repos/${owner}/${repo}/pulls/${prNumber}/timeline`)
   }
 
   // -------------------------------------------------------------------------
   // Deployments / releases / check runs
   // -------------------------------------------------------------------------
 
-  async listDeployments(owner, repo) {
-    return this.restGetAll(`/repos/${owner}/${repo}/deployments`)
+  /**
+   * Bulk deployment fetch via GraphQL. The REST LIST omits each deployment's
+   * outcome (it lives in a per-deployment status sub-resource → one extra REST
+   * call each), so the previous path was an N+1. GraphQL returns `latestStatus`
+   * INLINE, so a whole repo's deployments + outcomes come back in O(pages)
+   * queries instead of O(deployments) REST calls. Returns nodes in the same
+   * normalised shape the REST mapper consumed plus `latestStatus`.
+   */
+  async fetchDeployments(owner, repo) {
+    const all = []
+    let after = null
+    // Hard backstop against a non-advancing cursor firing authenticated POSTs forever.
+    for (let pages = 0; pages < 10_000; pages++) {
+      const { data } = await this.graphqlRequest(DEPLOYMENTS_QUERY, 'RepoDeployments', {
+        owner,
+        name: repo,
+        after,
+      })
+      const conn = data.repository?.deployments
+      if (!conn) break
+      for (const node of conn.nodes ?? []) all.push(node)
+      if (!conn.pageInfo?.hasNextPage || !conn.pageInfo?.endCursor) break
+      after = conn.pageInfo.endCursor
+    }
+    return all
+  }
+
+  /**
+   * Bulk default-branch commit history via GraphQL, returning each commit in the
+   * SAME normalised shape the REST commit path consumed (so mapCommit and the
+   * write loop are unchanged) plus `__detail` (additions/deletions/haloc, no
+   * patch) and `__checks` (REST-shaped check runs). Replaces the per-commit
+   * DETAIL + check-runs REST N+1. `since` (ISO) bounds incremental runs.
+   */
+  async fetchCommitHistory(owner, repo, since) {
+    const all = []
+    let after = null
+    for (let pages = 0; pages < MAX_PAGES; pages++) {
+      const { data } = await this.graphqlRequest(COMMIT_HISTORY_QUERY, 'CommitHistory', {
+        owner,
+        name: repo,
+        since: since ?? null,
+        after,
+      })
+      const history = data.repository?.defaultBranchRef?.target?.history
+      if (!history) break
+      for (const node of history.nodes ?? []) all.push(adaptCommitNode(node))
+      if (!history.pageInfo?.hasNextPage || !history.pageInfo?.endCursor) break
+      after = history.pageInfo.endCursor
+    }
+    return all
+  }
+
+  /**
+   * Bulk pull-request fetch via GraphQL: returns each PR adapted into the
+   * REST-ish shapes writePr consumes (rawPr + reviews/comments/files/headChecks).
+   * Replaces the REST PR list + per-PR reviews/comments/files/check-runs N+1.
+   * `since` (ISO) bounds incremental runs: results are ordered updated-desc, so
+   * pagination stops as soon as a PR older than the watermark is seen. Any PR
+   * whose inline connection overflowed first:100 is topped up via the paginated
+   * REST methods (rare).
+   */
+  async fetchPullRequests(owner, repo, since) {
+    const sinceMs = since ? new Date(since).getTime() : null
+    const out = []
+    let after = null
+    let stop = false
+    for (let pages = 0; !stop && pages < MAX_PAGES; pages++) {
+      const { data } = await this.graphqlRequest(REPO_PULL_REQUESTS_QUERY, 'RepoPullRequests', {
+        owner,
+        name: repo,
+        after,
+      })
+      const conn = data.repository?.pullRequests
+      if (!conn) break
+      for (const node of conn.nodes ?? []) {
+        if (sinceMs !== null && node.updatedAt && new Date(node.updatedAt).getTime() < sinceMs) {
+          stop = true
+          break
+        }
+        const pr = adaptPrNode(node)
+        // Top up any connection that exceeded its inline page via GraphQL
+        // continuation (rare — >100 reviews/threads/files on a single PR).
+        if (pr.__overflow.reviews || pr.__overflow.comments || pr.__overflow.files) {
+          const full = await this.fetchPrConnectionsFull(owner, repo, node.number)
+          if (pr.__overflow.reviews) pr.reviews = full.reviews
+          if (pr.__overflow.comments) pr.comments = full.comments
+          if (pr.__overflow.files) pr.files = full.files
+        }
+        out.push(pr)
+      }
+      if (stop || !conn.pageInfo?.hasNextPage || !conn.pageInfo?.endCursor) break
+      after = conn.pageInfo.endCursor
+    }
+    return out
+  }
+
+  /**
+   * Paginate ONE pull request's reviews / review-thread comments / files to
+   * exhaustion via GraphQL (only still-live cursors advance each round). Used to
+   * top up a PR whose inline first:100 page overflowed in the bulk query.
+   */
+  async fetchPrConnectionsFull(owner, repo, number) {
+    const reviews = []
+    const files = []
+    const threadNodes = []
+    let reviewsAfter = null
+    let threadsAfter = null
+    let filesAfter = null
+    let reviewsDone = false
+    let threadsDone = false
+    let filesDone = false
+    for (let i = 0; !(reviewsDone && threadsDone && filesDone) && i < MAX_PAGES; i++) {
+      const { data } = await this.graphqlRequest(PR_CONNECTIONS_QUERY, 'PrConnections', {
+        owner,
+        name: repo,
+        number,
+        reviewsAfter: reviewsDone ? null : reviewsAfter,
+        threadsAfter: threadsDone ? null : threadsAfter,
+        filesAfter: filesDone ? null : filesAfter,
+      })
+      const pr = data.repository?.pullRequest
+      if (!pr) break
+      if (!reviewsDone) {
+        for (const r of pr.reviews?.nodes ?? []) reviews.push(adaptReviewNode(r))
+        if (pr.reviews?.pageInfo?.hasNextPage && pr.reviews.pageInfo.endCursor)
+          reviewsAfter = pr.reviews.pageInfo.endCursor
+        else reviewsDone = true
+      }
+      if (!threadsDone) {
+        for (const t of pr.reviewThreads?.nodes ?? []) threadNodes.push(t)
+        if (pr.reviewThreads?.pageInfo?.hasNextPage && pr.reviewThreads.pageInfo.endCursor)
+          threadsAfter = pr.reviewThreads.pageInfo.endCursor
+        else threadsDone = true
+      }
+      if (!filesDone) {
+        for (const f of pr.files?.nodes ?? []) files.push(adaptFileNode(f))
+        if (pr.files?.pageInfo?.hasNextPage && pr.files.pageInfo.endCursor)
+          filesAfter = pr.files.pageInfo.endCursor
+        else filesDone = true
+      }
+    }
+    return { reviews, comments: adaptThreadComments(threadNodes), files }
   }
 
   async listReleases(owner, repo) {
-    return this.restGetAll(`/repos/${owner}/${repo}/releases`)
+    const out = []
+    let after = null
+    for (let pages = 0; pages < MAX_PAGES; pages++) {
+      const { data } = await this.graphqlRequest(RELEASES_QUERY, 'RepoReleases', {
+        owner,
+        name: repo,
+        after,
+      })
+      const conn = data.repository?.releases
+      if (!conn) break
+      for (const node of conn.nodes ?? []) {
+        // Adapt to the REST-ish raw mapReleaseAsDeployment reads.
+        out.push({
+          tag_name: node.tagName,
+          created_at: node.createdAt ?? null,
+          target_commitish: node.tagCommit?.oid ?? '',
+        })
+      }
+      if (!conn.pageInfo?.hasNextPage || !conn.pageInfo?.endCursor) break
+      after = conn.pageInfo.endCursor
+    }
+    return out
   }
 
   /**
@@ -342,37 +672,45 @@ export class GitHubClient {
    * exceeds the contents API's ~1 MB inline limit. Best-effort: complexity
    * analysis is optional, so any fetch failure yields null rather than throwing.
    */
-  async getFileContentAtRef(owner, repo, path, ref) {
-    const encodedPath = path.split('/').map(encodeURIComponent).join('/')
-    try {
-      const { body } = await this.restGet(
-        `/repos/${owner}/${repo}/contents/${encodedPath}?ref=${encodeURIComponent(ref)}`,
-      )
-      if (body?.encoding === 'base64' && typeof body.content === 'string') {
-        return Buffer.from(body.content, 'base64').toString('utf8')
-      }
-      return null
-    } catch {
-      return null
-    }
-  }
-
   /**
-   * Deployment STATUS history for one deployment (GET …/deployments/{id}/statuses).
-   * GitHub's deployments LIST carries no outcome — the success/failure/error/inactive
-   * state lives only here. Returned newest-first by the API; callers take [0] as the
-   * latest state. Returns [] when a deployment has no statuses yet (pending).
+   * Bulk file-content fetch via GraphQL. Each (sha, path) becomes a
+   * `object(expression: "<sha>:<path>")` Blob alias, so up to BLOB_BATCH files
+   * come back in ONE query instead of one REST contents call each (the per-file
+   * N+1 that dominated complexity ingestion). The expression is passed as a
+   * GraphQL VARIABLE (never interpolated into the query text), so a path cannot
+   * break or inject into the query. Returns a Map keyed `"<sha>:<path>"` →
+   * source text, with null for binary / missing / oversized blobs (parity with
+   * the REST path). `refPaths` order is irrelevant; lookups are by key.
    */
-  async listDeploymentStatuses(owner, repo, deploymentId) {
-    return this.restGetAll(`/repos/${owner}/${repo}/deployments/${deploymentId}/statuses`)
-  }
-
-  async listCheckRuns(owner, repo, ref) {
-    const { body } = await this.restGet(`/repos/${owner}/${repo}/commits/${ref}/check-runs`)
-    const typed = body
-    // Default to [] when the response omits check_runs (permissions / API variance)
-    // so callers can iterate without an undefined-crash.
-    return typed.check_runs ?? []
+  async fetchBlobs(owner, repo, refPaths) {
+    const out = new Map()
+    const BLOB_BATCH = 50
+    for (let start = 0; start < refPaths.length; start += BLOB_BATCH) {
+      const chunk = refPaths.slice(start, start + BLOB_BATCH)
+      // Build aliased Blob selections + their variable declarations dynamically.
+      const decls = ['$owner: String!', '$name: String!']
+      const selections = []
+      const variables = { owner, name: repo }
+      chunk.forEach((rp, i) => {
+        decls.push(`$e${i}: String!`)
+        selections.push(`b${i}: object(expression: $e${i}) { ... on Blob { text isBinary } }`)
+        variables[`e${i}`] = `${rp.sha}:${rp.path}`
+      })
+      const query = `query FileBlobs(${decls.join(', ')}) {
+        repository(owner: $owner, name: $name) {
+          ${selections.join('\n          ')}
+        }
+        rateLimit { cost remaining resetAt }
+      }`
+      const { data } = await this.graphqlRequest(query, 'FileBlobs', variables)
+      const repository = data.repository ?? {}
+      chunk.forEach((rp, i) => {
+        const node = repository[`b${i}`]
+        const text = node && node.isBinary !== true ? (node.text ?? null) : null
+        out.set(`${rp.sha}:${rp.path}`, text)
+      })
+    }
+    return out
   }
 
   // -------------------------------------------------------------------------
@@ -380,65 +718,83 @@ export class GitHubClient {
   // -------------------------------------------------------------------------
 
   /**
-   * Execute the named `PullRequestGraph` GraphQL query against the mock or
-   * real GitHub GraphQL endpoint.
-   *
-   * The MSW mock intercepts `graphql.query('PullRequestGraph', ...)` using
-   * the operation name, not the URL + body structure. We therefore POST to
-   * `${baseUrl}/graphql` with the operation name embedded in the body so MSW
-   * can match it.
+   * Execute a named GraphQL query against the mock or real GitHub GraphQL
+   * endpoint. `operationName` is embedded in the body so the MSW mock (which
+   * matches on `graphql.query('<name>', ...)`) can route it.
    */
-  async graphqlRequest(variables) {
-    const response = await fetch(`${this.baseUrl}/graphql`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${this.token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        query: PR_GRAPH_QUERY,
-        operationName: 'PullRequestGraph',
-        variables,
-      }),
-      signal: AbortSignal.timeout(this.timeoutMs),
-      // Do not auto-follow a server-controlled redirect with the bearer token
-      // attached; the GraphQL endpoint never legitimately 30x's.
-      redirect: 'manual',
-    })
+  async graphqlRequest(query, operationName, variables) {
+    // GraphQL has its OWN point-based budget (separate from REST) and rate-limits
+    // via either HTTP 429/403 or a 200 body carrying a `RATE_LIMITED` error. A
+    // backfill that exhausts the budget must back off and retry, not crash the
+    // whole sync. Mirror the REST retry policy.
+    const maxAttempts = 4
+    for (let attempt = 0; ; attempt++) {
+      const response = await fetch(`${this.baseUrl}/graphql`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ query, operationName, variables }),
+        signal: AbortSignal.timeout(this.timeoutMs),
+        // Do not auto-follow a server-controlled redirect with the bearer token
+        // attached; the GraphQL endpoint never legitimately 30x's.
+        redirect: 'manual',
+      })
 
-    if (response.status >= 300 && response.status < 400) {
-      throw new Error(`GitHub GraphQL unexpected redirect (${response.status})`)
-    }
-    if (!response.ok) {
-      throw new Error(`GitHub GraphQL HTTP ${response.status}`)
-    }
+      if (response.status >= 300 && response.status < 400) {
+        throw new Error(`GitHub GraphQL unexpected redirect (${response.status})`)
+      }
 
-    let json
-    try {
-      json = await response.json()
-    } catch (err) {
-      throw new Error(
-        `GitHub GraphQL invalid JSON: ${err instanceof Error ? err.message : String(err)}`,
-      )
-    }
+      // HTTP-level rate limit: honour Retry-After / X-RateLimit-Reset backoff.
+      if ((response.status === 429 || response.status === 403) && attempt < maxAttempts) {
+        const waitMs = rateLimitWaitMs(response.headers)
+        if (waitMs !== null) {
+          await sleep(waitMs)
+          continue
+        }
+      }
+      if (!response.ok) {
+        throw new Error(`GitHub GraphQL HTTP ${response.status}`)
+      }
 
-    if (json.errors && json.errors.length > 0) {
-      throw new Error(`GitHub GraphQL error: ${json.errors[0]?.message ?? 'unknown'}`)
-    }
+      let json
+      try {
+        json = await response.json()
+      } catch (err) {
+        throw new Error(
+          `GitHub GraphQL invalid JSON: ${err instanceof Error ? err.message : String(err)}`,
+        )
+      }
 
-    // The MSW mock wraps everything under `data` including rateLimit.
-    const data = json.data ?? {}
-    const rateLimit = data.rateLimit ?? {
-      cost: 1,
-      remaining: this.rateLimitRemaining,
-      resetAt: new Date().toISOString(),
-    }
+      const errors = json.errors ?? []
+      // Body-level rate limiting (HTTP 200 + RATE_LIMITED): wait until the budget
+      // resets, then retry.
+      if (errors.some((e) => e?.type === 'RATE_LIMITED') && attempt < maxAttempts) {
+        const resetAt = json.data?.rateLimit?.resetAt
+        const resetMs = resetAt ? new Date(resetAt).getTime() - Date.now() : 2 ** attempt * 1000
+        await sleep(Math.min(Math.max(resetMs, 0), 120_000))
+        continue
+      }
+      // A request that returns NO data AND errors is fatal (bad query, not-found
+      // root, auth). Field-level errors alongside partial `data` (e.g. one node
+      // with a GC'd commit) are tolerated — proceed with the data we got.
+      if (errors.length > 0 && json.data == null) {
+        throw new Error(`GitHub GraphQL error: ${errors[0]?.message ?? 'unknown'}`)
+      }
 
-    if (typeof rateLimit.remaining === 'number') {
-      this.rateLimitRemaining = rateLimit.remaining
+      // The MSW mock wraps everything under `data` including rateLimit.
+      const data = json.data ?? {}
+      const rateLimit = data.rateLimit ?? {
+        cost: 1,
+        remaining: this.rateLimitRemaining,
+        resetAt: new Date().toISOString(),
+      }
+      if (typeof rateLimit.remaining === 'number') {
+        this.rateLimitRemaining = rateLimit.remaining
+      }
+      return { data, rateLimit }
     }
-
-    return { data, rateLimit }
   }
 
   /**
@@ -490,7 +846,7 @@ export class GitHubClient {
           `GraphQL pagination exceeded ${MAX_PAGE_ITERATIONS} iterations for prId=${prId} — aborting (non-advancing cursor?)`,
         )
       }
-      const { data, rateLimit } = await this.graphqlRequest({
+      const { data, rateLimit } = await this.graphqlRequest(PR_GRAPH_QUERY, 'PullRequestGraph', {
         prId,
         reviewsAfter: reviewsDone ? null : reviewsAfter,
         commentsAfter: commentsDone ? null : commentsAfter,
@@ -606,10 +962,13 @@ function sleep(ms) {
  * Compute how long to wait before retrying a rate-limited GitHub response.
  * Prefers `Retry-After` (seconds), then `X-RateLimit-Reset` (epoch seconds).
  * Returns null when neither is present (caller then surfaces the error).
- * Capped at 60s so a misconfigured header can't hang a sync indefinitely.
+ * Capped at 120s: GitHub's secondary-rate-limit `Retry-After` is legitimately
+ * 60–120s, so a 60s cap caused a premature retry that immediately 403'd again
+ * and burned an attempt. 120s honours the real values while still bounding a
+ * pathological/misconfigured header so a sync can't hang indefinitely.
  */
 function rateLimitWaitMs(headers) {
-  const MAX_WAIT_MS = 60_000
+  const MAX_WAIT_MS = 120_000
   const retryAfter = headers.get('Retry-After')
   if (retryAfter !== null) {
     const secs = Number(retryAfter)
@@ -623,22 +982,6 @@ function rateLimitWaitMs(headers) {
       const waitMs = resetMs - Date.now()
       if (waitMs > 0) return Math.min(waitMs, MAX_WAIT_MS)
       return 0
-    }
-  }
-  return null
-}
-
-/**
- * Parse the RFC 5988 `Link` header and return the `rel="next"` URL, or null.
- * Example: `<https://api.github.com/…?page=2>; rel="next"`
- */
-function parseLinkNext(link) {
-  if (!link) return null
-  for (const part of link.split(',')) {
-    const trimmed = part.trim()
-    if (trimmed.includes('rel="next"')) {
-      const match = /^<([^>]+)>/.exec(trimmed)
-      if (match?.[1]) return match[1]
     }
   }
   return null

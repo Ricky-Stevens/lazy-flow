@@ -32,7 +32,7 @@
 import { computeHaloc } from '../code-analysis/index.js'
 
 import { buildIdentityId, scrubFreeText } from '../core/index.js'
-import { ingestPrComplexity } from './complexity.js'
+import { fetchPrComplexityBatch, writePrComplexity } from './complexity.js'
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -66,13 +66,41 @@ export async function syncGitHub(store, client, scope, mode, now = new Date().to
   })
 
   // Discover repos.
-  const rawRepos = await client.listOrgRepos(scope.org)
-  const filteredRaw = scope.repos
-    ? rawRepos.filter((r) => {
-        const full = r.full_name
-        return full !== undefined && (scope.repos?.includes(full) ?? false)
-      })
-    : rawRepos
+  //
+  // When an explicit repo list is configured, fetch each one DIRECTLY via
+  // GET /repos/{owner}/{name} rather than listing the whole org and filtering.
+  // `GET /orgs/{org}/repos` can return an empty 200 for an OAuth/SSO-restricted
+  // token even when that same token CAN read a specific repo — which previously
+  // produced a silent no-op sync (zero rows, no error). Direct access is also
+  // cheaper. A repo that cannot be resolved is recorded as a warning so the
+  // failure is visible instead of masquerading as success.
+  const warnings = []
+  let filteredRaw
+  if (scope.repos && scope.repos.length > 0) {
+    filteredRaw = []
+    for (const full of scope.repos) {
+      const [owner, name] = full.split('/')
+      if (!owner || !name) {
+        warnings.push(`skipped malformed repo "${full}" (expected "owner/name")`)
+        continue
+      }
+      try {
+        filteredRaw.push(await client.getRepo(owner, name))
+      } catch (err) {
+        warnings.push(
+          `could not resolve repo ${full}: ${err instanceof Error ? err.message : String(err)}`,
+        )
+      }
+    }
+    if (filteredRaw.length === 0) {
+      warnings.push(
+        `no configured repos could be resolved for org ${scope.org} — check the token has access (SSO authorization for private repos) and the owner/name values`,
+      )
+    }
+  } else {
+    // No explicit list: discover everything visible to the credential.
+    filteredRaw = await client.listOrgRepos(scope.org)
+  }
 
   const repoNames = []
 
@@ -91,7 +119,7 @@ export async function syncGitHub(store, client, scope, mode, now = new Date().to
   // Update org-level sync state watermark.
   await store.putSyncState(buildSyncState('github', 'org', orgId, null, now, now, 'idle', null))
 
-  return { org: scope.org, repos: repoNames, mode, syncedAt: now }
+  return { org: scope.org, repos: repoNames, mode, syncedAt: now, warnings }
 }
 
 // ---------------------------------------------------------------------------
@@ -137,59 +165,36 @@ async function syncRepo(store, client, repo, mode, now) {
   }
 
   // ---- Commits ----
-  // Batch the per-commit writes (identity + commit + commit_author rows) into a
-  // single transaction so the ingest is one durable commit instead of one WAL
-  // fsync per row.
-  const rawCommits = await client.listCommits(owner, name, since)
-  // The commit LIST endpoint carries no per-commit stats (additions/deletions),
-  // so commit volume + HALOC always read 0 from the list payload. Fetch the
-  // per-commit DETAIL (one request each) for the commits in this window and
-  // merge its `stats` onto the raw before mapping. Only windowed commits are
-  // detailed (the LIST already applied the `since` filter), so the rate-limit
-  // cost is bounded to the incremental delta on reconciliation runs.
-  // Commits are immutable: once a SHA is stored its stats never change. Skip the
-  // per-commit DETAIL request (and the upsert below) for SHAs already ingested so
-  // re-syncs only pay for genuinely-new commits, bounding the rate-limit cost of
-  // the overlap window. (NOTE: GitHub's `since` filters on COMMITTER date, so a
-  // commit authored/committed long ago but pushed recently — rebase, cherry-pick,
-  // long-lived branch merge — can be absent from the LIST and thus missed here;
-  // capturing those would require enumerating each merged PR's commits.)
+  // BULK GraphQL: one paginated `history` query returns every default-branch
+  // commit WITH line stats and check runs INLINE — replacing the REST list +
+  // per-commit DETAIL + per-commit check-runs N+1 (~2 REST calls PER commit)
+  // with ~O(commits/100) requests. Each returned commit carries `__detail`
+  // (additions/deletions/haloc — HALOC from line stats, since GraphQL exposes no
+  // per-file patch) and `__checks` (REST-shaped check runs). `since` bounds
+  // incremental runs to the committer-date window.
+  const rawCommits = await client.fetchCommitHistory(owner, name, since)
   const existingShas = await store.getCommitShasByRepo(repoId)
   const detailBySha = new Map()
+  // Commits are immutable: skip re-writing SHAs already ingested. `__detail` /
+  // `__checks` come inline with the bulk fetch, so there is no per-commit fetch.
   for (const raw of rawCommits) {
-    const sha = raw.sha
-    if (!sha || existingShas.has(sha)) continue
-    const detail = await client.getCommitDetail(owner, name, sha)
-    const additions = detail.stats?.additions ?? 0
-    const deletions = detail.stats?.deletions ?? 0
-    // HALOC from the real per-file patches (Σ_hunk max(ins,del)); falls back to
-    // max(additions,deletions) when GitHub omits patches (binary/oversized).
-    let haloc = 0
-    if (detail.files && detail.files.length > 0) {
-      for (const f of detail.files) {
-        haloc += halocForFilePatch(f.filename, f.patch)
-      }
-    }
-    if (haloc === 0) haloc = Math.max(additions, deletions)
-    detailBySha.set(sha, { additions, deletions, haloc })
-
-    // Longitudinal CI: capture check runs for this default-branch commit, not
-    // just open-PR heads. This gives pr.ci_health post-merge + main-branch
-    // history and lets flakiness (same sha+name flipping conclusion) be detected
-    // across all commits. Bounded to NEW commits (above) + resilient: a missing
-    // or failed CI fetch for one commit must not abort the repo sync.
-    try {
-      for (const rawCheck of await client.listCheckRuns(owner, name, sha)) {
-        await store.upsertCheckRun(mapCheckRun(rawCheck, repoId, sha, now))
-      }
-    } catch {
-      // No CI / transient error for this commit — skip, don't fail the sync.
+    if (raw.sha && !existingShas.has(raw.sha)) {
+      detailBySha.set(raw.sha, raw.__detail)
     }
   }
+
   // Anchor the watermark on the max committer date actually seen (robust to
   // local/GitHub clock skew), not the local sync-start clock.
+  // ONE transaction writes commits, authors AND their check runs together — a
+  // single durable fsync.
   let maxCommitAt = null
   await store.transaction(async () => {
+    for (const raw of rawCommits) {
+      if (!raw.sha || existingShas.has(raw.sha)) continue
+      for (const rawCheck of raw.__checks ?? []) {
+        await store.upsertCheckRun(mapCheckRun(rawCheck, repoId, raw.sha, now))
+      }
+    }
     for (const raw of rawCommits) {
       const commitData0 = raw.commit ?? {}
       const committedAt = commitData0.committer?.date ?? commitData0.author?.date
@@ -276,16 +281,67 @@ async function syncRepo(store, client, repo, mode, now) {
       ? subtractMinutes(prCursor.watermarkAt, INCREMENTAL_OVERLAP_MINUTES)
       : undefined
   }
-  const rawPrs = await client.listPullRequestsUpdatedSince(owner, name, prsSince)
-  // Anchor the PR watermark on the max server-provided updated_at, not local now.
+  // BULK GraphQL: one paginated query returns every PR WITH its reviews,
+  // comments, changed files and head check runs nested inline — replacing the
+  // REST PR list + the per-PR reviews/comments/files/check-runs N+1 (4 REST
+  // calls PER pr). File complexity (base/head blobs) is still fetched per PR,
+  // but CONCURRENTLY, and via the batched GraphQL blob query. Writes stay
+  // sequential + per-PR transactional (SQLite is single-writer).
+  const prs = await client.fetchPullRequests(owner, name, prsSince)
+  // Repo-wide complexity: collect every PR's changed-code files and fetch all
+  // needed blobs in ONE chunked GraphQL call (instead of one call per PR).
+  let complexities
+  try {
+    complexities = await fetchPrComplexityBatch(
+      client,
+      store,
+      owner,
+      name,
+      prs.map((p) => ({
+        prId: buildPrId(repoId, p.rawPr.number),
+        repoId,
+        baseSha: p.rawPr.base?.sha ?? null,
+        headSha: p.headSha,
+        rawFiles: p.files,
+      })),
+      now,
+    )
+  } catch {
+    // Complexity is optional enrichment; on failure write pr_refs with no rows.
+    complexities = prs.map((p) => ({
+      prRef: {
+        prId: buildPrId(repoId, p.rawPr.number),
+        repoId,
+        baseSha: p.rawPr.base?.sha ?? null,
+        headSha: p.headSha,
+        updatedAt: now,
+      },
+      rows: [],
+    }))
+  }
   let maxPrUpdatedAt = null
-  for (const rawPr of rawPrs) {
-    const u = rawPr.updated_at
+  for (let i = 0; i < prs.length; i++) {
+    const p = prs[i]
+    const u = p.rawPr.updated_at
     if (u && (maxPrUpdatedAt === null || u > maxPrUpdatedAt)) maxPrUpdatedAt = u
     // One transaction per PR so its reviews/comments writes are one durable
     // commit instead of one WAL fsync per row.
     await store.transaction(() =>
-      syncPr(store, client, rawPr, owner, name, repoId, repo.defaultBranch, now),
+      writePr(
+        store,
+        p.rawPr,
+        {
+          rawReviews: p.reviews,
+          rawComments: p.comments,
+          rawFiles: p.files,
+          headChecks: p.headChecks,
+          headSha: p.headSha,
+          complexity: complexities[i],
+        },
+        repoId,
+        repo.defaultBranch,
+        now,
+      ),
     )
   }
 
@@ -307,43 +363,26 @@ async function syncRepo(store, client, repo, mode, now) {
   const deployCursor =
     mode === 'incremental' ? await store.getSyncState('github', 'deployments', repoId) : null
   const priorDeployWatermark = deployCursor?.watermarkAt ?? null
-  const rawDeploys = await client.listDeployments(owner, name)
-  // The deployments LIST endpoint carries NO outcome — success/failure/error/
-  // inactive lives only in the per-deployment statuses sub-resource. Without it
-  // every deployment defaults to 'success', so failures are invisible and DORA
-  // change-failure / frequency are wrong. Fetch the latest status per deployment.
-  // Bounded + idempotent: skip deployments already recorded with a terminal
-  // outcome (it can't change), so re-syncs don't re-pay the per-deploy request.
-  const existingDeployStatus = new Map(
-    (await store.getDeploymentsByRepo(repoId)).map((d) => [d.id, d.status]),
-  )
+  // GraphQL returns each deployment's outcome INLINE via `latestStatus`,
+  // collapsing the REST list + per-deployment status sub-resource N+1 (one extra
+  // REST call PER deployment) into O(pages) queries. The outcome is essential:
+  // the REST LIST carries none, so without it every deploy defaulted to 'success'
+  // and DORA change-failure / frequency were wrong.
+  const ghDeploys = await client.fetchDeployments(owner, name)
   let maxDeployUpdatedAt = null
-  for (const rawDeploy of rawDeploys) {
-    const u = rawDeploy.updated_at ?? rawDeploy.created_at
-    if (u && (maxDeployUpdatedAt === null || u > maxDeployUpdatedAt)) maxDeployUpdatedAt = u
-    const deploy = mapDeployment(rawDeploy, repoId, now, 'deployments_api')
-
-    const stored = existingDeployStatus.get(deploy.id)
-    if (!TERMINAL_DEPLOY_STATES.has(stored ?? '')) {
-      try {
-        const statuses = await client.listDeploymentStatuses(owner, name, rawDeploy.id)
-        const latest = statuses[0]
-        if (latest?.state) {
-          deploy.status = String(latest.state)
-          if (TERMINAL_DEPLOY_STATES.has(deploy.status)) {
-            deploy.finishedAt = latest.created_at ?? deploy.finishedAt
-          }
-        }
-      } catch {
-        // Resilience: a single deployment's status fetch failing (permissions,
-        // transient error) must not abort the repo sync — keep the mapped record.
-      }
+  await store.transaction(async () => {
+    for (const node of ghDeploys) {
+      // databaseId is non-null on Deployment per GitHub's schema, but guard so a
+      // malformed node can never collapse to the literal id "null" and collide.
+      if (node.databaseId == null) continue
+      const u = node.updatedAt ?? node.createdAt
+      if (u && (maxDeployUpdatedAt === null || u > maxDeployUpdatedAt)) maxDeployUpdatedAt = u
+      await store.upsertDeployment(mapDeploymentFromGraphql(node, repoId, now))
     }
-    await store.upsertDeployment(deploy)
-  }
+  })
 
   // Releases → deployments if no deployments_api signal (D9 priority 2).
-  if (rawDeploys.length === 0) {
+  if (ghDeploys.length === 0) {
     const rawReleases = await client.listReleases(owner, name)
     for (const rawRelease of rawReleases) {
       const deploy = mapReleaseAsDeployment(rawRelease, repoId, now)
@@ -354,8 +393,8 @@ async function syncRepo(store, client, repo, mode, now) {
   // Merge-to-default-branch proxy (D9 priority 4) — create a proxy deployment
   // for each merged PR targeting the default branch when no other signal exists.
   // Reuse the PR list already fetched above rather than re-paginating it.
-  if (rawDeploys.length === 0) {
-    for (const rawPr of rawPrs) {
+  if (ghDeploys.length === 0) {
+    for (const { rawPr } of prs) {
       const mergedAt = rawPr.merged_at
       const baseRef = rawPr.base?.ref
       if (mergedAt && baseRef === repo.defaultBranch) {
@@ -380,38 +419,22 @@ async function syncRepo(store, client, repo, mode, now) {
 }
 
 // ---------------------------------------------------------------------------
-// Per-PR sync (reviews, comments, timeline, stage timestamps)
+// Per-PR WRITE. The PR and its reviews/comments/files/head-checks/complexity are
+// fetched in bulk via GraphQL (client.fetchPullRequests + fetchPrComplexity);
+// this persists one PR's rows sequentially under a single transaction.
 // ---------------------------------------------------------------------------
 
-async function syncPr(store, client, rawPr, owner, repoName, repoId, defaultBranch, now) {
+async function writePr(store, rawPr, fetched, repoId, defaultBranch, now) {
   const prNumber = rawPr.number
   const prId = buildPrId(repoId, prNumber)
+  const { rawReviews, rawComments, rawFiles, headChecks, headSha, complexity } = fetched
 
-  // Author identity — must be upserted BEFORE the PR row (FK constraint).
-  // Fall back to a sentinel 'identity-unknown' when the raw lacks a user field.
-  const authorLogin = rawPr.user?.login
-  const authorIdentityId = authorLogin
-    ? buildIdentityId('github_login', authorLogin)
-    : 'identity-unknown'
-  if (authorLogin) {
-    await store.upsertIdentity(mapIdentityFromLogin(authorLogin, now))
-  } else {
-    // Ensure the sentinel identity exists so the FK is satisfied.
-    await store.upsertIdentity({
-      id: 'identity-unknown',
-      personId: null,
-      kind: 'github_login',
-      externalId: 'unknown',
-      isBot: false,
-      confidence: 0,
-      raw: '{}',
-      updatedAt: now,
-    })
-  }
+  // Author identity — upserted BEFORE the PR row (NOT NULL FK), falling back to
+  // the sentinel when the PR has no author (deleted account).
+  const authorIdentityId = await resolveLoginIdentity(store, rawPr.user?.login, now)
 
-  // Fetch reviews to derive firstReviewAt, approvedAt, and firstCommitAt.
-  const rawReviews = await client.listReviews(owner, repoName, prNumber)
-  const rawComments = await client.listReviewComments(owner, repoName, prNumber)
+  // rawReviews / rawComments come from the prefetched bundle (see fetchPrBundle),
+  // and feed firstReviewAt, approvedAt, and firstCommitAt below.
 
   // Stage timestamps (denormalised per SPEC §6.1 pull_requests).
   const createdAt = rawPr.created_at ?? now
@@ -436,7 +459,7 @@ async function syncPr(store, client, rawPr, owner, repoName, repoId, defaultBran
       if (!firstReviewAt || submittedAt < firstReviewAt) {
         firstReviewAt = submittedAt
       }
-      const state = rev.state.toUpperCase()
+      const state = (rev.state ?? '').toUpperCase()
       if (state === 'APPROVED') {
         if (!approvedAt || submittedAt < approvedAt) {
           approvedAt = submittedAt
@@ -481,13 +504,7 @@ async function syncPr(store, client, rawPr, owner, repoName, repoId, defaultBran
 
   // Persist reviews.
   for (const rawReview of rawReviews) {
-    const reviewerLogin = rawReview.user?.login
-    const reviewerIdentityId = reviewerLogin
-      ? buildIdentityId('github_login', reviewerLogin)
-      : 'unknown'
-    if (reviewerLogin) {
-      await store.upsertIdentity(mapIdentityFromLogin(reviewerLogin, now))
-    }
+    const reviewerIdentityId = await resolveLoginIdentity(store, rawReview.user?.login, now)
 
     const review = {
       nodeId: buildReviewNodeId(rawReview),
@@ -504,13 +521,7 @@ async function syncPr(store, client, rawPr, owner, repoName, repoId, defaultBran
 
   // Persist review comments.
   for (const rawComment of rawComments) {
-    const commentAuthorLogin = rawComment.user?.login
-    const commentAuthorIdentityId = commentAuthorLogin
-      ? buildIdentityId('github_login', commentAuthorLogin)
-      : 'unknown'
-    if (commentAuthorLogin) {
-      await store.upsertIdentity(mapIdentityFromLogin(commentAuthorLogin, now))
-    }
+    const commentAuthorIdentityId = await resolveLoginIdentity(store, rawComment.user?.login, now)
 
     const comment = {
       nodeId: String(rawComment.id),
@@ -526,41 +537,29 @@ async function syncPr(store, client, rawPr, owner, repoName, repoId, defaultBran
     await store.upsertReviewComment(comment)
   }
 
-  // Persist per-file diffs (GET /pulls/{n}/files). These feed the code.* metrics
-  // (HALOC aggregation, Nagappan-Ball churn, code-change impact). The patch text
-  // is scrubbed of free-text secrets inside mapPrFile before persistence.
-  const rawFiles = await client.listPrFiles(owner, repoName, prNumber)
+  // Persist per-file diffs (prefetched via GET /pulls/{n}/files). These feed the
+  // code.* metrics (HALOC aggregation, Nagappan-Ball churn, code-change impact).
+  // The patch text is scrubbed of free-text secrets inside mapPrFile.
   for (const rawFile of rawFiles) {
     if (!rawFile.filename) continue
     await store.upsertPrFile(mapPrFile(rawFile, prId, repoId, now))
   }
 
-  // Record base/head SHAs + analyse changed-file complexity at both refs (feeds
-  // code.complexity_delta + code.maintainability_index). Best-effort + bounded —
-  // a failure here must not abort PR ingestion.
+  // Persist base/head SHAs + the prefetched changed-file complexity (feeds
+  // code.complexity_delta + code.maintainability_index). Best-effort — a failure
+  // here must not abort PR ingestion.
   try {
-    await ingestPrComplexity(store, client, {
-      owner,
-      repoName,
-      repoId,
-      rawPr,
-      prId,
-      rawFiles,
-      now,
-    })
+    await writePrComplexity(store, complexity)
   } catch {
     // Complexity analysis is optional enrichment; never fail the sync over it.
   }
 
-  // Persist CI check runs for the PR head sha (GET /commits/{ref}/check-runs).
-  // These feed pr.ci_health (compute reads getCheckRunsByRepo). The head sha is
-  // the only ref that carries the PR's final CI status; when the raw PR payload
-  // omits head.sha (minimal stub / API variance) we skip the fetch rather than
-  // querying a bogus ref — an honest gap, not a fabricated pass/fail.
-  const headSha = extractHeadSha(rawPr)
+  // Persist CI check runs for the PR head sha (prefetched). These feed
+  // pr.ci_health (compute reads getCheckRunsByRepo). When the raw PR payload
+  // omits head.sha the bundle skipped the fetch — an honest gap, not a
+  // fabricated pass/fail.
   if (headSha) {
-    const rawChecks = await client.listCheckRuns(owner, repoName, headSha)
-    for (const rawCheck of rawChecks) {
+    for (const rawCheck of headChecks) {
       await store.upsertCheckRun(mapCheckRun(rawCheck, repoId, headSha, now))
     }
   }
@@ -581,8 +580,8 @@ async function tombstoneRepo(store, client, repo, now) {
   const repoId = repo.id
 
   // --- PRs ---
-  const livePrs = await client.listPullRequests(owner, name)
-  const livePrIds = new Set(livePrs.map((p) => buildPrId(repoId, p.number)))
+  const livePrs = await client.fetchPullRequests(owner, name)
+  const livePrIds = new Set(livePrs.map((p) => buildPrId(repoId, p.rawPr.number)))
   const storedPrs = await store.getPullRequestsByRepo(repoId)
   for (const storedPr of storedPrs) {
     if (!livePrIds.has(storedPr.id) && storedPr.deletedAt === null) {
@@ -668,19 +667,25 @@ function mapCommit(raw, repoId, now, detail) {
   }
 }
 
-function mapDeployment(raw, repoId, now, source) {
-  const id = String(raw.id)
+/**
+ * Map a GraphQL deployment node (with inline `latestStatus`) to a deployment
+ * row. The GraphQL state is an UPPER-case enum (SUCCESS/FAILURE/ERROR/…); we
+ * lower-case it so it matches the REST states the rest of the engine expects.
+ * Defaults to 'success' only when no status exists at all (parity with REST).
+ */
+function mapDeploymentFromGraphql(node, repoId, now) {
+  const state = node.latestStatus?.state ? String(node.latestStatus.state).toLowerCase() : 'success'
   return {
-    id,
+    id: String(node.databaseId),
     repoId,
-    sha: raw.sha ?? '',
-    environment: raw.environment ?? 'production',
-    status: raw.status ?? 'success',
-    createdAt: raw.created_at ?? now,
-    finishedAt: raw.finished_at ?? null,
-    source,
-    raw: JSON.stringify(raw),
-    updatedAt: raw.updated_at ?? now,
+    sha: node.commitOid ?? '',
+    environment: node.environment ?? 'production',
+    status: state,
+    createdAt: node.createdAt ?? now,
+    finishedAt: TERMINAL_DEPLOY_STATES.has(state) ? (node.latestStatus?.createdAt ?? null) : null,
+    source: 'deployments_api',
+    raw: JSON.stringify(node),
+    updatedAt: node.updatedAt ?? now,
   }
 }
 
@@ -762,16 +767,22 @@ function halocForFilePatch(path, patch) {
 function mapPrFile(raw, prId, repoId, now) {
   const path = raw.filename
   const patch = raw.patch
-  const haloc = halocForFilePatch(path, patch)
+  const additions = typeof raw.additions === 'number' ? raw.additions : 0
+  const deletions = typeof raw.deletions === 'number' ? raw.deletions : 0
+  // HALOC from the per-hunk patch when present; otherwise (GraphQL files carry no
+  // patch text) fall back to max(additions,deletions) — the same approximation
+  // used for commits, and exact for single-hunk changes.
+  let haloc = halocForFilePatch(path, patch)
+  if (haloc === 0) haloc = Math.max(additions, deletions)
   return {
     prId,
     repoId,
     path,
-    additions: typeof raw.additions === 'number' ? raw.additions : 0,
-    deletions: typeof raw.deletions === 'number' ? raw.deletions : 0,
+    additions,
+    deletions,
     haloc,
     status: raw.status ?? 'modified',
-    patch: patch !== undefined ? scrubFreeText(patch) : null,
+    patch: patch !== undefined && patch !== null ? scrubFreeText(patch) : null,
     createdAt: now,
     updatedAt: now,
   }
@@ -792,8 +803,10 @@ function mapCheckRun(raw, repoId, headSha, now) {
     nodeId,
     repoId,
     headSha,
-    name: raw.name,
-    status: raw.status,
+    // name/status are NOT NULL in check_runs; default rather than crash the write
+    // transaction if a payload variant omits them.
+    name: raw.name ?? 'unknown',
+    status: raw.status ?? 'queued',
     conclusion: raw.conclusion ?? null,
     startedAt: raw.started_at ?? null,
     completedAt: raw.completed_at ?? null,
@@ -827,6 +840,41 @@ function mapIdentityFromEmail(email, now) {
     raw: JSON.stringify({ email }),
     updatedAt: now,
   }
+}
+
+// Sentinel identity for GitHub actors with no login (deleted/"ghost" accounts:
+// the API returns `user: null`). pull_requests.author_identity_id,
+// reviews.reviewer_identity_id and review_comments.author_identity_id are all
+// NOT NULL REFERENCES identities(id), so this row MUST exist before any of them
+// is written — otherwise the FK fails, the PR transaction rolls back, and the
+// sync wedges on that PR forever.
+const SENTINEL_IDENTITY_ID = 'identity-unknown'
+
+function sentinelIdentity(now) {
+  return {
+    id: SENTINEL_IDENTITY_ID,
+    personId: null,
+    kind: 'github_login',
+    externalId: 'unknown',
+    isBot: false,
+    confidence: 0,
+    raw: '{}',
+    updatedAt: now,
+  }
+}
+
+/**
+ * Upsert the identity for a GitHub login (or the sentinel when the login is
+ * absent — a deleted account) and return its id, ALWAYS ensuring the row exists
+ * so a NOT NULL identity FK can never be violated.
+ */
+async function resolveLoginIdentity(store, login, now) {
+  if (login) {
+    await store.upsertIdentity(mapIdentityFromLogin(login, now))
+    return buildIdentityId('github_login', login)
+  }
+  await store.upsertIdentity(sentinelIdentity(now))
+  return SENTINEL_IDENTITY_ID
 }
 
 // ---------------------------------------------------------------------------
@@ -863,7 +911,7 @@ function resolveState(rawPr) {
 }
 
 function normaliseReviewState(state) {
-  switch (state.toUpperCase()) {
+  switch ((state ?? '').toUpperCase()) {
     case 'APPROVED':
       return 'approved'
     case 'CHANGES_REQUESTED':
@@ -888,17 +936,6 @@ function deriveFirstCommitAt(rawPr) {
   const commitData = commit?.commit
   const author = commitData?.author
   return author?.date ?? null
-}
-
-/**
- * Extract the PR head commit sha from the raw PR payload (`head.sha`), or null
- * when absent. Used as the ref for the check-runs fetch; a null sha means we
- * skip CI ingestion for the PR rather than querying an invalid ref.
- */
-function extractHeadSha(rawPr) {
-  const head = rawPr.head
-  const sha = head?.sha
-  return sha && sha.length > 0 ? sha : null
 }
 
 /**

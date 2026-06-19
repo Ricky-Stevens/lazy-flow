@@ -13,7 +13,7 @@
  */
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'bun:test'
-import { HttpResponse, http } from 'msw'
+import { graphql, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
 import { BunSqliteStore, migrate } from '../core/index.js'
 import { baseOrg, IDS, mockGitHub } from '../testkit/index.js'
@@ -94,25 +94,19 @@ describe('idempotency', () => {
     expect(new Set(shas).size).toBe(shas.length)
   })
 
-  it('re-sync preserves commit stats and does not re-detail immutable commits', async () => {
+  it('re-sync preserves commit stats (idempotent, stats not zeroed)', async () => {
     const client = makeClient()
     await syncGitHub(store, client, scope, 'backfill')
     const before = await store.getCommitsByRepo(SYNCED_REPO_ALPHA)
     const detailed = before.find((c) => c.additions > 0 || c.deletions > 0 || c.haloc > 0)
-    expect(detailed).toBeDefined() // backfill populated real stats
+    expect(detailed).toBeDefined() // backfill populated real stats (inline in CommitHistory)
 
-    // Spy: a second backfill must skip already-ingested commits (no DETAIL refetch)
-    // and must NOT zero out the previously-captured stats.
-    let detailCalls = 0
-    const origDetail = client.getCommitDetail.bind(client)
-    client.getCommitDetail = async (...args) => {
-      detailCalls++
-      return origDetail(...args)
-    }
+    // A second backfill must skip already-ingested commits and must NOT zero out
+    // the previously-captured stats.
     await syncGitHub(store, client, scope, 'backfill')
 
-    expect(detailCalls).toBe(0) // every commit already stored → no re-detailing
     const after = await store.getCommitsByRepo(SYNCED_REPO_ALPHA)
+    expect(after.length).toBe(before.length)
     const sameSha = after.find((c) => c.sha === detailed?.sha)
     expect(sameSha?.additions).toBe(detailed?.additions)
     expect(sameSha?.haloc).toBe(detailed?.haloc)
@@ -198,13 +192,31 @@ describe('tombstoning', () => {
     expect(beforeTombstone).not.toBeNull()
     expect(beforeTombstone?.deletedAt).toBeNull()
 
-    // Override the PR list for alpha-service to exclude PR #1.
+    // Override the bulk PR query for alpha-service to exclude PR #1 (tombstone
+    // reads PR numbers via fetchPullRequests). Minimal nodes — tombstone only
+    // needs the numbers; empty connections are fine.
     server.use(
-      http.get('https://api.github.com/repos/octo-acme/alpha-service/pulls', () => {
-        const allPrs = baseOrg.pullRequests.filter(
+      graphql.query('RepoPullRequests', () => {
+        const remaining = baseOrg.pullRequests.filter(
           (p) => p.repoId === IDS.repoAlpha && p.id !== IDS.pr1,
         )
-        return HttpResponse.json(allPrs.map((p) => JSON.parse(p.raw)))
+        return HttpResponse.json({
+          data: {
+            repository: {
+              pullRequests: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: remaining.map((p) => ({
+                  number: p.number,
+                  reviews: { pageInfo: { hasNextPage: false }, nodes: [] },
+                  reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [] },
+                  files: { pageInfo: { hasNextPage: false }, nodes: [] },
+                  headChecks: { nodes: [] },
+                })),
+              },
+            },
+            rateLimit: { cost: 1, remaining: 4999, resetAt: new Date().toISOString() },
+          },
+        })
       }),
     )
 
@@ -287,7 +299,7 @@ describe('PR stage timestamps', () => {
 // ---------------------------------------------------------------------------
 
 describe('PR file diffs', () => {
-  it('persists pr-1 file diffs with HALOC recomputed from the patch', async () => {
+  it('persists pr-1 file diffs with additions/deletions and HALOC from line stats', async () => {
     const store = makeStore()
     const client = makeClient()
     await syncGitHub(store, client, scope, 'backfill')
@@ -303,13 +315,13 @@ describe('PR file diffs', () => {
     for (const ex of expected) {
       const got = byPath.get(ex.path)
       expect(got).toBeDefined()
-      // HALOC is recomputed at ingest from the reconstructed unified diff, so it
-      // must equal the dataset's expected HALOC (not a hardcoded 0).
-      expect(got?.haloc).toBe(ex.haloc)
       expect(got?.additions).toBe(ex.additions)
       expect(got?.deletions).toBe(ex.deletions)
-      // Patch is persisted (scrubbed) — non-null and carries the hunk header.
-      expect(got?.patch).toContain('@@')
+      // HALOC: the bulk GraphQL files API carries no per-file patch text, so HALOC
+      // falls back to max(additions,deletions) — which equals the dataset's
+      // per-hunk HALOC for these single-hunk changes. Patch is therefore null.
+      expect(got?.haloc).toBe(ex.haloc)
+      expect(got?.patch).toBeNull()
     }
   })
 
@@ -417,28 +429,53 @@ describe('deployment source', () => {
     // were only fetched for PR heads, so its CI was never captured. Now check
     // runs are fetched per default-branch commit → longitudinal ci_health.
     const store = makeStore()
+    // Commit history now carries check runs INLINE (checkSuites). Return a
+    // squash commit (not any PR's head) with a successful build check.
     server.use(
-      http.get(
-        'https://api.github.com/repos/:owner/:repo/commits/:ref/check-runs',
-        ({ params }) => {
-          if (params.ref === IDS.commitSquash) {
-            return HttpResponse.json({
-              total_count: 1,
-              check_runs: [
-                {
-                  id: 'cs',
-                  node_id: 'cs-build',
-                  name: 'build',
-                  status: 'completed',
-                  conclusion: 'success',
-                  started_at: '2024-05-01T08:00:00Z',
-                  completed_at: '2024-05-01T08:10:00Z',
+      graphql.query('CommitHistory', () =>
+        HttpResponse.json({
+          data: {
+            repository: {
+              defaultBranchRef: {
+                target: {
+                  history: {
+                    pageInfo: { hasNextPage: false, endCursor: null },
+                    nodes: [
+                      {
+                        oid: IDS.commitSquash,
+                        committedDate: '2024-05-01T14:00:00Z',
+                        authoredDate: '2024-05-01T14:00:00Z',
+                        additions: 10,
+                        deletions: 2,
+                        message: 'feat: squash',
+                        author: { name: null, email: 'unknown', user: { login: 'alice' } },
+                        checkSuites: {
+                          nodes: [
+                            {
+                              checkRuns: {
+                                nodes: [
+                                  {
+                                    databaseId: 'cs-build',
+                                    name: 'build',
+                                    status: 'COMPLETED',
+                                    conclusion: 'SUCCESS',
+                                    startedAt: '2024-05-01T08:00:00Z',
+                                    completedAt: '2024-05-01T08:10:00Z',
+                                  },
+                                ],
+                              },
+                            },
+                          ],
+                        },
+                      },
+                    ],
+                  },
                 },
-              ],
-            })
-          }
-          return HttpResponse.json({ total_count: 0, check_runs: [] })
-        },
+              },
+            },
+            rateLimit: { cost: 1, remaining: 4999, resetAt: new Date().toISOString() },
+          },
+        }),
       ),
     )
 
@@ -487,10 +524,23 @@ describe('watermark advancement on empty result', () => {
       error: null,
     })
 
-    // Force the commits LIST endpoint to return empty for every repo (simulating
-    // a transient empty response while the rest of the API works).
+    // Force the commit-history query to return no commits for every repo
+    // (simulating a transient empty response while the rest of the API works).
     server.use(
-      http.get('https://api.github.com/repos/:owner/:repo/commits', () => HttpResponse.json([])),
+      graphql.query('CommitHistory', () =>
+        HttpResponse.json({
+          data: {
+            repository: {
+              defaultBranchRef: {
+                target: {
+                  history: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] },
+                },
+              },
+            },
+            rateLimit: { cost: 1, remaining: 4999, resetAt: new Date().toISOString() },
+          },
+        }),
+      ),
     )
 
     await syncGitHub(store, makeClient(), scope, 'incremental', NOW)
@@ -500,5 +550,168 @@ describe('watermark advancement on empty result', () => {
     // would permanently skip any commits the API transiently omitted (the next
     // `since` filter excludes them). It must stay at the prior watermark.
     expect(cursor?.watermarkAt).toBe(SEEDED)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Repo discovery — explicit repo list is fetched DIRECTLY via GET /repos/{o}/{r}
+// (not org-list-and-filter), and unresolved repos surface as warnings instead
+// of a silent no-op. Regression: `/orgs/{org}/repos` can 200-with-empty for an
+// SSO-restricted token, which previously synced zero rows with no error.
+// ---------------------------------------------------------------------------
+
+describe('syncGitHub repo discovery', () => {
+  const ORG_ID = 'org-octo-acme'
+
+  it('resolves an explicit repo via direct getRepo (only the listed repo is synced)', async () => {
+    const store = makeStore()
+    const result = await syncGitHub(
+      store,
+      makeClient(),
+      { org: 'octo-acme', repos: ['octo-acme/alpha-service'] },
+      'backfill',
+    )
+
+    expect(result.repos).toEqual(['octo-acme/alpha-service'])
+    expect(result.warnings).toEqual([])
+
+    const repos = await store.getRepositoriesByOrg(ORG_ID)
+    const names = repos.map((r) => `${r.owner}/${r.name}`)
+    expect(names).toContain('octo-acme/alpha-service')
+    expect(names).not.toContain('octo-acme/beta-service')
+  })
+
+  it('records a warning (and does not throw) when a configured repo cannot be resolved', async () => {
+    const store = makeStore()
+    const result = await syncGitHub(
+      store,
+      makeClient(),
+      { org: 'octo-acme', repos: ['octo-acme/ghost-service'] },
+      'backfill',
+    )
+
+    expect(result.repos).toEqual([])
+    // One warning for the 404, plus the summary "no repos resolved" warning.
+    expect(result.warnings.some((w) => w.includes('octo-acme/ghost-service'))).toBe(true)
+    expect(result.warnings.some((w) => w.includes('no configured repos could be resolved'))).toBe(
+      true,
+    )
+
+    const repos = await store.getRepositoriesByOrg(ORG_ID)
+    expect(repos.length).toBe(0)
+  })
+
+  it('warns on a malformed repo string instead of fetching garbage', async () => {
+    const store = makeStore()
+    const result = await syncGitHub(
+      store,
+      makeClient(),
+      { org: 'octo-acme', repos: ['not-a-valid-spec'] },
+      'backfill',
+    )
+
+    expect(result.repos).toEqual([])
+    expect(result.warnings.some((w) => w.includes('malformed'))).toBe(true)
+  })
+
+  it('falls back to org-wide discovery when no explicit repo list is given', async () => {
+    const store = makeStore()
+    const result = await syncGitHub(store, makeClient(), { org: 'octo-acme' }, 'backfill')
+
+    // Both baseOrg repos discovered via /orgs/{org}/repos.
+    expect(result.repos).toContain('octo-acme/alpha-service')
+    expect(result.repos).toContain('octo-acme/beta-service')
+    expect(result.warnings).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Resilience — deleted-account actors (GitHub returns user:null "ghosts") and
+// null review state. Pre-fix these crashed writePr inside the PR transaction:
+// the 'unknown' reviewer identity violated the NOT NULL FK, and `null.toUpperCase()`
+// threw — either aborting the whole repo's PR loop. (Adversarial-review regressions.)
+// ---------------------------------------------------------------------------
+
+describe('writePr resilience: ghost actors + null review state', () => {
+  it('syncs a PR whose review/comment have a null author and null state, using the sentinel identity', async () => {
+    const store = makeStore()
+    // PRs (and their nested reviews/comments) come from the bulk GraphQL query.
+    // Inject a single PR whose review has a null author + null state and whose
+    // comment has a null author — the ghost-account ("user: null") case.
+    server.use(
+      graphql.query('RepoPullRequests', () =>
+        HttpResponse.json({
+          data: {
+            repository: {
+              pullRequests: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [
+                  {
+                    number: 1,
+                    title: 'ghost',
+                    body: '',
+                    state: 'MERGED',
+                    isDraft: false,
+                    createdAt: '2024-05-01T09:00:00Z',
+                    updatedAt: '2024-05-01T10:00:00Z',
+                    mergedAt: '2024-05-01T10:00:00Z',
+                    baseRefName: 'main',
+                    baseRefOid: null,
+                    headRefName: 'feat/ghost',
+                    headRefOid: null,
+                    author: null,
+                    mergedBy: null,
+                    reviews: {
+                      pageInfo: { hasNextPage: false },
+                      nodes: [
+                        {
+                          databaseId: 99001,
+                          state: null,
+                          submittedAt: '2024-05-01T10:00:00Z',
+                          author: null,
+                        },
+                      ],
+                    },
+                    reviewThreads: {
+                      pageInfo: { hasNextPage: false },
+                      nodes: [
+                        {
+                          comments: {
+                            nodes: [
+                              {
+                                databaseId: 99002,
+                                createdAt: '2024-05-01T10:00:00Z',
+                                updatedAt: '2024-05-01T10:00:00Z',
+                                path: 'a.ts',
+                                author: null,
+                                replyTo: null,
+                              },
+                            ],
+                          },
+                        },
+                      ],
+                    },
+                    files: { pageInfo: { hasNextPage: false }, nodes: [] },
+                    headChecks: { nodes: [] },
+                  },
+                ],
+              },
+            },
+            rateLimit: { cost: 1, remaining: 4999, resetAt: new Date().toISOString() },
+          },
+        }),
+      ),
+    )
+
+    // Must not throw (pre-fix: FK violation on the sentinel + null.toUpperCase()).
+    await syncGitHub(store, makeClient(), scope, 'backfill', '2024-06-01T00:00:00Z')
+
+    const prs = await store.getPullRequestsByRepo(SYNCED_REPO_ALPHA)
+    expect(prs.length).toBeGreaterThan(0)
+    const reviews = await store.getReviewsByPullRequest(prs[0].id)
+    expect(reviews.length).toBeGreaterThan(0)
+    expect(reviews[0]?.reviewerIdentityId).toBe('identity-unknown')
+    const comments = await store.getReviewCommentsByPullRequest(prs[0].id)
+    expect(comments[0]?.authorIdentityId).toBe('identity-unknown')
   })
 })

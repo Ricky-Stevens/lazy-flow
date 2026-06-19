@@ -54,6 +54,9 @@ export function loadConfig() {
     repos: parseList(env.LAZYFLOW_REPOS),
     jiraProjects: parseList(env.LAZYFLOW_JIRA_PROJECTS),
     jiraBaseUrl: env.LAZYFLOW_JIRA_BASE_URL ?? '',
+    // Atlassian account email — REQUIRED for an API token (Basic auth) against a
+    // Jira Cloud site URL. Empty falls back to Bearer (OAuth 3LO) auth.
+    jiraEmail: env.LAZYFLOW_JIRA_EMAIL ?? '',
     dbPath: resolveDbPath(env.LAZYFLOW_DB_PATH),
     githubToken: env.LAZYFLOW_GITHUB_TOKEN ?? null,
     jiraToken: env.LAZYFLOW_JIRA_TOKEN ?? null,

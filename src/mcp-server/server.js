@@ -193,13 +193,17 @@ function registerDoctorTool(server, ctx) {
           : 'LAZYFLOW_GITHUB_TOKEN not set — GitHub sync unavailable',
       })
 
-      // 3. Jira token presence
+      // 3. Jira token presence (+ Basic-auth email pairing). An API token against
+      //    a Jira Cloud site URL needs LAZYFLOW_JIRA_EMAIL for Basic auth — without
+      //    it the client falls back to Bearer and every call 403s.
       checks.push({
         name: 'jira_token',
-        status: ctx.config.jiraToken ? 'ok' : 'warn',
-        message: ctx.config.jiraToken
-          ? 'Jira token configured'
-          : 'LAZYFLOW_JIRA_TOKEN not set — Jira sync unavailable',
+        status: ctx.config.jiraToken && ctx.config.jiraEmail ? 'ok' : 'warn',
+        message: !ctx.config.jiraToken
+          ? 'LAZYFLOW_JIRA_TOKEN not set — Jira sync unavailable'
+          : ctx.config.jiraEmail
+            ? 'Jira token + email configured (Basic auth)'
+            : 'LAZYFLOW_JIRA_TOKEN set but LAZYFLOW_JIRA_EMAIL missing — API tokens need email for Basic auth (will 403)',
       })
 
       // 4. Repos / Jira projects configured
@@ -378,6 +382,7 @@ function registerRunSyncTool(server, ctx) {
       issues_upserted: z.number(),
       transitions_appended: z.number(),
       errors: z.array(z.string()),
+      warnings: z.array(z.string()),
     }),
     identity: z.object({
       identities_upserted: z.number(),
@@ -400,6 +405,14 @@ function registerRunSyncTool(server, ctx) {
     skipped: z.boolean(),
     skip_reason: z.string().optional(),
     snapshots_written: z.number().optional(),
+    timings_ms: z
+      .object({
+        sync_total: z.number(),
+        github: z.number(),
+        jira: z.number(),
+        snapshot_backfill: z.number(),
+      })
+      .optional(),
   })
 
   server.registerTool(
@@ -429,7 +442,13 @@ function registerRunSyncTool(server, ctx) {
           ...provenance('n/a', 'no_data'),
           synced_at: new Date().toISOString(),
           github: { org: '', repos: [], mode: syncMode },
-          jira: { projects_processed: [], issues_upserted: 0, transitions_appended: 0, errors: [] },
+          jira: {
+            projects_processed: [],
+            issues_upserted: 0,
+            transitions_appended: 0,
+            errors: [],
+            warnings: [],
+          },
           identity: { identities_upserted: 0, persons_created: 0, auto_merged: 0, queued: 0 },
           linking: { links_upserted: 0, false_positives_dropped: 0 },
           errors: ['GitHub client not configured — LAZYFLOW_GITHUB_TOKEN required'],
@@ -452,6 +471,7 @@ function registerRunSyncTool(server, ctx) {
             issues_upserted: 0,
             transitions_appended: 0,
             errors: ['Jira client not configured'],
+            warnings: [],
           },
           identity: { identities_upserted: 0, persons_created: 0, auto_merged: 0, queued: 0 },
           linking: { links_upserted: 0, false_positives_dropped: 0 },
@@ -477,7 +497,10 @@ function registerRunSyncTool(server, ctx) {
 
       // Build stub scopes from config when clients aren't wired up yet
       const org = ctx.config.repos[0]?.split('/')[0] ?? ''
-      const repos = ctx.config.repos.map((r) => r.split('/')[1] ?? r)
+      // Pass FULL "owner/name" identifiers to the GitHub sync, which resolves
+      // each repo directly. Stripping the owner here yielded bare names that
+      // never matched the API's full_name, silently syncing zero repos.
+      const repos = ctx.config.repos
 
       const jiraMode = syncMode === 'full' ? 'backfill' : 'incremental'
       const ghMode = syncMode === 'full' ? 'backfill' : 'incremental'
@@ -492,6 +515,7 @@ function registerRunSyncTool(server, ctx) {
       const ghClient = syncSources.includes('github') ? ctx.githubClient : null
       const jrClient = syncSources.includes('jira') ? ctx.jiraClient : null
 
+      const tSync = Date.now()
       const result = await runSync(
         ctx.store,
         ghClient,
@@ -505,6 +529,7 @@ function registerRunSyncTool(server, ctx) {
         jiraMode,
         opts,
       )
+      const syncMs = Date.now() - tSync
 
       // Compute + persist metric snapshots so reports + get_* tools have real
       // history (the metric engine runs over the freshly-synced entities). The
@@ -515,6 +540,7 @@ function registerRunSyncTool(server, ctx) {
       const backfillFrom = new Date(Date.parse(today) - 119 * 86_400_000).toISOString().slice(0, 10)
       const coverageFingerprint = `${org}|${repos.join(',')}|${ctx.config.jiraProjects.join(',')}`
       let snapshotsWritten = 0
+      const tBackfill = Date.now()
       try {
         for (const [scopeType, scopeId] of [
           ['team', 'team'],
@@ -536,11 +562,18 @@ function registerRunSyncTool(server, ctx) {
         // Surface as an error string but keep the successful sync result.
         result.errors.push(`snapshot backfill failed: ${String(err)}`)
       }
+      const backfillMs = Date.now() - tBackfill
 
       const output = {
         ...provenance('n/a'),
         synced_at: result.syncedAt,
         snapshots_written: snapshotsWritten,
+        timings_ms: {
+          sync_total: syncMs,
+          github: result.timings?.githubMs ?? 0,
+          jira: result.timings?.jiraMs ?? 0,
+          snapshot_backfill: backfillMs,
+        },
         github: {
           org: result.github.org,
           repos: result.github.repos,
@@ -551,6 +584,7 @@ function registerRunSyncTool(server, ctx) {
           issues_upserted: result.jira.issuesUpserted,
           transitions_appended: result.jira.transitionsAppended,
           errors: result.jira.errors,
+          warnings: result.jira.warnings ?? [],
         },
         identity: {
           identities_upserted: result.identity.identitiesUpserted,

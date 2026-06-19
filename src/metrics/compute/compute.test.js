@@ -21,7 +21,12 @@ import { setupServer } from 'msw/node'
 import { BunSqliteStore, migrate } from '../../core/index.js'
 import { GitHubClient, syncGitHub } from '../../ingest-github/index.js'
 import { baseOrg, IDS, mockGitHub } from '../../testkit/index.js'
-import { backfillSnapshots, COMPUTE_METRIC_IDS, computeMetric } from './index.js'
+import {
+  backfillSnapshots,
+  COMPUTE_METRIC_IDS,
+  computeMetric,
+  loadScopeDataWindowed,
+} from './index.js'
 
 const NOW = '2024-06-01T00:00:00.000Z'
 // Sprints/boards are discovered by probing the Jira project id as a board id.
@@ -1116,4 +1121,58 @@ describe('pr.ci_health end-to-end from a real sync', () => {
     expect(r.value).toBeGreaterThan(0)
     expect(r.value).toBeLessThan(1)
   })
+})
+
+// ---------------------------------------------------------------------------
+// Equivalence: the bulk load-once + in-memory window slice
+// (loadFullScopeData/sliceScopeData) must produce IDENTICAL metric values to the
+// original per-window SQL loader (loadScopeDataWindowed oracle) for every metric
+// over every window. This is the safety net for the snapshot-backfill perf
+// rewrite — if any slice predicate diverges from its SQL counterpart, a metric
+// value differs here.
+// ---------------------------------------------------------------------------
+
+describe('sliceScopeData ≡ loadScopeDataWindowed (perf-rewrite equivalence)', () => {
+  let store
+  beforeEach(async () => {
+    store = freshStore()
+    await seed(store)
+  })
+
+  // Windows spanning the seeded data plus an empty future window.
+  const WINDOWS = [
+    ['2024-01-01', '2024-03-31'],
+    ['2024-02-01', '2024-03-02'],
+    ['2024-03-02', '2024-03-31'],
+    ['2024-05-02', '2024-05-31'],
+    ['2024-01-01', '2024-06-01'],
+    ['2025-01-01', '2025-01-30'], // no data — exercises empty slices
+  ]
+
+  for (const [from, to] of WINDOWS) {
+    for (const scopeType of ['org', 'team']) {
+      it(`matches the SQL oracle for every metric over ${from}..${to} (${scopeType})`, async () => {
+        const oracle = await loadScopeDataWindowed(store, from, to)
+        for (const metricId of COMPUTE_METRIC_IDS) {
+          const viaSlice = await computeMetric(store, scopeType, scopeType, metricId, from, to, NOW)
+          const viaOracle = await computeMetric(
+            store,
+            scopeType,
+            scopeType,
+            metricId,
+            from,
+            to,
+            NOW,
+            oracle,
+          )
+          expect({ id: metricId, value: viaSlice.value }).toEqual({
+            id: metricId,
+            value: viaOracle.value,
+          })
+          expect(viaSlice.trustTier).toBe(viaOracle.trustTier)
+          expect(viaSlice.dataQuality).toBe(viaOracle.dataQuality)
+        }
+      })
+    }
+  }
 })
