@@ -157,6 +157,37 @@ export async function syncJira(store, client, scope, mode, now = new Date().toIS
             `custom-field name/permissions or set the project's storyPointsFieldId property.`,
         )
       }
+      // Epic-link field id is instance-specific (classic boards) — discover it
+      // rather than hardcoding a customfield id. Best-effort; team-managed
+      // projects expose the parent directly.
+      let epicLinkFieldId = null
+      try {
+        epicLinkFieldId = await client.discoverEpicLinkField()
+      } catch {
+        // Field-list discovery failed (permissions) — fall back to parent/epic.
+      }
+
+      // Fields to request: the generic base set PLUS the per-instance custom
+      // fields we discovered. Without explicitly requesting the discovered
+      // story-point/epic fields, the enhanced /search/jql endpoint omits them
+      // and story_points/epic_key silently stay null.
+      const issueFields = [
+        'summary',
+        'issuetype',
+        'status',
+        'project',
+        'created',
+        'updated',
+        'resolutiondate',
+        'assignee',
+        'parent',
+        'labels',
+        'components',
+        'priority',
+        'resolution',
+      ]
+      if (storyPointFieldId) issueFields.push(storyPointFieldId)
+      if (epicLinkFieldId) issueFields.push(epicLinkFieldId)
 
       // Ingest workflows for this project. Workflow discovery is auxiliary
       // (status-mapping enrichment); a failure is reported but must NOT abort
@@ -233,7 +264,11 @@ export async function syncJira(store, client, scope, mode, now = new Date().toIS
       // eliminating the per-issue changelog round trip (N+1) for issues whose
       // history fits one page. Issues with a truncated inline changelog fall back
       // to the paginated getChangelogAll below.
-      for await (const issuesBatch of client.searchJqlAll({ jql, expand: ['changelog'] })) {
+      for await (const issuesBatch of client.searchJqlAll({
+        jql,
+        expand: ['changelog'],
+        fields: issueFields,
+      })) {
         for (const rawIssue of issuesBatch) {
           seenIssueIds.add(rawIssue.id)
 
@@ -244,6 +279,7 @@ export async function syncJira(store, client, scope, mode, now = new Date().toIS
               rawIssue,
               projectId,
               storyPointFieldId,
+              epicLinkFieldId,
               statusCategoryMap,
               now,
             )
@@ -431,7 +467,7 @@ export async function syncJira(store, client, scope, mode, now = new Date().toIS
 // Helpers
 // ---------------------------------------------------------------------------
 
-function mapRawIssue(raw, projectId, storyPointFieldId, statusCategoryMap, now) {
+function mapRawIssue(raw, projectId, storyPointFieldId, epicLinkFieldId, statusCategoryMap, now) {
   const fields = raw.fields
 
   const statusId = fields.status?.id ?? ''
@@ -459,7 +495,11 @@ function mapRawIssue(raw, projectId, storyPointFieldId, statusCategoryMap, now) 
 
   const hierarchyLevel = isSubtask ? 2 : parentId ? 1 : 0
 
-  const epicKey = fields.epic?.key ?? fields.customfield_10014 ?? null
+  // Epic key: team-managed projects expose fields.epic.key; classic boards store
+  // it on the DISCOVERED epic-link custom field (id varies per instance — never
+  // hardcoded). The discovered field may hold the epic KEY (e.g. "BP-12").
+  const epicKey =
+    fields.epic?.key ?? (epicLinkFieldId ? (fields[epicLinkFieldId] ?? null) : null) ?? null
 
   // Identity resolution (Jira accountId → internal identity) is handled by a
   // separate identity-resolution pass; set to null here to avoid FK violations.

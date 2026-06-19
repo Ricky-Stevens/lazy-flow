@@ -713,6 +713,41 @@ export class GitHubClient {
     return out
   }
 
+  /**
+   * Check which of `paths` exist at the repo's default-branch HEAD, via one (or a
+   * few) batched GraphQL `object(expression:"HEAD:<path>")` lookups. Returns the
+   * set of present paths. Used for tool-agnostic AI-tooling detection (CLAUDE.md,
+   * .cursor, copilot-instructions, …). Paths are passed as VARIABLES, never
+   * interpolated, so a path cannot break or inject into the query.
+   */
+  async fetchPathsPresent(owner, repo, paths) {
+    const present = new Set()
+    const BATCH = 40
+    for (let start = 0; start < paths.length; start += BATCH) {
+      const chunk = paths.slice(start, start + BATCH)
+      const decls = ['$owner: String!', '$name: String!']
+      const selections = []
+      const variables = { owner, name: repo }
+      chunk.forEach((p, i) => {
+        decls.push(`$e${i}: String!`)
+        selections.push(`o${i}: object(expression: $e${i}) { __typename }`)
+        variables[`e${i}`] = `HEAD:${p}`
+      })
+      const query = `query RepoPaths(${decls.join(', ')}) {
+        repository(owner: $owner, name: $name) {
+          ${selections.join('\n          ')}
+        }
+        rateLimit { cost remaining resetAt }
+      }`
+      const { data } = await this.graphqlRequest(query, 'RepoPaths', variables)
+      const repository = data.repository ?? {}
+      chunk.forEach((p, i) => {
+        if (repository[`o${i}`]) present.add(p)
+      })
+    }
+    return present
+  }
+
   // -------------------------------------------------------------------------
   // GraphQL — per-PR object graph with exhausted inner connections
   // -------------------------------------------------------------------------

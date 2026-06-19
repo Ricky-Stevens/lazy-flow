@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS candidate_matches (
   id              TEXT    NOT NULL PRIMARY KEY,
   identity_id_a   TEXT    NOT NULL REFERENCES identities(id),
   identity_id_b   TEXT    NOT NULL REFERENCES identities(id),
-  reason          TEXT    NOT NULL CHECK (reason IN ('local_part_name', 'fuzzy_name')),
+  reason          TEXT    NOT NULL CHECK (reason IN ('local_part_name', 'fuzzy_name', 'xsrc_email', 'xsrc_name', 'xsrc_behavioral', 'xsrc_name_behavioral')),
   confidence      REAL    NOT NULL,
   status          TEXT    NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'confirmed', 'rejected')),
   decided_at      TEXT,
@@ -497,6 +497,37 @@ CREATE INDEX IF NOT EXISTS idx_ai_verdicts_subject ON ai_verdicts(subject_type, 
 CREATE INDEX IF NOT EXISTS idx_ai_verdicts_metric ON ai_verdicts(metric, created_at);
 CREATE INDEX IF NOT EXISTS idx_ai_verdicts_created_at ON ai_verdicts(created_at);
 
+-- Per-change AI-authorship signal (tool-agnostic; deterministic stylometry +
+-- markers + AI-agent author). Feeds AI-adoption KPIs (per repo / author / time).
+-- ai_score is a 0..1 likelihood; signals_json lists which signals fired so
+-- downstream KPIs can apply their own threshold/policy.
+CREATE TABLE IF NOT EXISTS ai_authorship (
+  entity_type        TEXT NOT NULL CHECK (entity_type IN ('commit', 'pull_request')),
+  entity_id          TEXT NOT NULL,
+  repo_id            TEXT NOT NULL REFERENCES repositories(id),
+  author_identity_id TEXT,
+  authored_at        TEXT,
+  ai_score           REAL NOT NULL,
+  signals_json       TEXT NOT NULL,
+  computed_at        TEXT NOT NULL,
+  PRIMARY KEY (entity_type, entity_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ai_authorship_repo ON ai_authorship(repo_id, authored_at);
+CREATE INDEX IF NOT EXISTS idx_ai_authorship_author ON ai_authorship(author_identity_id);
+
+-- Repo-level AI-tooling maturity: presence of AI-assistant config (CLAUDE.md,
+-- .cursor, copilot-instructions, …) and active AI agent/bot apps. Tool-agnostic
+-- and configurable; the marker/bot lists are NOT hardcoded to any one vendor.
+CREATE TABLE IF NOT EXISTS repo_ai_signals (
+  repo_id     TEXT NOT NULL REFERENCES repositories(id),
+  signal      TEXT NOT NULL,
+  category    TEXT NOT NULL CHECK (category IN ('assistant_config', 'agent_bot')),
+  present     INTEGER NOT NULL DEFAULT 0,
+  detail      TEXT,
+  detected_at TEXT NOT NULL,
+  PRIMARY KEY (repo_id, signal)
+);
+
 -- Per-workflow active/wait/done map; effective-dated
 CREATE TABLE IF NOT EXISTS flow_state_models (
   workflow_id   TEXT NOT NULL REFERENCES workflows(workflow_id),
@@ -584,6 +615,8 @@ DROP TABLE IF EXISTS deploy_incident_links;
 DROP TABLE IF EXISTS sync_state;
 DROP TABLE IF EXISTS status_category_history;
 DROP TABLE IF EXISTS flow_state_models;
+DROP TABLE IF EXISTS repo_ai_signals;
+DROP TABLE IF EXISTS ai_authorship;
 DROP TABLE IF EXISTS ai_verdicts;
 DROP TABLE IF EXISTS metric_baselines;
 DROP TABLE IF EXISTS metric_snapshots;

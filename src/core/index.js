@@ -1,4 +1,7 @@
 // Constants
+
+// AI-authorship detection (tool-agnostic stylometry + markers + agent author)
+export { DEFAULT_AI_BOT_LOGINS, detectAiAuthorship, scoreAiText } from './ai/aiAuthorship.js'
 export { ENGINE_VERSION } from './constants.js'
 // Deployment-environment matching (DORA + deploy↔incident linking)
 export { environmentMatches, isProductionEnv } from './domain/environment.js'
@@ -26,6 +29,7 @@ export {
   parseTrailers,
   rejectCandidateMatch,
   resolveIdentities,
+  stitchCrossSource,
   stitchPersons,
   unmergeIdentities,
 } from './identity/index.js'

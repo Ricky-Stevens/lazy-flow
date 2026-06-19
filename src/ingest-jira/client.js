@@ -191,6 +191,9 @@ export class JiraClient {
     const body = {
       jql: opts.jql,
       maxResults: opts.maxResults ?? 50,
+      // Generic base fields present on every Jira instance. Instance-specific
+      // custom fields (story points, epic link) are NOT hardcoded here — the
+      // caller discovers them per-instance and appends them via opts.fields.
       fields: opts.fields ?? [
         'summary',
         'issuetype',
@@ -201,7 +204,10 @@ export class JiraClient {
         'resolutiondate',
         'assignee',
         'parent',
-        'customfield_10016',
+        'labels',
+        'components',
+        'priority',
+        'resolution',
       ],
     }
     if (opts.nextPageToken !== undefined) {
@@ -337,6 +343,23 @@ export class JiraClient {
     ])
     const match = fields.find(
       (f) => f.custom && f.schema?.type === 'number' && storyPointNames.has(f.name.toLowerCase()),
+    )
+    return match?.id ?? null
+  }
+
+  /**
+   * Discover the epic-link field id for an instance (classic Jira boards store
+   * the epic on a custom field, e.g. customfield_10014 — but the id differs per
+   * instance, so it must be discovered, never hardcoded). Team-managed projects
+   * expose the parent directly and don't need this. Returns null when absent.
+   */
+  async discoverEpicLinkField() {
+    const fields = await this.getFields()
+    const match = fields.find(
+      (f) =>
+        f.custom &&
+        (f.schema?.custom === 'com.pyxis.greenhopper.jira:gh-epic-link' ||
+          f.name?.toLowerCase() === 'epic link'),
     )
     return match?.id ?? null
   }

@@ -1,6 +1,13 @@
-import { linkDeployIncidents, linkIssues, resolveIdentities, stitchPersons } from '../core/index.js'
+import {
+  detectAiAuthorship,
+  linkDeployIncidents,
+  linkIssues,
+  resolveIdentities,
+  stitchCrossSource,
+  stitchPersons,
+} from '../core/index.js'
 
-import { syncGitHub } from '../ingest-github/index.js'
+import { ingestRepoAiSignals, syncGitHub } from '../ingest-github/index.js'
 
 import { syncJira } from '../ingest-jira/index.js'
 
@@ -94,6 +101,48 @@ export async function runSync(
   const linkResult = await linkIssues(store, { now })
 
   // -------------------------------------------------------------------------
+  // 5a. Cross-source identity stitch (GitHub ↔ Jira). Runs AFTER linkIssues so
+  //     the behavioural signal (PR author ↔ issue assignee via pr_issue_links)
+  //     is available. Incremental: only resolves still-unpaired persons, so
+  //     iterative syncs only stitch genuinely new handles. Best-effort — a
+  //     failure here must not fail an otherwise-successful sync.
+  // -------------------------------------------------------------------------
+  let crossSource = { autoMerged: 0, queued: 0 }
+  try {
+    crossSource = await stitchCrossSource(store, { now })
+  } catch (err) {
+    errors.push(`cross-source stitch: ${err instanceof Error ? err.message : String(err)}`)
+  }
+
+  // -------------------------------------------------------------------------
+  // 5b. AI-authorship detection (tool-agnostic; em-dash + markers + agent
+  //     author). Incremental — only new commits/PRs are scored. Best-effort.
+  // -------------------------------------------------------------------------
+  let aiAuthorship = { scored: 0 }
+  try {
+    aiAuthorship = await detectAiAuthorship(store, { now, aiBotLogins: options.aiBotLogins })
+  } catch (err) {
+    errors.push(`ai-authorship: ${err instanceof Error ? err.message : String(err)}`)
+  }
+
+  // -------------------------------------------------------------------------
+  // 5c. Repo AI-tooling maturity (assistant-config files via the GitHub client +
+  //     AI-agent-bot authorship from stored data). Best-effort.
+  // -------------------------------------------------------------------------
+  let repoAiSignals = { signalsWritten: 0 }
+  try {
+    const repos = await store.getRepositoriesByOrg(`org-${githubScope.org}`)
+    if (repos.length > 0) {
+      repoAiSignals = await ingestRepoAiSignals(store, githubClient, repos, {
+        now,
+        aiBotLogins: options.aiBotLogins,
+      })
+    }
+  } catch (err) {
+    errors.push(`repo-ai-signals: ${err instanceof Error ? err.message : String(err)}`)
+  }
+
+  // -------------------------------------------------------------------------
   // 5b. Link deployments ↔ incidents (populate deploy_incident_links) for DORA
   //     CFR / recovery / rework attribution + insight joins. Best-effort: a
   //     failure here does not fail the sync (the metric engine derives its own
@@ -155,8 +204,14 @@ export async function runSync(
       issuesBackfilled: resolveResult.issuesBackfilled,
       transitionsBackfilled: resolveResult.transitionsBackfilled,
       personsCreated: stitchResult.personsCreated,
-      autoMerged: stitchResult.autoMerged,
-      queued: stitchResult.queued,
+      // Total auto-merges/queues across the base ladder AND the cross-source
+      // (GitHub↔Jira) pass, so the sync summary reflects all identity resolution.
+      autoMerged: stitchResult.autoMerged + crossSource.autoMerged,
+      queued: stitchResult.queued + crossSource.queued,
+      crossSourceAutoMerged: crossSource.autoMerged,
+      crossSourceQueued: crossSource.queued,
+      aiAuthorshipScored: aiAuthorship.scored,
+      repoAiSignalsWritten: repoAiSignals.signalsWritten,
     },
     linking: {
       linksUpserted: linkResult.linksUpserted,

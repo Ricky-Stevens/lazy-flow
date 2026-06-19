@@ -569,6 +569,17 @@ function graphQLHandlers() {
     // status N+1). databaseId mirrors the REST numeric id so String(databaseId)
     // equals the row id the engine stored via the old REST path; the latest
     // status state is the upper-case GraphQL enum the mapper lower-cases.
+    // AI-tooling config probe (object(expression:"HEAD:<path>") existence checks).
+    // The base dataset has no AI config files, so every alias resolves to null.
+    graphql.query('RepoPaths', () => {
+      return HttpResponse.json({
+        data: {
+          repository: {},
+          rateLimit: { cost: 1, remaining: 4999, resetAt: new Date().toISOString() },
+        },
+      })
+    }),
+
     graphql.query('RepoDeployments', ({ variables }) => {
       const { owner, name } = variables
       const repoRecord = baseOrg.repositories.find((r) => r.owner === owner && r.name === name)

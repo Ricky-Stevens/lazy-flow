@@ -882,6 +882,78 @@ export class BunSqliteStore {
     }))
   }
 
+  /** All PR↔issue links (pr_id, issue_id) in one query — for cross-source identity
+   * behavioral matching (PR author ↔ issue assignee co-occurrence). */
+  async getAllPrIssueLinks() {
+    const rows = this.stmt(`SELECT pr_id, issue_id FROM pr_issue_links`).all()
+    return rows.map((r) => ({ prId: String(r.pr_id), issueId: String(r.issue_id) }))
+  }
+
+  /** All non-deleted issues' (id, assignee_identity_id) in one query — for
+   * cross-source identity behavioral matching. */
+  async getAllIssueAssignees() {
+    const rows = this.stmt(
+      `SELECT id, assignee_identity_id FROM issues WHERE deleted_at IS NULL`,
+    ).all()
+    return rows.map((r) => ({
+      issueId: String(r.id),
+      assigneeIdentityId: rstr(r.assignee_identity_id),
+    }))
+  }
+
+  // --- AI-authorship signal ------------------------------------------------
+
+  async upsertAiAuthorship(row) {
+    this.stmt(`
+      INSERT INTO ai_authorship
+        (entity_type, entity_id, repo_id, author_identity_id, authored_at, ai_score, signals_json, computed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+        repo_id            = excluded.repo_id,
+        author_identity_id = excluded.author_identity_id,
+        authored_at        = excluded.authored_at,
+        ai_score           = excluded.ai_score,
+        signals_json       = excluded.signals_json,
+        computed_at        = excluded.computed_at
+    `).run(
+      row.entityType,
+      row.entityId,
+      row.repoId,
+      row.authorIdentityId ?? null,
+      row.authoredAt ?? null,
+      row.aiScore,
+      row.signalsJson,
+      row.computedAt,
+    )
+  }
+
+  /** (entity_type, entity_id) of every scored row — for incremental skip. */
+  async getAiAuthorshipKeys() {
+    const rows = this.stmt(`SELECT entity_type, entity_id FROM ai_authorship`).all()
+    return rows.map((r) => ({ entityType: String(r.entity_type), entityId: String(r.entity_id) }))
+  }
+
+  // --- Repo AI-tooling maturity signal -------------------------------------
+
+  async upsertRepoAiSignal(sig) {
+    this.stmt(`
+      INSERT INTO repo_ai_signals (repo_id, signal, category, present, detail, detected_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(repo_id, signal) DO UPDATE SET
+        category    = excluded.category,
+        present     = excluded.present,
+        detail      = excluded.detail,
+        detected_at = excluded.detected_at
+    `).run(
+      sig.repoId,
+      sig.signal,
+      sig.category,
+      sig.present ? 1 : 0,
+      sig.detail ?? null,
+      sig.detectedAt,
+    )
+  }
+
   // ---------------------------------------------------------------------------
   // Deployments
   // ---------------------------------------------------------------------------

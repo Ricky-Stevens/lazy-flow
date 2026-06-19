@@ -5,10 +5,13 @@
  *   resolveIdentities  — resolution pass: upsert identities, backfill NULL FKs
  *   parseCommitAuthors — parse Co-authored-by trailers → commit_authors rows
  *   stitchPersons      — match ladder: create persons, auto-merge or queue
+ *   stitchCrossSource  — GitHub↔Jira merge via email / name / behavioural signals
  *   listCandidateMatches / confirmCandidateMatch / rejectCandidateMatch / unmergeIdentities
  */
 
 export { parseCommitAuthors, parseTrailers } from './coauthors.js'
+
+export { stitchCrossSource } from './crossSource.js'
 
 export {
   confirmCandidateMatch,
