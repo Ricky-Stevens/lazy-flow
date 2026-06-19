@@ -197,9 +197,13 @@ export class JiraClient {
 
     const data = await this.postJson('/rest/api/3/search/jql', body)
 
+    // A 200 can legitimately omit `issues` (e.g. an empty/last page). Default to
+    // an empty array so the pagination loop's `page.issues.length` never throws
+    // and crashes the whole project sync.
+    const issues = Array.isArray(data.issues) ? data.issues : []
     return {
-      issues: data.issues,
-      total: data.total,
+      issues,
+      total: typeof data.total === 'number' ? data.total : issues.length,
       nextPageToken: data.nextPageToken,
     }
   }

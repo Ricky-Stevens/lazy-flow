@@ -1,18 +1,8 @@
+import { fmtValue } from './units.js'
+
 function esc(s) {
   // Escape pipes/newlines so table cells don't break.
   return s.replace(/\|/g, '\\|').replace(/\n/g, ' ')
-}
-
-function fmtValue(value, unit) {
-  if (value === null || !Number.isFinite(value)) return '—'
-  // Keep formatting identical to the HTML renderer so the same value reads the
-  // same in every output format: integers verbatim, large values (|v| >= 100)
-  // rounded to whole numbers, otherwise up to 2 decimals with trailing zeros trimmed.
-  let s
-  if (Number.isInteger(value)) s = String(value)
-  else if (Math.abs(value) >= 100) s = value.toFixed(0)
-  else s = value.toFixed(2).replace(/\.?0+$/, '')
-  return unit && unit !== 'count' ? `${s} ${unit}` : s
 }
 
 function comparisonCell(cell) {

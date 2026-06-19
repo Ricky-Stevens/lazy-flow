@@ -259,9 +259,13 @@ describe('PR stage timestamps', () => {
     expect(approved?.nodeId).toBe(IDS.review1Round2)
   })
 
-  it('pr-1 state is merged (from the raw merged:true flag)', async () => {
+  it('pr-1 state is merged (derived from merged_at — list endpoint omits `merged`)', async () => {
+    // Regression: the GitHub list endpoint returns merged_at but no `merged`
+    // boolean. resolveState must treat a non-null merged_at as merged, else
+    // every merged PR is misclassified as 'closed' and merged-PR metrics zero out.
     const pr = await store.getPullRequest(`${SYNCED_REPO_ALPHA}-pr-1`)
     expect(pr?.state).toBe('merged')
+    expect(pr?.mergedAt).not.toBeNull()
   })
 
   it('pr-2 has null firstReviewAt (no reviews in base dataset)', async () => {

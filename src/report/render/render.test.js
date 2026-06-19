@@ -229,3 +229,85 @@ describe('renderMarkdown', () => {
     expect(md).toContain('connect real deploy/incident data')
   })
 })
+
+// ---------------------------------------------------------------------------
+// Percentage scaling regression — ratio metrics declared with unit '%'
+// must render as percent (8%), NOT as the raw ratio with a '%' suffix (0.08 %).
+// ---------------------------------------------------------------------------
+
+import { renderCsv } from './csv.js'
+import { fmtValue, toDisplayValue } from './units.js'
+
+function percentModel() {
+  return sampleModel({
+    sections: [
+      {
+        id: 'dora',
+        title: 'DORA',
+        purpose: 'Stability.',
+        cells: [
+          {
+            metricId: 'dora.change_failure_rate',
+            label: 'Change failure rate',
+            value: 0.08, // ratio in [0,1]
+            unit: '%',
+            trustTier: 'deterministic',
+            dataQuality: 'ok',
+            polarity: 'lower_better',
+            formulaDoc: '',
+            comparison: {
+              baselineP50: 0.05,
+              delta: 0.03,
+              deltaPct: 0.6,
+              band: 'above',
+              trendArrow: 'up',
+              zScore: 1.1,
+              percentileWithin: 0.7,
+              n: 12,
+              significant: true,
+              note: null,
+            },
+          },
+        ],
+        charts: [],
+        narrative: null,
+        caveats: [],
+      },
+    ],
+  })
+}
+
+describe('percentage unit scaling', () => {
+  it('fmtValue scales ratio to percent and uses no space', () => {
+    expect(fmtValue(0.08, '%')).toBe('8%')
+    expect(fmtValue(0.6667, '%')).toBe('66.67%')
+    expect(fmtValue(1.4, '%')).toBe('140%')
+    expect(toDisplayValue(0.08, '%')).toBe(8)
+    // non-percent units are untouched
+    expect(fmtValue(5.2, 'days')).toBe('5.2 days')
+    expect(toDisplayValue(5.2, 'days')).toBe(5.2)
+    expect(fmtValue(null, '%')).toBe('—')
+  })
+
+  it('markdown renders 8% not 0.08 %', () => {
+    const md = renderMarkdown(percentModel())
+    expect(md).toContain('8%')
+    expect(md).not.toContain('0.08 %')
+    expect(md).not.toContain('0.08%')
+  })
+
+  it('html renders 8% not 0.08 %', () => {
+    const html = renderHtml(percentModel())
+    expect(html).toContain('8%')
+    expect(html).not.toContain('0.08 %')
+  })
+
+  it('csv emits the percent value (8) in the value column, matching unit', () => {
+    const csv = renderCsv(percentModel())
+    const dataLine = csv.split('\n').find((l) => l.includes('change_failure_rate'))
+    expect(dataLine).toBeDefined()
+    // value column = 8 (not 0.08); delta column = 3 (not 0.03)
+    expect(dataLine).toContain(',8,%,')
+    expect(dataLine).not.toContain(',0.08,%,')
+  })
+})

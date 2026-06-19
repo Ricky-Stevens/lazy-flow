@@ -55,7 +55,7 @@ function makeSnapshot(scopeId, day, value, engineVersion = ENGINE_VERSION, isSta
     metric: 'flow.throughput',
     day,
     value,
-    window: `${day}T00:00:00Z`,
+    window: '30d', // rolling-window DESCRIPTOR, not a timestamp
     trustTier: 'deterministic',
     dataQuality: value === null ? 'no_data' : 'ok',
     engineVersion,
@@ -174,6 +174,8 @@ describe('markStaleAndRederive', () => {
     expect(after[0]?.value).toBe(99)
     expect(after[0]?.isStale).toBe(false)
     expect(after[0]?.engineVersion).toBe(ENGINE_VERSION)
+    // Regression: window stays the '30d' descriptor, not the asOf timestamp.
+    expect(after[0]?.window).toBe('30d')
   })
 
   it('stamps the current ENGINE_VERSION on recomputed snapshots', async () => {
@@ -272,6 +274,11 @@ describe('rederiveStaleSnapshots', () => {
     const day2 = snapshots.find((s) => s.day === '2024-03-02' && !s.isStale)
     expect(day1?.value).toBe(100)
     expect(day2?.value).toBe(100)
+
+    // Regression: the re-derived snapshot must KEEP the rolling-window descriptor
+    // ('30d'), not overwrite it with the compute result's asOf timestamp.
+    expect(day1?.window).toBe('30d')
+    expect(day2?.window).toBe('30d')
   })
 })
 

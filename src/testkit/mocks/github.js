@@ -126,7 +126,18 @@ function pullsHandlers() {
       if (!repoRecord) return new HttpResponse(null, { status: 404 })
 
       const repoPrs = baseOrg.pullRequests.filter((p) => p.repoId === repoRecord.id)
-      const bodies = repoPrs.map((p) => JSON.parse(p.raw))
+      // Mirror the REAL GitHub *list* endpoint (GET /pulls): it returns
+      // `merged_at` but NOT the `merged` boolean (that field only exists on the
+      // single-PR detail endpoint). The fixture raws carry a synthetic
+      // `merged:true`; strip it and project `merged_at` from the record so the
+      // mock matches production and exercises merged-state derivation honestly.
+      const bodies = repoPrs.map((p) => {
+        const body = JSON.parse(p.raw)
+        body.merged = undefined
+        delete body.merged
+        if (p.mergedAt != null) body.merged_at = p.mergedAt
+        return body
+      })
       return HttpResponse.json(bodies, { headers: rateLimitHeaders })
     }),
 

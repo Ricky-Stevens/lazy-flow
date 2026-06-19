@@ -103,4 +103,73 @@ describe('linkDeployIncidents (persists to the store)', () => {
     expect(r2.linksUpserted).toBe(1)
     expect(await store.getDeployIncidentLinks()).toHaveLength(1)
   })
+
+  it('links incidents for non-lowercase prod env spellings (Production, prod, production-us)', async () => {
+    // Regression: the GitHub Deployments API environment is free-form. An exact
+    // `=== 'production'` match dropped these real prod deploys, zeroing CFR/MTTR.
+    for (const [i, env] of ['Production', 'prod', 'production-us'].entries()) {
+      const store = makeStore()
+      store.db.exec('PRAGMA foreign_keys = OFF')
+      store.db
+        .prepare(
+          `INSERT INTO deployments (id, repo_id, sha, environment, status, created_at, finished_at, source, raw, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          `d${i}`,
+          'repo-1',
+          'abc',
+          env,
+          'success',
+          '2024-03-01T10:00:00Z',
+          '2024-03-01T10:05:00Z',
+          'deployments_api',
+          '{}',
+          '2024-03-01T10:05:00Z',
+        )
+      store.db
+        .prepare(
+          `INSERT INTO issues (id, project_id, key, type, status_id, status_category, created_at, raw, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          `inc${i}`,
+          'proj-1',
+          `OPS-${i}`,
+          'Incident',
+          's1',
+          'done',
+          '2024-03-01T12:00:00Z',
+          '{}',
+          '2024-03-01T12:00:00Z',
+        )
+
+      const r = await linkDeployIncidents(store, { now: '2024-03-02T00:00:00Z' })
+      expect(r.linksUpserted, `env=${env}`).toBe(1)
+    }
+  })
+})
+
+describe('environment matching helpers', () => {
+  it('isProductionEnv accepts prod-family spellings, rejects look-alikes', async () => {
+    const { isProductionEnv, environmentMatches } = await import('../domain/environment.js')
+    for (const e of [
+      'production',
+      'Production',
+      'PROD',
+      'prod',
+      'production-us',
+      'prod-eu',
+      'prod_1',
+      'production2',
+    ]) {
+      expect(isProductionEnv(e), e).toBe(true)
+    }
+    for (const e of ['staging', 'product-catalog', 'preproduction', 'dev', '', null, undefined]) {
+      expect(isProductionEnv(e), String(e)).toBe(false)
+    }
+    // configurable non-prod target falls back to case-insensitive exact match
+    expect(environmentMatches('Staging', 'staging')).toBe(true)
+    expect(environmentMatches('production', 'staging')).toBe(false)
+  })
 })

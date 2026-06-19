@@ -41,6 +41,13 @@ describe('classifyDrift', () => {
     const prior = summarize([10, 12, 11, 9, 10, 11, 10, 12])
     expect(classifyDrift(10.5, prior).driftStatus).toBe('stable')
   })
+  it('flat prior: classifies by relative move, not the EPS-floored z-score', () => {
+    const flatPrior = summarize([10, 10, 10, 10, 10])
+    expect(classifyDrift(10.05, flatPrior).driftStatus).toBe('stable') // +0.5%
+    expect(classifyDrift(11.5, flatPrior).driftStatus).toBe('shifting') // +15%
+    expect(classifyDrift(14, flatPrior).driftStatus).toBe('regime_change') // +40%
+    expect(classifyDrift(10.05, flatPrior).driftZ).toBeNull()
+  })
 })
 
 describe('compareToBaseline', () => {
@@ -74,6 +81,29 @@ describe('compareToBaseline', () => {
     const c = compareToBaseline({ value: null, baselineValues: baseline })
     expect(c.note).toBe('no current value')
     expect(c.delta).toBeNull()
+  })
+
+  it('does NOT flag a micro-move against a perfectly flat baseline as significant', () => {
+    // Regression: a flat baseline floors robustSd to EPS, so delta/EPS exploded
+    // and a 0.002% change read as "well above baseline". A flat baseline must be
+    // judged by relative change instead.
+    const flat = [5, 5, 5, 5, 5]
+    const tiny = compareToBaseline({ value: 5.0001, baselineValues: flat })
+    expect(tiny.significant).toBe(false)
+    expect(tiny.band).toBe('in_line')
+    expect(tiny.zScore).toBeNull()
+
+    // A genuinely large move from the flat baseline still registers.
+    const big = compareToBaseline({ value: 7, baselineValues: flat }) // +40%
+    expect(big.significant).toBe(true)
+    expect(big.band).toBe('well_above')
+    expect(big.trendArrow).toBe('up')
+  })
+
+  it('treats a non-zero value over an all-zero baseline as a regime change', () => {
+    const c = compareToBaseline({ value: 3, baselineValues: [0, 0, 0, 0, 0] })
+    expect(c.significant).toBe(true)
+    expect(c.band).toBe('well_above')
   })
 })
 

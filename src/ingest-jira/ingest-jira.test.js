@@ -565,6 +565,41 @@ describe('board config: started vs queue column distinguished', () => {
     expect(done?.isStartedCol).toBe(false)
   })
 
+  it('survives a malformed column (no statuses / no name) without dropping the rest', async () => {
+    // Regression: `col.statuses.map(...)` / `col.name.toLowerCase()` threw on a
+    // malformed column, aborting the loop and dropping ALL board-column
+    // boundaries for the project. Bad columns are now skipped, good ones persist.
+    const store = makeStore()
+    const rawConfig = {
+      id: IDS.boardId,
+      name: 'Acme Board',
+      type: 'scrum',
+      columnConfig: {
+        columns: [
+          {
+            name: 'In Progress',
+            statuses: [{ id: IDS.statusInProgress }],
+            isStartedColumn: true,
+            isDoneColumn: false,
+          },
+          { name: 'Broken (no statuses)' }, // missing statuses → must not throw
+          { statuses: [{ id: IDS.statusDone }], isDoneColumn: true }, // missing name → skipped
+        ],
+      },
+    }
+
+    await ingestBoardConfigFromRaw(store, rawConfig, NOW)
+
+    const columns = await store.getBoardColumns(IDS.boardId)
+    // The good column persists; the nameless one is skipped; the no-statuses one
+    // persists with an empty status set (still a valid, keyed column).
+    const inProgress = columns.find((c) => c.columnName === 'In Progress')
+    expect(inProgress?.isStartedCol).toBe(true)
+    const broken = columns.find((c) => c.columnName === 'Broken (no statuses)')
+    expect(broken).toBeDefined()
+    expect(JSON.parse(broken?.statusIds ?? '[]')).toEqual([])
+  })
+
   it('fetches and ingests board config via client (integration with mock)', async () => {
     const client = makeClient()
     const store = makeStore()
@@ -941,5 +976,33 @@ describe('syncJira integration smoke', () => {
     const sprint = await store.getSprint(IDS.sprintId)
     expect(sprint).not.toBeNull()
     expect(sprint?.boardId).toBe(IDS.boardId)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Resilience: a 200 /search/jql response that omits `issues` must not crash
+// the pagination loop (and thus the whole project sync).
+// ---------------------------------------------------------------------------
+
+describe('searchJql resilience to a missing `issues` field', () => {
+  it('treats an issues-less 200 as an empty page instead of throwing', async () => {
+    const client = makeClient()
+    server.use(
+      http.post('*/rest/api/3/search/jql', () =>
+        // Real Jira can return a 200 with no `issues` array (empty/last page).
+        HttpResponse.json({ total: 0 }),
+      ),
+    )
+
+    const page = await client.searchJql({ jql: 'project = ACME' })
+    expect(page.issues).toEqual([])
+    expect(page.total).toBe(0)
+
+    // The exhaustive iterator must terminate cleanly, yielding nothing.
+    const collected = []
+    for await (const batch of client.searchJqlAll({ jql: 'project = ACME' })) {
+      collected.push(...batch)
+    }
+    expect(collected).toEqual([])
   })
 })

@@ -10,17 +10,9 @@
 import { Eta } from 'eta'
 
 import { REPORT_CSS } from './theme.js'
+import { fmtValue } from './units.js'
 
 const eta = new Eta({ autoEscape: true, autoTrim: false })
-
-function fmtValue(value, unit) {
-  if (value === null || !Number.isFinite(value)) return '—'
-  let s
-  if (Number.isInteger(value)) s = String(value)
-  else if (Math.abs(value) >= 100) s = value.toFixed(0)
-  else s = value.toFixed(2).replace(/\.?0+$/, '')
-  return unit && unit !== 'count' ? `${s} ${unit}` : s
-}
 
 const ARROW = { up: '▲', down: '▼', steady: '▬' }
 const BAND_LABEL = {

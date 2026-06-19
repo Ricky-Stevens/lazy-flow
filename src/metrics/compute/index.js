@@ -191,7 +191,7 @@ async function loadScopeData(store, windowFrom, windowTo) {
   let priorHaloc = 0
 
   for (const repo of repos) {
-    const repoPrs = await store.getPullRequestsByRepo(repo.id, fromIso, toIso)
+    const repoPrs = await store.getPullRequestsForMetrics(repo.id, fromIso, toIso)
     for (const pr of repoPrs) {
       prs.push(pr)
       reviewsByPr.set(pr.id, await store.getReviewsByPullRequest(pr.id))
@@ -685,26 +685,17 @@ function allReviewCommentInputs(data) {
  * with the board ids of any sprints found (a sprint's board id may differ from
  * the project id). Sprints found under any discovered board are returned.
  */
-async function loadAllSprints(store, data) {
-  const probed = new Set()
-  const queue = [...data.projectIds]
-  const sprints = []
-  const seenSprint = new Set()
-
-  while (queue.length > 0) {
-    const boardId = queue.shift()
-    if (probed.has(boardId)) continue
-    probed.add(boardId)
-    const boardSprints = await store.getSprintsByBoard(boardId)
-    for (const s of boardSprints) {
-      if (!seenSprint.has(s.id)) {
-        seenSprint.add(s.id)
-        sprints.push(s)
-      }
-      if (!probed.has(s.boardId)) queue.push(s.boardId)
-    }
-  }
-  return sprints
+/**
+ * Discover every sprint in the install via a direct store enumeration.
+ *
+ * Sprints are keyed by agile-board id, which does NOT share a namespace with
+ * Jira project ids — so the previous project-id-probing heuristic discovered
+ * nothing on a real install (board ids only coincided with project ids in test
+ * fixtures), leaving the whole agile family permanently no_data. `data` is kept
+ * in the signature for call-site compatibility.
+ */
+async function loadAllSprints(store, _data) {
+  return store.listAllSprints()
 }
 
 /** Build the agile IssueRecord projection used by velocity. */
@@ -1088,7 +1079,14 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
         toFlowIssueRecord(i, data.transitionsByIssue.get(i.id) ?? []),
       )
       return cycleTime.compute(
-        { issues: flowIssues, boardColumns, resolveFlowState: () => null, now },
+        {
+          issues: flowIssues,
+          boardColumns,
+          resolveFlowState: () => null,
+          windowStart: dayStartIso(windowFrom),
+          windowEnd: dayEndIso(windowTo),
+          now,
+        },
         now,
       )
     }
@@ -1623,6 +1621,121 @@ function detectGamingFor(metricId, data) {
  * @param windowTo   - inclusive ISO day 'YYYY-MM-DD'
  * @param now        - injected ISO timestamp (never Date.now())
  */
+/**
+ * Metric ids that carry a faithful PER-PERSON meaning. Person scope is an IC
+ * SELF-VIEW (SPEC §11 personScope): a narrow flow slice judged against the
+ * person's OWN baseline, never a ranking. Team-only metrics (DORA, anything
+ * aggregated across the team — flow_efficiency, flow_distribution, reviewer-load
+ * Gini, agile sprint metrics, Monte Carlo) are intentionally no_data at person
+ * scope rather than fabricated per-head.
+ */
+const PERSON_SUPPORTED_METRICS = new Set([
+  'flow.cycle_time', // issues assigned to the person
+  'flow.aging_wip',
+  'flow.wip_load',
+  'flow.throughput',
+  'pr.cycle_time', // PRs the person authored
+  'pr.size',
+  'pr.time_to_merge',
+  'pr.time_to_first_review',
+  'pr.review_latency', // review latency the person GIVES (as reviewer)
+])
+
+/**
+ * Compute a single metric for a PERSON scope by attributing the loaded data to
+ * the person's identities. Issue-flow metrics use the issues ASSIGNED to the
+ * person; PR-authoring metrics use the PRs they AUTHORED; review latency uses the
+ * reviews they GAVE. Unsupported (team-only) metrics return no_data.
+ *
+ * @param identityIds  Set of identity ids belonging to the person.
+ */
+async function computePersonRaw(store, metricId, windowFrom, windowTo, now, data, identityIds) {
+  if (!PERSON_SUPPORTED_METRICS.has(metricId)) {
+    return noDataResult(metricId, 'person', now)
+  }
+
+  const windowStart = dayStartIso(windowFrom)
+  const windowEnd = dayEndIso(windowTo)
+
+  // Issues assigned to the person → their flow slice.
+  const assignedFlowIssues = () =>
+    data.issues
+      .filter((i) => i.assigneeIdentityId !== null && identityIds.has(i.assigneeIdentityId))
+      .map((i) => toFlowIssueRecord(i, data.transitionsByIssue.get(i.id) ?? []))
+
+  // PRs the person authored → their authoring slice.
+  const authoredPrInputs = () =>
+    data.prs
+      .filter((pr) => pr.authorIdentityId !== null && identityIds.has(pr.authorIdentityId))
+      .map((pr) => toPrInput(pr, data.prFilesByPr.get(pr.id)))
+
+  switch (metricId) {
+    case 'flow.cycle_time': {
+      const { boardColumns } = await buildStatusBoundaries(store, data)
+      return cycleTime.compute(
+        {
+          issues: assignedFlowIssues(),
+          boardColumns,
+          resolveFlowState: () => null,
+          windowStart,
+          windowEnd,
+          now,
+        },
+        now,
+      )
+    }
+    case 'flow.throughput': {
+      const { doneIds } = await buildStatusBoundaries(store, data)
+      return throughput.compute(
+        { issues: assignedFlowIssues(), doneStatusIds: doneIds, windowStart, windowEnd },
+        now,
+      )
+    }
+    case 'flow.aging_wip': {
+      const { boardColumns } = await buildStatusBoundaries(store, data)
+      return agingWip.compute({ issues: assignedFlowIssues(), boardColumns, now }, now)
+    }
+    case 'flow.wip_load': {
+      const { boardColumns } = await buildStatusBoundaries(store, data)
+      return wipLoad.compute(
+        { issues: assignedFlowIssues(), boardColumns, now, avgCycleTimeDays: null },
+        now,
+      )
+    }
+    case 'pr.cycle_time':
+      return prCycleTime.compute(
+        { prs: authoredPrInputs(), deploys: data.deploys.map(toDeployInput) },
+        now,
+      )
+    case 'pr.size':
+      return prSize.compute({ prs: authoredPrInputs() }, now)
+    case 'pr.time_to_merge':
+      return timeToMerge.compute({ prs: authoredPrInputs() }, now)
+    case 'pr.time_to_first_review':
+      return timeToFirstReview.compute({ prs: authoredPrInputs() }, now)
+    case 'pr.review_latency': {
+      // "Review latency you give": the reviews the PERSON submitted, on the PRs
+      // they reviewed. First-response = the person's first review − PR ready.
+      const reviewedPrIds = new Set()
+      const personReviews = []
+      for (const [prId, revs] of data.reviewsByPr) {
+        for (const r of revs) {
+          if (identityIds.has(r.reviewerIdentityId)) {
+            reviewedPrIds.add(prId)
+            personReviews.push(toReviewInput(r))
+          }
+        }
+      }
+      const prs = data.prs
+        .filter((pr) => reviewedPrIds.has(pr.id))
+        .map((pr) => toPrInput(pr, data.prFilesByPr.get(pr.id)))
+      return reviewLatency.compute({ prs, reviews: personReviews }, now)
+    }
+    default:
+      return noDataResult(metricId, 'person', now)
+  }
+}
+
 export async function computeMetric(
   store,
   scopeType,
@@ -1632,17 +1745,21 @@ export async function computeMetric(
   windowTo,
   now,
 ) {
-  void scopeId
-
-  // Person/self scope: no wired module supports per-identity filtering. No data is
-  // loaded and no gaming pass runs — there is nothing to annotate.
-  if (scopeType === 'person' || scopeType === 'self') {
-    return noDataResult(metricId, scopeType, now)
-  }
-
   // Unknown / unwired metric id — valid no_data result, never throw.
   if (!COMPUTE_METRIC_IDS.includes(metricId)) {
     return noDataResult(metricId, scopeType, now)
+  }
+
+  // Person/self scope: an IC self-view. Attribute the loaded data to the person's
+  // identities (issues assigned / PRs authored / reviews given) and compute the
+  // per-person-meaningful subset; team-only metrics stay no_data. No gaming pass
+  // runs — a private self-view is advisory, not a ranking to game.
+  if (scopeType === 'person' || scopeType === 'self') {
+    const identities = await store.getIdentitiesByPerson(scopeId)
+    const identityIds = new Set(identities.map((i) => i.id))
+    if (identityIds.size === 0) return noDataResult(metricId, scopeType, now)
+    const personData = await loadScopeData(store, windowFrom, windowTo)
+    return computePersonRaw(store, metricId, windowFrom, windowTo, now, personData, identityIds)
   }
 
   const data = await loadScopeData(store, windowFrom, windowTo)
@@ -1681,8 +1798,16 @@ export async function backfillSnapshots(store, opts) {
   const window = Math.max(1, opts.windowDays)
   let written = 0
 
+  const nowMs = new Date(opts.now).getTime()
   for (const day of days) {
     const windowFrom = shiftDay(day, -(window - 1))
+    // Clock each day's snapshot to the END of that day (clamped to the real
+    // compute time), NOT to a single opts.now. Point-in-time metrics (aging_wip,
+    // wip_load) and open-interval tails (cfd, time_in_status, flow_efficiency)
+    // otherwise reconstruct every historical day as if it were today, making
+    // every backfilled snapshot identical to the latest one.
+    const dayEnd = dayEndIso(day)
+    const dayNow = new Date(dayEnd).getTime() <= nowMs ? dayEnd : opts.now
     for (const metricId of opts.metricIds) {
       const result = await computeMetric(
         store,
@@ -1691,7 +1816,7 @@ export async function backfillSnapshots(store, opts) {
         metricId,
         windowFrom,
         day,
-        opts.now,
+        dayNow,
       )
       await store.putSnapshot({
         scopeType: opts.scopeType,

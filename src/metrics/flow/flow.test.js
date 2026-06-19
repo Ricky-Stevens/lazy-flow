@@ -134,6 +134,36 @@ describe('cycleTime', () => {
     expect(result.perIssue[0]?.reopenCount).toBeGreaterThan(0) // story-1 was reopened
   })
 
+  it('only counts issues whose first Done falls inside the completion window', () => {
+    // Regression: without a window every issue ever completed contributes, so a
+    // daily backfill snapshot reports the all-time p50 not the window's.
+    // story-1 first Done = 2024-02-18.
+    const inWindow = cycleTime.compute(
+      {
+        issues: [storyIssue],
+        boardColumns: BOARD_COLUMNS,
+        windowStart: '2024-02-01T00:00:00.000Z',
+        windowEnd: '2024-02-29T23:59:59.999Z',
+        now: NOW,
+      },
+      AS_OF,
+    )
+    expect(inWindow.sampleSize).toBe(1)
+
+    const outOfWindow = cycleTime.compute(
+      {
+        issues: [storyIssue],
+        boardColumns: BOARD_COLUMNS,
+        windowStart: '2024-03-01T00:00:00.000Z',
+        windowEnd: '2024-03-31T23:59:59.999Z',
+        now: NOW,
+      },
+      AS_OF,
+    )
+    expect(outOfWindow.sampleSize).toBe(0)
+    expect(outOfWindow.dataQuality).toBe('no_data')
+  })
+
   // KEY TEST: queue-vs-started column changes the cycle-time start
   it('queue column (Selected for Dev) does NOT start cycle time', () => {
     // story-1's first transition is to "Selected for Dev" (not started).
@@ -520,6 +550,30 @@ describe('monteCarlo', () => {
     expect(result.p50Weeks).not.toBeNull()
     // p50 should be 2 weeks (10/5=2)
     expect(result.p50Weeks).toBeCloseTo(2, 0)
+  })
+
+  it('emits p90/p95 for realistic week counts (week-appropriate floor, not item floor)', () => {
+    // Regression: the floor used item-level thresholds (20/30) against a weekly
+    // bucket count, so a monthly/quarterly window NEVER produced p90/p95. Now a
+    // ~quarter of weekly history (13 weeks) is enough for p90 (≥8) and p95 (≥12).
+    const thirteenWeeks = [4, 5, 6, 3, 5, 4, 6, 5, 4, 5, 3, 6, 4]
+    const quarter = monteCarlo.compute(
+      { weeklySamples: thirteenWeeks, remainingItems: 30, seed: 7, simulations: 2000 },
+      AS_OF,
+    )
+    expect(quarter.dataQuality).toBe('ok')
+    expect(quarter.p90Weeks).not.toBeNull()
+    expect(quarter.p95Weeks).not.toBeNull()
+
+    // A 5-week (monthly) window: usable p50 (ok), but p90/p95 still suppressed.
+    const monthly = monteCarlo.compute(
+      { weeklySamples: [4, 5, 6, 3, 5], remainingItems: 20, seed: 7, simulations: 2000 },
+      AS_OF,
+    )
+    expect(monthly.dataQuality).toBe('ok')
+    expect(monthly.p50Weeks).not.toBeNull()
+    expect(monthly.p90Weeks).toBeNull()
+    expect(monthly.p95Weeks).toBeNull()
   })
 })
 

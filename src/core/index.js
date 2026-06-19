@@ -1,5 +1,7 @@
 // Constants
 export { ENGINE_VERSION } from './constants.js'
+// Deployment-environment matching (DORA + deploy↔incident linking)
+export { environmentMatches, isProductionEnv } from './domain/environment.js'
 
 // Domain types (SPEC §6.1/§6.2)
 

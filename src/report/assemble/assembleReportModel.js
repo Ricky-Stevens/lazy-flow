@@ -12,6 +12,7 @@ import {
 import { resolvePeriod, shiftDay } from '../model/period.js'
 
 import { getPreset } from '../registry/index.js'
+import { isPercentUnit } from '../render/units.js'
 
 function latestNonNull(snaps) {
   for (let i = snaps.length - 1; i >= 0; i--) {
@@ -23,7 +24,16 @@ function latestNonNull(snaps) {
 
 async function buildChart(spec, series, value, thresholds, band) {
   if (spec.chart === undefined) return null
-  const points = series.map((p) => ({ label: p.day, value: p.value }))
+  // '%' metrics store a ratio in [0,1]; scale the value, series and threshold
+  // markers together so the chart axis and its band lines stay in one space
+  // (matching the percent the cell text shows). See render/units.js.
+  const scale = isPercentUnit(spec.unit) ? 100 : 1
+  const chartValue = value === null || !Number.isFinite(value) ? value : value * scale
+  const chartThresholds = (thresholds ?? []).map((t) => ({ ...t, at: t.at * scale }))
+  const points = series.map((p) => ({
+    label: p.day,
+    value: p.value === null || !Number.isFinite(p.value) ? p.value : p.value * scale,
+  }))
   switch (spec.chart) {
     case 'trend':
       return trendLineChart({ title: spec.label, points, yTitle: spec.unit })
@@ -32,7 +42,13 @@ async function buildChart(spec, series, value, thresholds, band) {
     case 'distribution_bar':
       return distributionBarChart({ title: spec.label, bars: points, yTitle: spec.unit })
     case 'dora_band_gauge':
-      return doraBandGaugeChart({ title: spec.label, value, unit: spec.unit, thresholds, band })
+      return doraBandGaugeChart({
+        title: spec.label,
+        value: chartValue,
+        unit: spec.unit,
+        thresholds: chartThresholds,
+        band,
+      })
     case 'cfd_area':
       // CFD needs status-bucketed data not present in scalar snapshots; degrade to alt.
       return cfdAreaChart({ title: spec.label, points: [] })
@@ -48,7 +64,7 @@ async function buildChart(spec, series, value, thresholds, band) {
         title: spec.label,
         points: series
           .filter((p) => p.value !== null)
-          .map((p) => ({ category: p.day, group: 'completed', value: p.value })),
+          .map((p) => ({ category: p.day, group: 'completed', value: p.value * scale })),
         yTitle: spec.unit,
       })
     default:

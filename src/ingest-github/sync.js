@@ -851,8 +851,12 @@ function buildReviewNodeId(rawReview) {
 }
 
 function resolveState(rawPr) {
-  const merged = rawPr.merged
-  if (merged) return 'merged'
+  // The GitHub *list* endpoint (the only one PR sync uses) does NOT return the
+  // `merged` boolean — that field only exists on the single-PR DETAIL endpoint.
+  // It DOES return `merged_at`, which is non-null iff the PR was merged. Treat
+  // either signal as authoritative so merged PRs are not misclassified as
+  // 'closed' (which would zero out every merged-PR-based metric in production).
+  if (rawPr.merged === true || rawPr.merged_at != null) return 'merged'
   const state = rawPr.state
   if (state === 'closed') return 'closed'
   return 'open'

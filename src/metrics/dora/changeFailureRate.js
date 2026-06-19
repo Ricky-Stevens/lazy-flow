@@ -1,4 +1,4 @@
-import { ENGINE_VERSION, safeRatio } from '../../core/index.js'
+import { ENGINE_VERSION, environmentMatches, safeRatio } from '../../core/index.js'
 
 const FORMULA_DOC =
   'Change Failure Rate (SPEC §8.1): deploys_with_linked_incident / total_prod_deploys. ' +
@@ -15,7 +15,7 @@ export const changeFailureRate = {
 
   compute(inputs, asOf) {
     const env = inputs.environment ?? 'production'
-    const prodDeploys = inputs.deploys.filter((d) => d.environment === env)
+    const prodDeploys = inputs.deploys.filter((d) => environmentMatches(d.environment, env))
     const total = prodDeploys.length
 
     if (total === 0) {

@@ -43,7 +43,13 @@ export async function ingestBoardConfigFromRaw(store, raw, now) {
   let columnsUpserted = 0
 
   for (const col of columns) {
-    const statusIds = col.statuses.map((s) => s.id)
+    // A board column can omit `statuses` (unmapped column), a status its `id`, or
+    // its own `name`; guard all three so one malformed column doesn't throw and
+    // drop ALL board-column boundaries for the project. A nameless column can't be
+    // keyed (column_name is part of the PK) so it is skipped, not crashed on.
+    const statusIds = (col.statuses ?? []).map((s) => s?.id).filter((id) => id != null)
+    const columnName = typeof col.name === 'string' ? col.name : null
+    if (columnName === null) continue
 
     // Use explicit flags if present; otherwise apply heuristic
     let isStartedCol
@@ -59,7 +65,7 @@ export async function ingestBoardConfigFromRaw(store, raw, now) {
       // recognise the common done-equivalent column names so a terminal column
       // isn't mis-flagged as "started" (which would count completed work as WIP
       // and corrupt cycle-time boundaries).
-      const nameLower = col.name.toLowerCase()
+      const nameLower = columnName.toLowerCase()
       const DONE_NAMES = new Set([
         'done',
         'complete',
@@ -90,7 +96,7 @@ export async function ingestBoardConfigFromRaw(store, raw, now) {
 
     const column = {
       boardId,
-      columnName: col.name,
+      columnName,
       statusIds: JSON.stringify(statusIds),
       isStartedCol,
       isDoneCol,

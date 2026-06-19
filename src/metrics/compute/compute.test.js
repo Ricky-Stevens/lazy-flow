@@ -25,7 +25,11 @@ import { backfillSnapshots, COMPUTE_METRIC_IDS, computeMetric } from './index.js
 
 const NOW = '2024-06-01T00:00:00.000Z'
 // Sprints/boards are discovered by probing the Jira project id as a board id.
-const BOARD_ID = IDS.jiraProjectId
+// Use the REAL agile-board id, which is a different namespace from the Jira
+// project id. Agile-metric sprint discovery must enumerate sprints directly
+// (listAllSprints), not probe project ids as candidate board ids — the latter
+// only ever worked because fixtures aliased board id == project id.
+const BOARD_ID = IDS.boardId
 
 /** Open an in-memory store with the schema migrated. */
 function freshStore() {
@@ -275,7 +279,7 @@ async function seed(store) {
     }
   }
 
-  // Board config + columns under BOARD_ID (= project id, so discovery finds it).
+  // Board config + columns under the real agile-board id (distinct from project id).
   await store.upsertBoardConfig({
     boardId: BOARD_ID,
     type: 'scrum',
@@ -577,6 +581,37 @@ describe('computeMetric', () => {
     expect(r.value).not.toBeNull()
   })
 
+  it('pr.stale surfaces a long-open PR created BEFORE the window (event-appropriate loading)', async () => {
+    // Regression: a PR opened well before the window and never updated is the
+    // definition of stale, yet a created_at-only window would drop it entirely.
+    // The metric loader must include still-open PRs as of the window end.
+    await store.upsertPullRequest({
+      id: 'pr-long-open',
+      repoId: IDS.repoAlpha,
+      number: 9001,
+      authorIdentityId: IDS.identityAliceGh,
+      state: 'open',
+      headRef: 'feat/ancient',
+      baseRef: 'main',
+      isDraft: false,
+      mergedViaQueue: false,
+      createdAt: '2023-11-01T00:00:00Z', // before FROM (2024-01-01)
+      readyAt: '2023-11-01T00:00:00Z',
+      firstCommitAt: null,
+      firstReviewAt: null,
+      approvedAt: null,
+      mergedAt: null,
+      mergedByIdentityId: null,
+      deletedAt: null,
+      raw: '{}',
+      updatedAt: '2023-11-01T00:00:00Z', // no activity since → stale vs NOW
+    })
+    const r = await compute('pr.stale')
+    expect(r.dataQuality).toBe('ok')
+    expect(r.openPrCount).toBeGreaterThanOrEqual(1)
+    expect(r.stalePrIds).toContain('pr-long-open')
+  })
+
   it('dora.change_failure_rate → ok with a REAL rate from proximity-linked incidents', async () => {
     // 3 prod deploys: deploy-1 (alpha, 03-02), deploy-2 (beta, 04-01),
     //   deploy-3 (alpha failure, 05-01, no following incident).
@@ -777,19 +812,42 @@ describe('computeMetric', () => {
     expect(sized.medianHaloc).toBe(8)
   })
 
-  it('person/self scope → no_data (no per-identity wiring)', async () => {
-    const person = await computeMetric(
+  it('person scope computes the per-person subset (PRs the person authored)', async () => {
+    // alice authored merged pr-1 → pr.cycle_time has a real per-person value.
+    const r = await computeMetric(store, 'person', IDS.personAlice, 'pr.cycle_time', FROM, TO, NOW)
+    expect(r.dataQuality).toBe('ok')
+    expect(r.value).not.toBeNull()
+    // 'self' is an alias for the same per-identity attribution.
+    const self = await computeMetric(store, 'self', IDS.personAlice, 'pr.size', FROM, TO, NOW)
+    expect(self.dataQuality).toBe('ok')
+  })
+
+  it('person scope returns no_data for team-only metrics (no per-head fabrication)', async () => {
+    const dora = await computeMetric(
       store,
       'person',
       IDS.personAlice,
-      'flow.cycle_time',
+      'dora.deployment_frequency',
       FROM,
       TO,
       NOW,
     )
-    expect(person.dataQuality).toBe('no_data')
-    const self = await computeMetric(store, 'self', IDS.personAlice, 'pr.size', FROM, TO, NOW)
-    expect(self.dataQuality).toBe('no_data')
+    expect(dora.dataQuality).toBe('no_data')
+    const dist = await computeMetric(
+      store,
+      'person',
+      IDS.personAlice,
+      'flow.flow_distribution',
+      FROM,
+      TO,
+      NOW,
+    )
+    expect(dist.dataQuality).toBe('no_data')
+  })
+
+  it('person scope for an unknown person → no_data (no identities)', async () => {
+    const r = await computeMetric(store, 'person', 'person-nobody', 'pr.cycle_time', FROM, TO, NOW)
+    expect(r.dataQuality).toBe('no_data')
   })
 
   it('unknown metric id → no_data, never throws', async () => {
@@ -980,6 +1038,37 @@ describe('backfillSnapshots', () => {
       expect(s.isStale).toBe(false)
       expect(s.computedAt).toBe(NOW)
     }
+  })
+
+  it('clocks each day to that day, not opts.now (point-in-time metrics vary over the backfill)', async () => {
+    // Regression: aging_wip is computed as-of `now`. If backfill reused a single
+    // opts.now for every day, every historical snapshot would be identical to
+    // today's. Clocking each day to its own end makes a persistently-open WIP
+    // item age across the series — so the snapshots must NOT all be equal, and
+    // an earlier day must read younger than a later one.
+    await backfillSnapshots(store, {
+      scopeType: 'team',
+      scopeId: IDS.org,
+      metricIds: ['flow.aging_wip'],
+      fromDay: '2024-03-01',
+      toDay: '2024-05-01',
+      windowDays: 90,
+      now: NOW,
+      ingestWatermarkVersion: 'wm-1',
+      coverageFingerprint: 'fp-test',
+    })
+    const snaps = (
+      await store.getSnapshots('team', IDS.org, 'flow.aging_wip', '2024-03-01', '2024-05-01')
+    ).filter((s) => s.value !== null)
+    expect(snaps.length).toBeGreaterThan(1)
+    const values = snaps.map((s) => s.value)
+    const allEqual = values.every((v) => v === values[0])
+    expect(allEqual).toBe(false)
+    // computedAt is still the real compute time, not the per-day clock.
+    for (const s of snaps) expect(s.computedAt).toBe(NOW)
+    // Earliest day reads younger than the latest day (age grows over time).
+    const byDay = [...snaps].sort((a, b) => a.day.localeCompare(b.day))
+    expect(byDay[0].value).toBeLessThan(byDay[byDay.length - 1].value)
   })
 })
 

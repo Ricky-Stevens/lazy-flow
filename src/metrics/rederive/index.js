@@ -32,6 +32,12 @@ export async function markStaleAndRederive(opts) {
   const recomputedIds = []
 
   for (const metricId of metricIds) {
+    // Capture the existing rolling-window descriptor ('30d'/'90d'…) BEFORE marking
+    // stale so the re-derived snapshot keeps the same window. The `window` column
+    // is a window descriptor, not a timestamp — writing result.asOf here corrupted
+    // it and broke window-scoped reads.
+    const priorWindow = await readSnapshotWindow(store, scopeType, scopeId, metricId, day)
+
     // Step 1: mark stale
     await store.markSnapshotsStale(scopeType, scopeId, metricId, day)
     markedStale++
@@ -51,7 +57,7 @@ export async function markStaleAndRederive(opts) {
       metric: metricId,
       day,
       value: result.value,
-      window: result.asOf,
+      window: priorWindow,
       trustTier: result.trustTier,
       dataQuality: result.dataQuality,
       engineVersion: ENGINE_VERSION,
@@ -72,6 +78,16 @@ export async function markStaleAndRederive(opts) {
     recomputed,
     metricIds: recomputedIds,
   }
+}
+
+/**
+ * Read the rolling-window descriptor ('30d', '90d', …) of the existing snapshot
+ * for a (scope, metric, day), defaulting to '1d' when none is found. Used so
+ * re-derivation preserves the original window rather than overwriting it.
+ */
+async function readSnapshotWindow(store, scopeType, scopeId, metricId, day) {
+  const existing = await store.getSnapshots(scopeType, scopeId, metricId, day, day)
+  return existing[0]?.window ?? '1d'
 }
 
 // ---------------------------------------------------------------------------
@@ -144,6 +160,9 @@ export async function rederiveStaleSnapshots(
   const stale = all.filter((s) => s.isStale)
 
   const days = [...new Set(stale.map((s) => s.day))]
+  // Preserve each day's original rolling-window descriptor (the `window` column
+  // is '30d'/'90d', NOT a timestamp); writing result.asOf corrupted it.
+  const windowByDay = new Map(stale.map((s) => [s.day, s.window]))
 
   let recomputed = 0
   const recomputedIds = []
@@ -161,7 +180,7 @@ export async function rederiveStaleSnapshots(
       metric: metricId,
       day,
       value: result.value,
-      window: result.asOf,
+      window: windowByDay.get(day) ?? '1d',
       trustTier: result.trustTier,
       dataQuality: result.dataQuality,
       engineVersion: ENGINE_VERSION,

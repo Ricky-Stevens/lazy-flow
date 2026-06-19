@@ -13,6 +13,8 @@
  * repos' production deployments, matching the single-team aggregate scope model.
  */
 
+import { isProductionEnv } from '../domain/environment.js'
+
 /** Default proximity window: 7 days (DORA "failed deployment recovery" guidance). */
 export const INCIDENT_DEPLOY_PROXIMITY_MS = 7 * 24 * 60 * 60 * 1000
 
@@ -62,8 +64,8 @@ export async function linkDeployIncidents(store, options = {}) {
   const now = options.now ?? new Date().toISOString()
   const proximityMs = options.proximityMs ?? INCIDENT_DEPLOY_PROXIMITY_MS
 
-  const prodDeploys = (await store.listAllDeployments()).filter(
-    (d) => d.environment === 'production',
+  const prodDeploys = (await store.listAllDeployments()).filter((d) =>
+    isProductionEnv(d.environment),
   )
   const incidents = await store.listIncidentIssues()
   const links = linkDeploysToIncidents(prodDeploys, incidents, proximityMs)

@@ -1,4 +1,4 @@
-import { ENGINE_VERSION, percentile, safeRatio } from '../../core/index.js'
+import { ENGINE_VERSION, environmentMatches, percentile, safeRatio } from '../../core/index.js'
 
 // ---------------------------------------------------------------------------
 // Recovery Time
@@ -23,7 +23,7 @@ const RECOVERY_DOC =
 function deploymentRecoveryDurations(deploys, env) {
   const FAILED = new Set(['failure', 'error'])
   const inEnv = deploys
-    .filter((d) => d.environment === env)
+    .filter((d) => environmentMatches(d.environment, env))
     .map((d) => ({ status: d.status, ms: new Date(d.createdAt).getTime() }))
     .filter((d) => Number.isFinite(d.ms))
     .sort((a, b) => a.ms - b.ms)

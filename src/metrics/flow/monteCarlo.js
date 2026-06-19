@@ -1,4 +1,4 @@
-import { createPrng, ENGINE_VERSION, meetsSampleFloor, quantiles } from '../../core/index.js'
+import { createPrng, ENGINE_VERSION, quantiles } from '../../core/index.js'
 
 const FORMULA_DOC =
   'Monte Carlo Forecast (SPEC §8.2, §8.6): ' +
@@ -77,13 +77,17 @@ export const monteCarlo = {
 
     const qs = quantiles(weeksToComplete)
 
-    // Sample floor gates on the HISTORICAL weekly-sample count (sampleSize), not
-    // the simulation count (simCount, ~10000) — the floor exists to suppress
-    // high percentiles when the throughput history is too thin. Gating on
-    // simCount made it a no-op (a 1-week history still reported p90/p95).
-    const meetsP90Floor = meetsSampleFloor(sampleSize, 0.9)
-    const p90 = meetsP90Floor ? (qs?.p90 ?? null) : null
-    const p95 = meetsSampleFloor(sampleSize, 0.95) ? (qs?.p95 ?? null) : null
+    // The sample here is the number of WEEKS of throughput history (sampleSize =
+    // weeklySamples.length), NOT a count of items. The generic item-level floors
+    // (n≥20 / n≥30) demand ~5 months of history, so a monthly/quarterly report
+    // window (≈4–13 weeks) would ALWAYS read insufficient_sample and never emit
+    // p90/p95. Monte-Carlo forecasting is conventionally usable from a handful of
+    // weekly data points, so we gate on week-appropriate floors: p50 needs ≥4
+    // weeks, p90 ≥8, p95 ≥12. Below the p50 floor the history is too thin to
+    // trust at all → insufficient_sample.
+    const WEEK_FLOORS = { p50: 4, p90: 8, p95: 12 }
+    const p90 = sampleSize >= WEEK_FLOORS.p90 ? (qs?.p90 ?? null) : null
+    const p95 = sampleSize >= WEEK_FLOORS.p95 ? (qs?.p95 ?? null) : null
 
     return {
       id: 'flow.monte_carlo_forecast',
@@ -91,7 +95,7 @@ export const monteCarlo = {
       scope: 'team',
       value: qs?.p50 ?? null,
       unit: 'weeks',
-      dataQuality: meetsP90Floor ? 'ok' : 'insufficient_sample',
+      dataQuality: sampleSize >= WEEK_FLOORS.p50 ? 'ok' : 'insufficient_sample',
       engineVersion: ENGINE_VERSION,
       asOf,
       formulaDoc: FORMULA_DOC,

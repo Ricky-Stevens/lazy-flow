@@ -110,13 +110,23 @@ export const cycleTime = {
     const startedIds = startedStatusIds(inputs.boardColumns)
     const doneIds = doneStatusIds(inputs.boardColumns)
 
+    // Optional completion window: only issues whose FIRST Done falls in
+    // [windowStart, windowEnd] count toward this period's cycle time. Without it
+    // every issue ever completed would contribute, so each daily backfill
+    // snapshot would carry the all-time p50 instead of the window's (SPEC §8.2 —
+    // cycle time is reported per delivery period).
+    const fromMs = inputs.windowStart != null ? new Date(inputs.windowStart).getTime() : -Infinity
+    const toMs =
+      inputs.windowEnd != null ? new Date(inputs.windowEnd).getTime() : Number.POSITIVE_INFINITY
+
     const perIssue = []
 
     for (const issue of inputs.issues) {
       const result = computePerIssueCycleTime(issue, startedIds, doneIds)
-      if (result !== null) {
-        perIssue.push(result)
-      }
+      if (result === null) continue
+      const doneMs = new Date(result.firstDoneAt).getTime()
+      if (doneMs < fromMs || doneMs > toMs) continue
+      perIssue.push(result)
     }
 
     const sampleSize = perIssue.length

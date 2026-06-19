@@ -64,6 +64,12 @@ export const PRESETS = [
         purpose: 'Predictability of the sprint commitment.',
         metrics: [
           { metricId: 'agile.say_do', label: 'Say/do ratio', unit: '%', chart: 'trend' },
+          {
+            metricId: 'agile.sprint_velocity',
+            label: 'Sprint velocity',
+            unit: 'points',
+            chart: 'trend',
+          },
           { metricId: 'flow.throughput', label: 'Throughput', unit: 'count', chart: 'trend' },
         ],
       },
@@ -140,6 +146,17 @@ export const PRESETS = [
         metrics: [
           { metricId: 'agile.say_do', label: 'Say/do ratio', unit: '%', chart: 'trend' },
           { metricId: 'agile.sprint_predictability', label: 'Sprint predictability', unit: '%' },
+          {
+            metricId: 'agile.sprint_velocity',
+            label: 'Sprint velocity',
+            unit: 'points',
+            chart: 'trend',
+          },
+          {
+            metricId: 'agile.estimation_accuracy',
+            label: 'Estimation accuracy',
+            unit: 'ratio',
+          },
           {
             metricId: 'flow.monte_carlo_forecast',
             label: 'Forecast to clear WIP (p50)',
@@ -301,6 +318,12 @@ export const PRESETS = [
             unit: 'index',
             chart: 'trend',
           },
+          {
+            metricId: 'code.change_impact',
+            label: 'Code change impact',
+            unit: 'ratio',
+            chart: 'trend',
+          },
           { metricId: 'code.rework_churn', label: 'Rework churn', unit: '%' },
         ],
       },
@@ -335,6 +358,18 @@ export const PRESETS = [
         purpose: 'Where the code is rotting (repo-scoped, never per-person).',
         metrics: [
           { metricId: 'code.complexity_delta', label: 'Complexity delta', unit: 'index' },
+          {
+            metricId: 'code.haloc_aggregate',
+            label: 'Churn (HALOC)',
+            unit: 'count',
+            chart: 'trend',
+          },
+          {
+            metricId: 'code.nagappan_ball',
+            label: 'Relative churn (Nagappan-Ball)',
+            unit: 'ratio',
+          },
+          { metricId: 'code.change_impact', label: 'Code change impact', unit: 'ratio' },
           { metricId: 'code.rework_churn', label: 'Rework churn', unit: '%' },
         ],
       },

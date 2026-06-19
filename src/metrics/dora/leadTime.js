@@ -1,4 +1,10 @@
-import { ENGINE_VERSION, meetsSampleFloor, percentile, quantiles } from '../../core/index.js'
+import {
+  ENGINE_VERSION,
+  environmentMatches,
+  meetsSampleFloor,
+  percentile,
+  quantiles,
+} from '../../core/index.js'
 
 const FORMULA_DOC =
   'Lead Time for Changes (SPEC §8.1, §8.6): each merged PR is attributed ONCE to the first ' +
@@ -21,7 +27,10 @@ export const leadTime = {
   compute(inputs, asOf) {
     const env = inputs.environment ?? 'production'
     const successDeploys = inputs.deploys
-      .filter((d) => d.status === 'success' && d.environment === env && d.finishedAt !== null)
+      .filter(
+        (d) =>
+          d.status === 'success' && environmentMatches(d.environment, env) && d.finishedAt !== null,
+      )
       // Earliest-first so we can attribute each PR to the first deploy after merge.
       .sort((a, b) => isoToMs(a.finishedAt) - isoToMs(b.finishedAt))
 

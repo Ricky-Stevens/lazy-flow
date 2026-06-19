@@ -477,6 +477,31 @@ export class BunSqliteStore {
     return rows.map((r) => this._rowToPullRequest(r))
   }
 
+  /**
+   * Load the PRs a metric run needs for a window, keyed by the RELEVANT event
+   * rather than by creation alone. A single created_at window wrongly drops
+   * (a) PRs merged inside the window but opened before it, and (b) long-open
+   * PRs (the very ones pr.stale exists to surface). The union covers:
+   *   - created inside the window  (back-compat),
+   *   - merged inside the window   (merged-PR metrics: cycle time, coverage…),
+   *   - still open as of window end (open/stale metrics).
+   * Soft-deleted PRs are excluded; rows are returned once (SQL OR dedupes).
+   */
+  async getPullRequestsForMetrics(repoId, fromIso, toIso) {
+    const sql =
+      `SELECT id, repo_id, number, author_identity_id, state, head_ref, base_ref,` +
+      ` is_draft, merged_via_queue, created_at, ready_at, first_commit_at,` +
+      ` first_review_at, approved_at, merged_at, merged_by_identity_id,` +
+      ` deleted_at, raw, updated_at` +
+      ` FROM pull_requests WHERE repo_id = ? AND deleted_at IS NULL AND (` +
+      `   (created_at >= ? AND created_at <= ?)` +
+      `   OR (merged_at IS NOT NULL AND merged_at >= ? AND merged_at <= ?)` +
+      `   OR (state = 'open' AND created_at <= ?)` +
+      ` ) ORDER BY created_at ASC`
+    const rows = this.stmt(sql).all(repoId, fromIso, toIso, fromIso, toIso, toIso)
+    return rows.map((r) => this._rowToPullRequest(r))
+  }
+
   _rowToPullRequest(r) {
     return {
       id: String(r.id),
@@ -1177,6 +1202,30 @@ export class BunSqliteStore {
       `SELECT id, board_id, state, start_at, end_at, complete_at, updated_at
        FROM sprints WHERE board_id = ? ORDER BY start_at ASC`,
     ).all(boardId)
+    return rows.map((r) => ({
+      id: String(r.id),
+      boardId: String(r.board_id),
+      state: r.state,
+      startAt: rstr(r.start_at),
+      endAt: rstr(r.end_at),
+      completeAt: rstr(r.complete_at),
+      updatedAt: String(r.updated_at),
+    }))
+  }
+
+  /**
+   * Enumerate every sprint in the install, regardless of board.
+   *
+   * The Store has no board registry, and a sprint's board_id is an agile-board
+   * id that does NOT share a namespace with Jira project ids — so probing
+   * project ids as candidate board ids never discovers sprints on a real
+   * install. Agile metrics enumerate sprints directly through this method.
+   */
+  async listAllSprints() {
+    const rows = this.stmt(
+      `SELECT id, board_id, state, start_at, end_at, complete_at, updated_at
+       FROM sprints ORDER BY start_at ASC`,
+    ).all()
     return rows.map((r) => ({
       id: String(r.id),
       boardId: String(r.board_id),

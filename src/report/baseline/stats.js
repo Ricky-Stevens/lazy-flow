@@ -15,7 +15,17 @@ export const MIN_BASELINE_SPRINTS = 3
 /** Bumps when this aggregation algorithm changes (distinct from ENGINE_VERSION). */
 export const BASELINE_VERSION = '1'
 
-const EPS = 1e-9
+export const EPS = 1e-9
+
+/**
+ * True when a baseline has effectively zero dispersion (a perfectly flat series
+ * like [5,5,5,5,5]). robustSd floors such a baseline to EPS, which would turn
+ * any non-zero delta into an astronomical z-score — so callers must judge
+ * significance by RELATIVE change instead of the EPS-floored ratio.
+ */
+export function isDegenerateDispersion(stats) {
+  return (stats.sd === null || stats.sd <= EPS) && (stats.mad ?? 0) <= EPS
+}
 
 function clean(values) {
   return values.filter((v) => v !== null && Number.isFinite(v))
@@ -45,12 +55,28 @@ export function robustSd(stats) {
   return Math.max(stats.sd ?? 0, 1.4826 * (stats.mad ?? 0), EPS)
 }
 
+/** Relative-change bands used when the prior baseline has zero dispersion. */
+const FLAT_REL_SHIFT = 0.1 // >10% move from a flat baseline = shifting
+const FLAT_REL_REGIME = 0.25 // >25% = regime change
+
 /** Classify drift of a new p50 against the prior baseline (deterministic, no AI). */
 export function classifyDrift(newP50, prev) {
   if (prev === null || prev.p50 === null || newP50 === null) {
     return { driftZ: null, driftStatus: 'cold_start' }
   }
-  const z = (newP50 - prev.p50) / robustSd(prev)
+  const delta = newP50 - prev.p50
+  // A flat prior (sd≈mad≈0) has undefined dispersion; the EPS-floored z-score
+  // would explode on any change. Classify by relative move instead so a stable
+  // metric reads 'stable', not 'regime_change', for negligible drift.
+  if (isDegenerateDispersion(prev)) {
+    if (delta === 0) return { driftZ: 0, driftStatus: 'stable' }
+    if (prev.p50 === 0) return { driftZ: null, driftStatus: 'regime_change' }
+    const rel = Math.abs(delta / prev.p50)
+    const driftStatus =
+      rel < FLAT_REL_SHIFT ? 'stable' : rel < FLAT_REL_REGIME ? 'shifting' : 'regime_change'
+    return { driftZ: null, driftStatus }
+  }
+  const z = delta / robustSd(prev)
   const a = Math.abs(z)
   const driftStatus = a < 1 ? 'stable' : a < 2 ? 'shifting' : 'regime_change'
   return { driftZ: z, driftStatus }

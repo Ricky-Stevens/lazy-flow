@@ -1,4 +1,5 @@
 import { stringify } from 'csv-stringify/sync'
+import { toDisplayValue } from './units.js'
 
 /** RFC-4180 CSV from a list of flat records (escaping handled by csv-stringify). */
 export function toCsv(rows) {
@@ -21,14 +22,16 @@ export function renderCsv(model) {
         section: section.title,
         metric_id: cell.metricId,
         label: cell.label,
-        value: cell.value,
+        // Present the value in its declared unit: '%' metrics carry a ratio in
+        // the model but must export as percent so the column matches `unit`.
+        value: toDisplayValue(cell.value, cell.unit),
         unit: cell.unit,
         trust_tier: cell.trustTier,
         data_quality: cell.dataQuality,
         polarity: cell.polarity,
         proxy: cell.proxy ?? false,
-        baseline_p50: cell.comparison?.baselineP50 ?? null,
-        delta: cell.comparison?.delta ?? null,
+        baseline_p50: toDisplayValue(cell.comparison?.baselineP50 ?? null, cell.unit),
+        delta: toDisplayValue(cell.comparison?.delta ?? null, cell.unit),
         band: cell.comparison?.band ?? null,
         baseline_n: cell.comparison?.n ?? null,
         significant: cell.comparison?.significant ?? null,
