@@ -1,9 +1,12 @@
-import { ENGINE_VERSION, safeRatio } from '../../core/index.js'
+import { ENGINE_VERSION, environmentMatches, safeRatio } from '../../core/index.js'
 
 const FORMULA_DOC =
   'Deployment Rework Rate (SPEC §8.1): unplanned_hotfix_deploys / total_prod_deploys. ' +
-  'A hotfix deploy is identified by branch prefix (hotfix/, fix/), revert keyword, or ' +
-  'incident linkage. Returns null on 0 deploys.'
+  'A hotfix deploy is identified by the hotfixDeployIds set supplied by the caller. ' +
+  'NOTE: branch-prefix (hotfix/, fix/) and revert-keyword detection are NOT yet wired ' +
+  '— the deploy feed carries no branch/ref marker — so with the current incident-only ' +
+  'linkage this rate equals change_failure_rate. Treat the two as the same signal until ' +
+  'a distinct hotfix marker is ingested. Returns null on 0 deploys.'
 
 export const deploymentReworkRate = {
   id: 'dora.deployment_rework_rate',
@@ -14,7 +17,7 @@ export const deploymentReworkRate = {
 
   compute(inputs, asOf) {
     const env = inputs.environment ?? 'production'
-    const prodDeploys = inputs.deploys.filter((d) => d.environment === env)
+    const prodDeploys = inputs.deploys.filter((d) => environmentMatches(d.environment, env))
     const total = prodDeploys.length
 
     if (total === 0) {

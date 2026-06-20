@@ -4,7 +4,7 @@ const FORMULA_DOC =
   'Nagappan-Ball M1/M2/M3 (SPEC §8.4): ' +
   'M1 = haloc / (priorHaloc + haloc) — relative churn [0,1]. ' +
   'M2 = haloc / windowDays — churn rate (haloc/day). ' +
-  'M3 = reworkLines / (totalLines + 1) — rework density. ' +
+  'M3 = reworkLines / (totalLines + 1) — rework density (null when blame unavailable). ' +
   'Descriptive-only; do not rank individuals. ' +
   'Zero-denominator → null (SPEC §8.6).'
 
@@ -18,8 +18,15 @@ export const nagappanBall = {
   compute(inputs, asOf) {
     const m1 = safeRatio(inputs.haloc, inputs.priorHaloc + inputs.haloc)
     const m2 = safeRatio(inputs.haloc, inputs.windowDays)
-    // M3 denominator = totalLines + 1 (never zero)
-    const m3 = inputs.reworkLines / (inputs.totalLines + 1)
+    // M3 (rework density) needs git blame to classify rework lines. When blame
+    // is unavailable the caller passes reworkLines: null → M3 is `null` ("not
+    // measured"), NOT 0, so a consumer cannot mistake "not measured" for "no
+    // rework". safeRatio also guards NaN/undefined inputs so M3 is never NaN
+    // (SPEC §8.6: zero-denominator/non-finite → null).
+    const m3 =
+      inputs.reworkLines === null || inputs.reworkLines === undefined
+        ? null
+        : safeRatio(inputs.reworkLines, inputs.totalLines + 1)
 
     return {
       id: 'code.nagappan_ball',

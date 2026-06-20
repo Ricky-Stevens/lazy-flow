@@ -12,7 +12,7 @@ import {
 import { resolvePeriod, shiftDay } from '../model/period.js'
 
 import { getPreset } from '../registry/index.js'
-import { isPercentUnit } from '../render/units.js'
+import { toDisplayValue } from '../render/units.js'
 
 function latestNonNull(snaps) {
   for (let i = snaps.length - 1; i >= 0; i--) {
@@ -24,15 +24,21 @@ function latestNonNull(snaps) {
 
 async function buildChart(spec, series, value, thresholds, band) {
   if (spec.chart === undefined) return null
-  // '%' metrics store a ratio in [0,1]; scale the value, series and threshold
-  // markers together so the chart axis and its band lines stay in one space
-  // (matching the percent the cell text shows). See render/units.js.
-  const scale = isPercentUnit(spec.unit) ? 100 : 1
-  const chartValue = value === null || !Number.isFinite(value) ? value : value * scale
-  const chartThresholds = (thresholds ?? []).map((t) => ({ ...t, at: t.at * scale }))
+  // The model stores values in their canonical unit ('%' as a [0,1] ratio,
+  // durations in seconds). Scale the value, series and threshold markers
+  // together through the SAME presentation transform the cell text uses, so the
+  // chart axis (labelled spec.unit) and its band lines sit in the displayed
+  // space rather than plotting raw seconds under an "hours" axis. See
+  // render/units.js.
+  const toDisplay = (v) => (v === null || !Number.isFinite(v) ? v : toDisplayValue(v, spec.unit))
+  const chartValue = toDisplay(value)
+  const chartThresholds = (thresholds ?? []).map((t) => ({
+    ...t,
+    at: toDisplayValue(t.at, spec.unit),
+  }))
   const points = series.map((p) => ({
     label: p.day,
-    value: p.value === null || !Number.isFinite(p.value) ? p.value : p.value * scale,
+    value: toDisplay(p.value),
   }))
   switch (spec.chart) {
     case 'trend':
@@ -64,7 +70,7 @@ async function buildChart(spec, series, value, thresholds, band) {
         title: spec.label,
         points: series
           .filter((p) => p.value !== null)
-          .map((p) => ({ category: p.day, group: 'completed', value: p.value * scale })),
+          .map((p) => ({ category: p.day, group: 'completed', value: toDisplay(p.value) })),
         yTitle: spec.unit,
       })
     default:
@@ -81,10 +87,33 @@ async function assembleCell(opts, preset, spec, from, to, baselineFrom, baseline
     await store.getSnapshots(scope.type, scope.id, spec.metricId, baselineFrom, baselineTo)
   ).filter((s) => !s.isStale)
 
-  const series = currentSnaps.map((s) => ({ day: s.day, value: s.value }))
-  const latest = latestNonNull(currentSnaps)
-  const value = latest?.value ?? null
+  let series = currentSnaps.map((s) => ({ day: s.day, value: s.value }))
+  let latest = latestNonNull(currentSnaps)
   const baselineValues = baselineSnaps.map((s) => s.value)
+
+  // Person-scope live fallback. The sync pipeline only persists team/org
+  // snapshots — person-scope snapshots are never written — so a person preset
+  // (e.g. annual:person) would otherwise render an all-no_data report despite
+  // get_person_report being able to compute these metrics live. When the scope
+  // is person/self and there are no stored snapshots, compute the metric live
+  // for the period (a single point series) so the report is not an empty facade.
+  if (
+    currentSnaps.length === 0 &&
+    (scope.type === 'person' || scope.type === 'self') &&
+    typeof opts.liveCompute === 'function'
+  ) {
+    const live = await opts.liveCompute(spec.metricId, scope, from, to)
+    if (live && live.value !== null && live.value !== undefined) {
+      series = [{ day: to, value: live.value }]
+      latest = {
+        value: live.value,
+        trustTier: live.trustTier ?? 'deterministic',
+        dataQuality: live.dataQuality ?? 'ok',
+        dataSource: live.dataSource ?? null,
+      }
+    }
+  }
+  const value = latest?.value ?? null
 
   const comparison = compareToBaseline({ value, baselineValues })
   const trustTier = latest?.trustTier ?? 'deterministic'
@@ -99,12 +128,21 @@ async function assembleCell(opts, preset, spec, from, to, baselineFrom, baseline
   // dataSource (NULL / non-DORA) is treated as proxy (conservative). Suppression
   // logic itself stays entirely in benchmark/dora.ts.
   const isProxy = spec.proxy === true && (latest?.dataSource ?? 'proxy') !== 'real'
+  // The benchmark provider's contract (see benchmark/dora.js) is that `value`
+  // arrives already normalised to the metric's DISPLAY unit — lead_time and
+  // recovery_time are stored in SECONDS but their preset unit is 'hours', and
+  // change_failure_rate is stored as a [0,1] ratio but presented as '%'. Pass
+  // the raw seconds and an elite 6h lead time (21600 s) is compared against the
+  // <24h threshold as `21600 < 24` → always banded 'low'. Convert through the
+  // SAME presentation transform the chart and cell text use so the band, the
+  // gauge and the displayed number all agree.
+  const benchValue = value === null ? null : toDisplayValue(value, spec.unit)
   const benchmark =
     preset.personScope === true || spec.benchmark !== true || opts.benchmark === undefined
       ? undefined
       : (opts.benchmark.lookup({
           metricId: spec.metricId,
-          value,
+          value: benchValue,
           scopeType: scope.type,
           proxy: isProxy,
         }) ?? undefined)

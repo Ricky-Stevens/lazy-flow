@@ -57,8 +57,10 @@ export const recoveryTime = {
     // Signal 1 (preferred): real deployment-to-recovery time.
     const deployDurations = inputs.deploys ? deploymentRecoveryDurations(inputs.deploys, env) : []
 
-    // Signal 2 (fallback): incident resolution time.
-    const resolved = inputs.incidents.filter((i) => i.firstResolvedAt !== null)
+    // Signal 2 (fallback): incident resolution time. `incidents` is optional —
+    // a deploy-only caller (or the deployment-recovery unit path) must not crash.
+    const incidents = inputs.incidents ?? []
+    const resolved = incidents.filter((i) => i.firstResolvedAt !== null)
     const incidentDurations = resolved.map((i) => {
       const created = new Date(i.createdAt).getTime()
       const firstResolved = new Date(i.firstResolvedAt).getTime()
@@ -81,7 +83,7 @@ export const recoveryTime = {
         scope: 'team',
         value: null,
         unit: 'seconds',
-        dataQuality: inputs.incidents.length === 0 ? 'no_data' : 'insufficient_sample',
+        dataQuality: incidents.length === 0 ? 'no_data' : 'insufficient_sample',
         engineVersion: ENGINE_VERSION,
         asOf,
         formulaDoc: RECOVERY_DOC,

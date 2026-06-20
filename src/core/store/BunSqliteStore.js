@@ -74,6 +74,12 @@ export class BunSqliteStore {
   constructor(path) {
     this.db = new Database(path)
     this.db.exec(`PRAGMA journal_mode = WAL`)
+    // Under WAL, synchronous=NORMAL is durable across application crashes (only
+    // an OS or power crash can lose the last few committed transactions, with
+    // no DB corruption). This is the standard SQLite-perf setting under WAL and
+    // is critical at ingest scale: synchronous=FULL fsyncs on every commit,
+    // which dominates wall-clock when many small transactions land in a row.
+    this.db.exec(`PRAGMA synchronous = NORMAL`)
     this.db.exec(`PRAGMA busy_timeout = 5000`)
     this.db.exec(`PRAGMA foreign_keys = ON`)
   }
@@ -568,17 +574,23 @@ export class BunSqliteStore {
   // ---------------------------------------------------------------------------
 
   async upsertPrFile(file) {
+    // is_generated is REQUIRED on the writer; the mapper computes it from the
+    // path. Coerce booleans (true/false) and 0/1 numbers; an undefined here
+    // means a CALLER bug, but we keep the storage strict-typed by defaulting
+    // to 0 so a single rogue row cannot wedge the whole sync.
+    const isGenerated = file.isGenerated === true || file.isGenerated === 1 ? 1 : 0
     this.stmt(`
-      INSERT INTO pr_files (pr_id, repo_id, path, additions, deletions, haloc, status, patch, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO pr_files (pr_id, repo_id, path, additions, deletions, haloc, status, patch, is_generated, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(pr_id, path) DO UPDATE SET
-        repo_id    = CASE WHEN excluded.updated_at >= pr_files.updated_at THEN excluded.repo_id    ELSE pr_files.repo_id    END,
-        additions  = CASE WHEN excluded.updated_at >= pr_files.updated_at THEN excluded.additions  ELSE pr_files.additions  END,
-        deletions  = CASE WHEN excluded.updated_at >= pr_files.updated_at THEN excluded.deletions  ELSE pr_files.deletions  END,
-        haloc      = CASE WHEN excluded.updated_at >= pr_files.updated_at THEN excluded.haloc      ELSE pr_files.haloc      END,
-        status     = CASE WHEN excluded.updated_at >= pr_files.updated_at THEN excluded.status     ELSE pr_files.status     END,
-        patch      = CASE WHEN excluded.updated_at >= pr_files.updated_at THEN excluded.patch      ELSE pr_files.patch      END,
-        updated_at = CASE WHEN excluded.updated_at >= pr_files.updated_at THEN excluded.updated_at ELSE pr_files.updated_at END
+        repo_id      = CASE WHEN excluded.updated_at >= pr_files.updated_at THEN excluded.repo_id      ELSE pr_files.repo_id      END,
+        additions    = CASE WHEN excluded.updated_at >= pr_files.updated_at THEN excluded.additions    ELSE pr_files.additions    END,
+        deletions    = CASE WHEN excluded.updated_at >= pr_files.updated_at THEN excluded.deletions    ELSE pr_files.deletions    END,
+        haloc        = CASE WHEN excluded.updated_at >= pr_files.updated_at THEN excluded.haloc        ELSE pr_files.haloc        END,
+        status       = CASE WHEN excluded.updated_at >= pr_files.updated_at THEN excluded.status       ELSE pr_files.status       END,
+        patch        = CASE WHEN excluded.updated_at >= pr_files.updated_at THEN excluded.patch        ELSE pr_files.patch        END,
+        is_generated = CASE WHEN excluded.updated_at >= pr_files.updated_at THEN excluded.is_generated ELSE pr_files.is_generated END,
+        updated_at   = CASE WHEN excluded.updated_at >= pr_files.updated_at THEN excluded.updated_at   ELSE pr_files.updated_at   END
     `).run(
       file.prId,
       file.repoId,
@@ -588,6 +600,7 @@ export class BunSqliteStore {
       file.haloc,
       file.status,
       file.patch,
+      isGenerated,
       file.createdAt,
       file.updatedAt,
     )
@@ -595,7 +608,7 @@ export class BunSqliteStore {
 
   async getPrFilesByPullRequest(prId) {
     const rows = this.stmt(
-      `SELECT pr_id, repo_id, path, additions, deletions, haloc, status, patch, created_at, updated_at
+      `SELECT pr_id, repo_id, path, additions, deletions, haloc, status, patch, is_generated, created_at, updated_at
        FROM pr_files WHERE pr_id = ? ORDER BY path ASC`,
     ).all(prId)
     return rows.map((r) => this._rowToPrFile(r))
@@ -606,7 +619,7 @@ export class BunSqliteStore {
     // exclude soft-deleted PRs (a tombstoned PR's files must not feed metrics).
     let sql =
       `SELECT f.pr_id, f.repo_id, f.path, f.additions, f.deletions, f.haloc,` +
-      ` f.status, f.patch, f.created_at, f.updated_at` +
+      ` f.status, f.patch, f.is_generated, f.created_at, f.updated_at` +
       ` FROM pr_files f` +
       ` JOIN pull_requests p ON p.id = f.pr_id` +
       ` WHERE f.repo_id = ? AND p.deleted_at IS NULL`
@@ -634,6 +647,11 @@ export class BunSqliteStore {
       haloc: Number(r.haloc),
       status: String(r.status),
       patch: rstr(r.patch),
+      // Round-trip the persisted classification as a real boolean so call-site
+      // filters (`!f.isGenerated`) work regardless of whether the column came
+      // back as 0/1 from SQLite, false/true from a fixture, or undefined from
+      // a pre-migration row (older callers default to false → "authored").
+      isGenerated: r.is_generated === 1 || r.is_generated === true,
       createdAt: String(r.created_at),
       updatedAt: String(r.updated_at),
     }
@@ -834,7 +852,7 @@ export class BunSqliteStore {
     // JOIN pull_requests to exclude soft-deleted PRs' files (matches getPrFilesByRepo).
     const rows = this.stmt(
       `SELECT f.pr_id, f.repo_id, f.path, f.additions, f.deletions, f.haloc,
-              f.status, f.patch, f.created_at, f.updated_at
+              f.status, f.patch, f.is_generated, f.created_at, f.updated_at
        FROM pr_files f
        JOIN pull_requests p ON p.id = f.pr_id
        WHERE p.deleted_at IS NULL
@@ -857,7 +875,7 @@ export class BunSqliteStore {
       const placeholders = chunk.map(() => '?').join(', ')
       const rows = this.stmt(
         `SELECT f.pr_id, f.repo_id, f.path, f.additions, f.deletions, f.haloc,
-                f.status, f.patch, f.created_at, f.updated_at
+                f.status, f.patch, f.is_generated, f.created_at, f.updated_at
          FROM pr_files f
          JOIN pull_requests p ON p.id = f.pr_id
          WHERE p.deleted_at IS NULL AND f.pr_id IN (${placeholders})
@@ -1050,15 +1068,30 @@ export class BunSqliteStore {
       `SELECT id, subject_type, subject_id, metric, structured_verdict_json, confidence, created_at
        FROM ai_verdicts WHERE subject_type = ? AND metric = ?`,
     ).all(subjectType, metric)
-    return rows.map((r) => ({
-      id: String(r.id),
-      subjectType: String(r.subject_type),
-      subjectId: String(r.subject_id),
-      metric: String(r.metric),
-      verdict: JSON.parse(String(r.structured_verdict_json)),
-      confidence: Number(r.confidence),
-      createdAt: String(r.created_at),
-    }))
+    // Guard the per-row JSON.parse: a single malformed structured_verdict_json
+    // (possible under the full-transparency contract where the DB is directly
+    // writable) must not throw and crash the whole metric read / person report.
+    // Skip the corrupt row instead — its absence degrades the metric to a smaller
+    // sample, which the sample floors already handle honestly.
+    const out = []
+    for (const r of rows) {
+      let verdict
+      try {
+        verdict = JSON.parse(String(r.structured_verdict_json))
+      } catch {
+        continue
+      }
+      out.push({
+        id: String(r.id),
+        subjectType: String(r.subject_type),
+        subjectId: String(r.subject_id),
+        metric: String(r.metric),
+        verdict,
+        confidence: Number(r.confidence),
+        createdAt: String(r.created_at),
+      })
+    }
+    return out
   }
 
   // --- Repo AI-tooling maturity signal -------------------------------------
@@ -2269,6 +2302,34 @@ export class BunSqliteStore {
     ).get(statusId, ts, ts)
     if (!row) return null
     return row.category
+  }
+
+  /**
+   * Bulk-load every status's CURRENT category as a Map<statusId, category>.
+   * Mirrors `getStatusCategory(statusId)` (no `at` → "now") for every status
+   * id that has any history row — used by metric compute to avoid calling
+   * `getStatusCategory` per status × per metric × per day in the backfill.
+   */
+  async getCurrentStatusCategories() {
+    const ts = new Date().toISOString()
+    const rows = this.stmt(
+      `SELECT status_id, category, valid_from FROM status_category_history
+       WHERE valid_from <= ?
+         AND (valid_to IS NULL OR valid_to > ?)`,
+    ).all(ts, ts)
+    // If multiple rows overlap "now" for the same status (shouldn't, but be
+    // safe), the latest valid_from wins — matches the single-row ORDER BY DESC.
+    const latest = new Map()
+    for (const r of rows) {
+      const statusId = String(r.status_id)
+      const prev = latest.get(statusId)
+      if (!prev || String(r.valid_from) > prev.validFrom) {
+        latest.set(statusId, { category: r.category, validFrom: String(r.valid_from) })
+      }
+    }
+    const out = new Map()
+    for (const [statusId, v] of latest) out.set(statusId, v.category)
+    return out
   }
 
   // ---------------------------------------------------------------------------

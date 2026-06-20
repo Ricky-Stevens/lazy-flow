@@ -715,3 +715,83 @@ describe('writePr resilience: ghost actors + null review state', () => {
     expect(comments[0]?.authorIdentityId).toBe('identity-unknown')
   })
 })
+
+// ---------------------------------------------------------------------------
+// Repo-parallelism safety: fetching repos concurrently must produce IDENTICAL
+// store state as a strictly serial run (writes always serial — single SQLite
+// connection; fetch is the only concurrent piece). This is the proof that
+// the fetch/write split preserves correctness end to end.
+// ---------------------------------------------------------------------------
+
+describe('repo parallelism — concurrent fetch ≡ serial run (store-state equality)', () => {
+  /** Snapshot the post-sync state of one repo into a comparable object. */
+  async function snapshotRepoState(store, repoFullName) {
+    const prs = await store.getPullRequestsByRepo(repoFullName)
+    const commits = await store.getCommitsByRepo(repoFullName)
+    const deploys = await store.getDeploymentsByRepo(repoFullName)
+    const reviewsByPr = {}
+    const commentsByPr = {}
+    for (const pr of prs) {
+      reviewsByPr[pr.id] = (await store.getReviewsByPullRequest(pr.id)).length
+      commentsByPr[pr.id] = (await store.getReviewCommentsByPullRequest(pr.id)).length
+    }
+    return {
+      prCount: prs.length,
+      prIds: [...prs.map((p) => p.id)].sort(),
+      commitCount: commits.length,
+      commitShas: [...commits.map((c) => c.sha)].sort(),
+      deployCount: deploys.length,
+      deployIds: [...deploys.map((d) => d.id)].sort(),
+      reviewsByPr,
+      commentsByPr,
+    }
+  }
+
+  it('concurrent fetch (bound=2) produces the same state as serial (bound=1) for every repo', async () => {
+    // Two independent in-memory stores hit the SAME MSW handlers; the only
+    // difference is the repoFetchConcurrency option. mockGitHub() exposes 2
+    // repos (alpha + beta), so bound=2 exercises true cross-repo concurrency.
+    const storeSerial = makeStore()
+    const storeParallel = makeStore()
+    const NOW = '2024-06-01T00:00:00.000Z'
+
+    await syncGitHub(storeSerial, makeClient(), scope, 'backfill', NOW, {
+      repoFetchConcurrency: 1,
+    })
+    await syncGitHub(storeParallel, makeClient(), scope, 'backfill', NOW, {
+      repoFetchConcurrency: 2,
+    })
+
+    for (const repo of [SYNCED_REPO_ALPHA, SYNCED_REPO_BETA]) {
+      const serial = await snapshotRepoState(storeSerial, repo)
+      const parallel = await snapshotRepoState(storeParallel, repo)
+      expect(parallel).toEqual(serial)
+      // Sanity: bound>1 didn't silently drop a repo's data.
+      expect(parallel.prCount).toBeGreaterThan(0)
+    }
+  })
+
+  it('chunked PR write batching produces no duplicates across resync', async () => {
+    // Idempotency proof for the chunked PR write path (PR_WRITE_CHUNK=25): a
+    // backfill followed by an incremental must produce the SAME set of PRs +
+    // reviews + comments, with NO duplicates. The chunk boundary itself
+    // (resync overlap + last-writer-wins gating) is what could regress.
+    const store = makeStore()
+    const NOW1 = '2024-06-01T00:00:00.000Z'
+    const NOW2 = '2024-06-02T00:00:00.000Z'
+
+    await syncGitHub(store, makeClient(), scope, 'backfill', NOW1)
+    const afterBackfill = await snapshotRepoState(store, SYNCED_REPO_ALPHA)
+
+    await syncGitHub(store, makeClient(), scope, 'incremental', NOW2)
+    const afterIncremental = await snapshotRepoState(store, SYNCED_REPO_ALPHA)
+
+    expect(afterIncremental.prCount).toBe(afterBackfill.prCount)
+    expect(afterIncremental.commitCount).toBe(afterBackfill.commitCount)
+    // No duplicate review / comment rows per PR after re-sync.
+    expect(afterIncremental.reviewsByPr).toEqual(afterBackfill.reviewsByPr)
+    expect(afterIncremental.commentsByPr).toEqual(afterBackfill.commentsByPr)
+    // Sanity: there was actually data to test on (otherwise this is vacuous).
+    expect(afterBackfill.prCount).toBeGreaterThan(0)
+  })
+})

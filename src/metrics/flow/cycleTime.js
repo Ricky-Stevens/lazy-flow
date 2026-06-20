@@ -124,6 +124,12 @@ export const cycleTime = {
     for (const issue of inputs.issues) {
       const result = computePerIssueCycleTime(issue, startedIds, doneIds)
       if (result === null) continue
+      // Defensive: a non-finite cycle time (should be impossible given the
+      // start/done selection guards in computePerIssueCycleTime, but cheap to
+      // assert) must not be counted in sampleSize while quantiles() silently
+      // excludes it — that would over-count the sample and could falsely clear
+      // the p90/p95 floors.
+      if (!Number.isFinite(result.cycleTimeSeconds)) continue
       const doneMs = new Date(result.firstDoneAt).getTime()
       if (doneMs < fromMs || doneMs > toMs) continue
       perIssue.push(result)

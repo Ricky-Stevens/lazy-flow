@@ -1,5 +1,11 @@
 import { ENGINE_VERSION, safeRatio } from '../../core/index.js'
 
+// Below this many merged PRs the ratio is noise (a single self-merged PR reads
+// 100% bypass). Mirror the sibling person ratios (changes_requested_received)
+// so a thin sample is flagged 'insufficient_sample' and the report excludes it
+// from the cohort distribution instead of banding it as a confident outlier.
+const SAMPLE_FLOOR = 8
+
 const BYPASS_DOC =
   "Review-Bypass Rate (person scope): share of the person's merged PRs that " +
   'shipped WITHOUT external scrutiny. A PR counts as bypassed when it drew no ' +
@@ -46,6 +52,7 @@ export const reviewBypassReceived = {
       return { ...base, value: null, dataQuality: 'no_data' }
     }
 
-    return { ...base, value: safeRatio(bypassedPrs, totalPrs), dataQuality: 'ok' }
+    const dataQuality = totalPrs < SAMPLE_FLOOR ? 'insufficient_sample' : 'ok'
+    return { ...base, value: safeRatio(bypassedPrs, totalPrs), dataQuality }
   },
 }

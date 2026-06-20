@@ -37,15 +37,17 @@ function sampleModel(overrides = {}) {
           {
             metricId: 'flow.cycle_time',
             label: 'Cycle time',
-            value: 5.2,
+            // Canonical seconds (5.2 days). Renders as "5.2 days" after the
+            // unit-aware conversion — NOT "449280 days".
+            value: 449280,
             unit: 'days',
             trustTier: 'deterministic',
             dataQuality: 'ok',
             polarity: 'lower_better',
             formulaDoc: 'started → done',
             comparison: {
-              baselineP50: 4,
-              delta: 1.2,
+              baselineP50: 345600,
+              delta: 103680,
               deltaPct: 0.3,
               band: 'above',
               trendArrow: 'up',
@@ -89,6 +91,12 @@ describe('renderHtml', () => {
     expect(html).toContain('Monthly Delivery Report')
     expect(html).toContain('May 2026')
     expect(html).toContain('Cycle time')
+    // Duration value is converted from canonical seconds to the declared unit:
+    // 449280 s = 5.2 days, NOT a raw "449280 days". The delta (103680 s) reads
+    // "+1.2 days". The canonical seconds survive only in the embedded JSON blob.
+    expect(html).toContain('5.2 days')
+    expect(html).toContain('+1.2 days')
+    expect(html).not.toContain('449280 days')
     // trust badge + significant comparison rendered with text (not colour-only)
     expect(html).toContain('badge deterministic')
     expect(html).toContain('▲ up')
@@ -283,10 +291,27 @@ describe('percentage unit scaling', () => {
     expect(fmtValue(0.6667, '%')).toBe('66.67%')
     expect(fmtValue(1.4, '%')).toBe('140%')
     expect(toDisplayValue(0.08, '%')).toBe(8)
-    // non-percent units are untouched
-    expect(fmtValue(5.2, 'days')).toBe('5.2 days')
-    expect(toDisplayValue(5.2, 'days')).toBe(5.2)
+    // count / index / points / ratio units are untouched
+    expect(fmtValue(42, 'count')).toBe('42')
+    expect(fmtValue(5.2, 'index')).toBe('5.2 index')
+    expect(toDisplayValue(5.2, 'points')).toBe(5.2)
     expect(fmtValue(null, '%')).toBe('—')
+  })
+
+  it('fmtValue divides seconds down to the declared human duration unit', () => {
+    // The model carries durations in SECONDS; the preset declares hours/days/etc.
+    // Without this conversion a 48h cycle time (172800 s) rendered "172800 hours".
+    expect(fmtValue(172800, 'hours')).toBe('48 hours')
+    expect(fmtValue(86400, 'days')).toBe('1 days')
+    expect(fmtValue(3600, 'hours')).toBe('1 hours')
+    expect(fmtValue(90, 'minutes')).toBe('1.5 minutes')
+    expect(fmtValue(604800, 'weeks')).toBe('1 weeks')
+    expect(fmtValue(55800, 's')).toBe('55800 s') // 's'/'seconds' are identity
+    expect(toDisplayValue(172800, 'hours')).toBe(48)
+    expect(toDisplayValue(864000, 'days')).toBe(10)
+    // null / non-finite pass through untouched for both transforms
+    expect(toDisplayValue(null, 'hours')).toBe(null)
+    expect(fmtValue(null, 'hours')).toBe('—')
   })
 
   it('markdown renders 8% not 0.08 %', () => {

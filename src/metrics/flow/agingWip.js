@@ -2,7 +2,8 @@ import { ENGINE_VERSION, meetsSampleFloor, quantiles, safeRatio } from '../../co
 
 const FORMULA_DOC =
   'Aging WIP (SPEC §8.2): For each issue currently in WIP (isStartedCol=true column), ' +
-  'ageSeconds = now − createdAt. ' +
+  'ageSeconds = now − firstStartedAt (first entry into a started column), ' +
+  'falling back to now − createdAt only when the item was created directly into WIP. ' +
   'Distribution: p50/p75/p85/p90/p95 via R-7. ' +
   'Issues above p85 flagged as aging alerts. ' +
   'Sample floors: n≥20 for p90, n≥30 for p95.'
@@ -55,7 +56,26 @@ export const agingWip = {
       // Only include issues in WIP (started, not done)
       if (!startedIds.has(currentStatusId) || doneIds.has(currentStatusId)) continue
 
-      const ageMs = Math.max(0, nowMs - new Date(issue.createdAt).getTime())
+      // Age = time since the item ENTERED work, not since it was created.
+      // Canonical Aging WIP measures how long an item has been in progress; using
+      // createdAt would add the item's entire backlog dwell time (an item that
+      // sat in the backlog 5 months then started 2 days ago would read 152 days,
+      // not 2). Use the first transition into a started-column status; fall back
+      // to createdAt only when the item was created directly into a WIP status
+      // (no started transition recorded).
+      let startedAtMs = null
+      for (const t of transitions) {
+        if (startedIds.has(t.toStatusId)) {
+          startedAtMs = new Date(t.transitionedAt).getTime()
+          break
+        }
+      }
+      const anchorMs =
+        startedAtMs !== null && Number.isFinite(startedAtMs)
+          ? startedAtMs
+          : new Date(issue.createdAt).getTime()
+
+      const ageMs = Math.max(0, nowMs - anchorMs)
       const ageSeconds = safeRatio(ageMs, 1000)
 
       wipItems.push({

@@ -438,6 +438,60 @@ describe('throughput', () => {
     expect(result.reopenedInWindowIds).toContain(IDS.issueStory1)
   })
 
+  // REGRESSION: an issue that completes once in-window, is reopened in-window,
+  // then re-completes OUTSIDE the window churned in-window and MUST be flagged.
+  // The old guard (reopenCount>0 && completionCount>1) required a SECOND in-window
+  // completion and silently dropped this case.
+  it('reopened in-window but re-completed outside → still flagged as churned', () => {
+    const churnedIssue = {
+      id: 'churned-1',
+      type: 'Story',
+      workflowId: IDS.workflowId,
+      currentStatusId: IDS.statusInProgress,
+      createdAt: '2024-03-01T00:00:00Z',
+      transitions: [
+        // First (and only in-window) Done.
+        {
+          id: 't1',
+          issueId: 'churned-1',
+          fromStatusId: IDS.statusInProgress,
+          toStatusId: IDS.statusDone,
+          transitionedAt: '2024-04-10T00:00:00Z',
+        },
+        // Reopened, still inside the window.
+        {
+          id: 't2',
+          issueId: 'churned-1',
+          fromStatusId: IDS.statusDone,
+          toStatusId: IDS.statusInProgress,
+          transitionedAt: '2024-04-20T00:00:00Z',
+        },
+        // Re-completed AFTER the window closes → completionCountInWindow stays 1.
+        {
+          id: 't3',
+          issueId: 'churned-1',
+          fromStatusId: IDS.statusInProgress,
+          toStatusId: IDS.statusDone,
+          transitionedAt: '2024-07-01T00:00:00Z',
+        },
+      ],
+    }
+
+    const result = throughput.compute(
+      {
+        issues: [churnedIssue],
+        doneStatusIds: DONE_STATUS_IDS,
+        windowStart: '2024-04-01T00:00:00Z',
+        windowEnd: '2024-06-01T00:00:00Z',
+      },
+      AS_OF,
+    )
+
+    expect(result.count).toBe(1) // counted once (first in-window Done)
+    expect(result.completedIssueIds).toContain('churned-1')
+    expect(result.reopenedInWindowIds).toContain('churned-1') // <-- the fix
+  })
+
   it('counts multiple distinct issues correctly', () => {
     const result = throughput.compute(
       {
@@ -539,6 +593,71 @@ describe('monteCarlo', () => {
     )
     expect(result.dataQuality).toBe('ok')
     expect(result.simulationCount).toBe(0)
+  })
+
+  it('floor gates on observedWeeks, not zero-padded weeklySamples.length', () => {
+    // Regression: a team active in only 2 of 13 weeks gets a 13-long padded
+    // sample. Gating the p95 floor on length (13) would clear the floor (≥12)
+    // and emit a precise-looking p95 off 2 real observations. observedWeeks (2)
+    // must drive the floor → p90/p95 suppressed, insufficient_sample.
+    const padded = [0, 0, 0, 0, 0, 3, 0, 4, 0, 0, 0, 0, 0] // 13 weeks, 2 active
+    const result = monteCarlo.compute(
+      { weeklySamples: padded, observedWeeks: 2, remainingItems: 50, seed: 1 },
+      AS_OF,
+    )
+    expect(result.sampleSize).toBe(13)
+    expect(result.observedWeeks).toBe(2)
+    expect(result.p90Weeks).toBeNull()
+    expect(result.p95Weeks).toBeNull()
+    expect(result.dataQuality).toBe('insufficient_sample')
+  })
+
+  it('observedWeeks≥floor still emits the upper percentiles (no over-suppression)', () => {
+    // 12 active weeks (no padding) clears the p95 floor.
+    const samples = [3, 5, 4, 2, 6, 3, 4, 5, 3, 4, 2, 5]
+    const result = monteCarlo.compute(
+      { weeklySamples: samples, observedWeeks: 12, remainingItems: 30, seed: 7 },
+      AS_OF,
+    )
+    expect(result.dataQuality).toBe('ok')
+    expect(result.p95Weeks).not.toBeNull()
+  })
+
+  it('all-zero throughput history → no_data, NOT a false-precise ~520-week forecast', () => {
+    // Regression: every sim hit the MAX_WEEKS cap so p50=p75=...=520 was reported
+    // at dataQuality 'ok' — "10 years to complete" presented as trustworthy.
+    const result = monteCarlo.compute(
+      { weeklySamples: [0, 0, 0, 0, 0, 0, 0, 0], remainingItems: 50, seed: 1 },
+      AS_OF,
+    )
+    expect(result.dataQuality).toBe('no_data')
+    expect(result.value).toBeNull()
+    expect(result.p50Weeks).toBeNull()
+    expect(result.simulationCount).toBe(0)
+  })
+
+  it('negative throughput samples are clamped to 0 (completed never moves backwards)', () => {
+    // A corrupt negative sample must not decrement completed and inflate weeks.
+    const result = monteCarlo.compute(
+      { weeklySamples: [-5, 5, 5, 5, 5], remainingItems: 10, seed: 1, simulations: 3000 },
+      AS_OF,
+    )
+    // With the -5 clamped to 0, throughput is effectively {0,5,5,5,5} → ~10/4≈2.5/wk.
+    expect(result.dataQuality).toBe('ok')
+    expect(result.p50Weeks).not.toBeNull()
+    expect(result.p50Weeks).toBeGreaterThan(0)
+    expect(result.p50Weeks).toBeLessThan(520)
+  })
+
+  it('surfaces infiniteFraction so a censored upper tail is not read as a precise quantile', () => {
+    // Mostly-zero history: many sims never complete → tail censored at MAX_WEEKS.
+    const result = monteCarlo.compute(
+      { weeklySamples: [0, 0, 0, 0, 0, 0, 0, 1], remainingItems: 100, seed: 3, simulations: 2000 },
+      AS_OF,
+    )
+    expect(result.hasInfiniteRisk).toBe(true)
+    expect(result.infiniteFraction).toBeGreaterThan(0)
+    expect(result.infiniteFraction).toBeLessThanOrEqual(1)
   })
 
   it('p50 weeks is a reasonable estimate', () => {
@@ -670,6 +789,24 @@ describe('wipLoad', () => {
     // story-1 is Done (not in WIP); epic-1 is In Progress (in WIP)
     expect(result.wip).toBeGreaterThanOrEqual(0)
     expect(typeof result.wip).toBe('number')
+    // Little's Law fires when avgCycleTimeDays is supplied (the dispatch now
+    // derives it from cycle-time p50 instead of hardcoding null).
+    if (result.wip > 0) {
+      expect(result.littlesLawThroughputPerDay).toBeCloseTo(result.wip / 14, 5)
+    }
+  })
+
+  it("Little's Law + stationarity are DEAD when avgCycleTimeDays is null (call-site contract)", () => {
+    // This documents the bug the dispatch fix addresses: passing null leaves the
+    // entire avgCycleTimeDays branch inert. The compute dispatch must therefore
+    // pass a derived cycle time, not null.
+    const epicIssue = buildFlowIssue(IDS.issueEpic1)
+    const result = wipLoad.compute(
+      { issues: [epicIssue], boardColumns: BOARD_COLUMNS, now: NOW, avgCycleTimeDays: null },
+      AS_OF,
+    )
+    expect(result.littlesLawThroughputPerDay).toBeNull()
+    expect(result.stationarityWarning).toBe(false)
   })
 })
 
@@ -690,6 +827,53 @@ describe('agingWip', () => {
       expect(result.p50Seconds).not.toBeNull()
       expect(result.wipItems[0]?.ageSeconds).toBeGreaterThan(0)
     }
+  })
+
+  it('measures age from work-start, not creation (excludes backlog dwell)', () => {
+    // Item created Jan 1, sat in backlog ~5 months, started 2 days before now.
+    // Canonical Aging WIP = ~2 days (172800 s), NOT 152 days since creation.
+    const cols = [
+      { statusIds: ['s-todo'], isStartedCol: false, isDoneCol: false },
+      { statusIds: ['s-doing'], isStartedCol: true, isDoneCol: false },
+      { statusIds: ['s-done'], isStartedCol: false, isDoneCol: true },
+    ]
+    const now = '2024-06-01T00:00:00Z'
+    const issue = {
+      id: 'late-start',
+      type: 'Story',
+      createdAt: '2024-01-01T00:00:00Z',
+      currentStatusId: 's-doing',
+      transitions: [
+        { toStatusId: 's-todo', transitionedAt: '2024-01-01T00:00:00Z' },
+        { toStatusId: 's-doing', transitionedAt: '2024-05-30T00:00:00Z' },
+      ],
+    }
+    const result = agingWip.compute({ issues: [issue], boardColumns: cols, now }, AS_OF)
+    expect(result.wipCount).toBe(1)
+    const age = result.wipItems[0]?.ageSeconds
+    // ~2 days, not ~152 days. Allow a small tolerance.
+    expect(age).toBeGreaterThan(2 * 86400 - 60)
+    expect(age).toBeLessThan(2 * 86400 + 60)
+  })
+
+  it('falls back to createdAt when the item was created directly into WIP', () => {
+    // No started transition recorded (only the creation snapshot). Anchor on
+    // createdAt so a born-in-progress item still ages from its creation.
+    const cols = [
+      { statusIds: ['s-doing'], isStartedCol: true, isDoneCol: false },
+      { statusIds: ['s-done'], isStartedCol: false, isDoneCol: true },
+    ]
+    const now = '2024-06-03T00:00:00Z'
+    const issue = {
+      id: 'born-wip',
+      type: 'Story',
+      createdAt: '2024-06-01T00:00:00Z',
+      currentStatusId: 's-doing',
+      transitions: [],
+    }
+    const result = agingWip.compute({ issues: [issue], boardColumns: cols, now }, AS_OF)
+    expect(result.wipCount).toBe(1)
+    expect(result.wipItems[0]?.ageSeconds).toBeCloseTo(2 * 86400, 0)
   })
 })
 

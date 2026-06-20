@@ -25,6 +25,8 @@ import {
   COMPUTE_METRIC_IDS,
   computeMetric,
   computePersonReportLive,
+  invalidateLookupsCache,
+  metricFormulaDoc,
   rederiveStaleEngineSnapshots,
 } from '../metrics/index.js'
 import {
@@ -43,6 +45,18 @@ import {
   toCsv,
   toJson,
 } from '../report/index.js'
+
+import {
+  assertIndexedPlan,
+  assertReadOnlyQuery,
+  LARGE_SCAN_ROW_THRESHOLD,
+  QUERY_DB_DEFAULT_MAX_ROWS,
+  QUERY_DB_HARD_CAP_ROWS,
+  QUERY_DB_MAX_BYTES,
+  QUERY_DB_TIMEOUT_MS,
+  QueryDbError,
+  runBudgetedQuery,
+} from './queryGuard.js'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -128,6 +142,9 @@ function makeComputeDayFn(ctx, now) {
  * silently mixing formula versions.
  */
 async function rederiveOnEngineBump(ctx, now) {
+  // Runs after ingestion (inside runSync) and at startup; drop any stale lookup
+  // memo so the recompute reads post-write pr_refs / file_complexity / statuses.
+  invalidateLookupsCache(ctx.store)
   const today = now.slice(0, 10)
   const fromDay = new Date(Date.parse(today) - SNAPSHOT_HISTORY_DAYS * 86_400_000)
     .toISOString()
@@ -1103,13 +1120,22 @@ function registerExplainMetricTool(server, _ctx) {
       outputSchema,
     },
     async ({ metric }) => {
+      // Prefer the engine module's own formulaDoc keyed by the FULLY-QUALIFIED
+      // id the get_* tools and schema guide emit (dora.*, flow.*, pr.*, code.*,
+      // agile.*, person.*). The curated short-name table (deployment_frequency,
+      // haloc, …) is kept only as a back-compat fallback for the legacy aliases.
+      // Without this, explain_metric returned "not documented" for every
+      // qualified id a user actually receives from the other tools.
+      const engine = metricFormulaDoc(metric)
       const entry = FORMULA_DOCS[metric]
+      const found = engine !== null || entry !== undefined
       const output = {
         ...provenance('n/a'),
         metric,
-        formula_doc: entry?.formula_doc ?? 'Formula not documented for this metric.',
-        scope: entry?.scope ?? 'unknown',
-        found: entry !== undefined,
+        formula_doc:
+          engine?.formulaDoc ?? entry?.formula_doc ?? 'Formula not documented for this metric.',
+        scope: engine !== null ? `${engine.scope}+` : (entry?.scope ?? 'unknown'),
+        found,
       }
       return {
         content: [{ type: 'text', text: JSON.stringify(output) }],
@@ -1145,130 +1171,12 @@ function registerExplainMetricTool(server, _ctx) {
 //   4. Reject ATTACH / DETACH / PRAGMA / DDL / DML keywords outright.
 //   5. Bind params positionally via prepare(sql).all(...params) — never
 //      string-interpolate user input.
-//   6. Enforce max_rows (default 1000, hard cap 5000).
-
-const QUERY_DB_DEFAULT_MAX_ROWS = 1000
-const QUERY_DB_HARD_CAP_ROWS = 5000
-
-/** Keywords that must never appear as statements in a read-only query. */
-const FORBIDDEN_SQL_KEYWORDS = [
-  'INSERT',
-  'UPDATE',
-  'DELETE',
-  'REPLACE',
-  'DROP',
-  'CREATE',
-  'ALTER',
-  'ATTACH',
-  'DETACH',
-  'PRAGMA',
-  'VACUUM',
-  'REINDEX',
-  'ANALYZE',
-  'TRUNCATE',
-]
-
-/**
- * Strip SQL comments (-- line and / * block * /) and surrounding whitespace so we
- * can inspect the real first keyword and statement structure.
- */
-function stripSqlComments(sql) {
-  // Remove block comments, then line comments, then collapse whitespace edges.
-  return sql
-    .replace(/\/\*[\s\S]*?\*\//g, ' ')
-    .replace(/--[^\n]*/g, ' ')
-    .trim()
-}
-
-/**
- * Blank out the CONTENTS of string literals and quoted identifiers (length is
- * preserved; delimiters are kept) so the keyword/semicolon read-only checks
- * scan only real SQL, not data. Without this, a legitimate read query like
- * `SELECT * WHERE name = 'DELETE'` or `... LIKE '%;%'` is wrongly rejected.
- * Operates on already-comment-stripped SQL. SQLite escapes a quote by doubling
- * it ('' / "" / ``), which is handled by staying inside the quoted run.
- * Masking only ever HIDES characters from the scan, so it can never let a real
- * write keyword/extra statement that sits OUTSIDE quotes slip through.
- */
-function maskSqlLiterals(sql) {
-  let out = ''
-  let quote = null // active closing delimiter: "'", '"', '`', or ']'
-  for (let i = 0; i < sql.length; i++) {
-    const ch = sql[i]
-    if (quote) {
-      if (ch === quote) {
-        // A doubled delimiter inside '..', ".." or `..` is an escaped literal
-        // quote — stay inside and mask both characters.
-        if (quote !== ']' && sql[i + 1] === quote) {
-          out += '  '
-          i++
-        } else {
-          quote = null
-          out += ch
-        }
-      } else {
-        out += ' '
-      }
-    } else if (ch === "'" || ch === '"' || ch === '`') {
-      quote = ch
-      out += ch
-    } else if (ch === '[') {
-      quote = ']'
-      out += ch
-    } else {
-      out += ch
-    }
-  }
-  return out
-}
-
-/** Thrown when a query_db request fails validation; message is safe to return. */
-class QueryDbError extends Error {}
-
-/**
- * Validate that `sql` is a single read-only SELECT/WITH statement. Throws
- * QueryDbError with a specific reason on any violation.
- */
-function assertReadOnlyQuery(sql) {
-  const stripped = stripSqlComments(sql)
-  if (stripped.length === 0) {
-    throw new QueryDbError('Empty query after stripping comments.')
-  }
-
-  // Run the structural checks against a copy with string-literal/identifier
-  // CONTENTS blanked out, so keywords/semicolons that appear only inside data
-  // (e.g. `WHERE name = 'DELETE'`) don't trip the guard. Real keywords and
-  // statement separators outside quotes are untouched. Length is preserved, so
-  // the semicolon index still lines up with the original.
-  const masked = maskSqlLiterals(stripped)
-
-  // Reject multiple statements: a ';' is only allowed as the final character.
-  const semicolonIdx = masked.indexOf(';')
-  if (semicolonIdx !== -1 && semicolonIdx !== masked.length - 1) {
-    throw new QueryDbError(
-      'Multiple statements are not allowed — submit a single SELECT/WITH query.',
-    )
-  }
-
-  const firstKeywordMatch = masked.match(/^([a-zA-Z]+)/)
-  const firstKeyword = firstKeywordMatch?.[1]?.toUpperCase() ?? ''
-  if (firstKeyword !== 'SELECT' && firstKeyword !== 'WITH') {
-    throw new QueryDbError(
-      `Only SELECT/WITH read queries are allowed (got "${firstKeyword || '?'}").`,
-    )
-  }
-
-  // Reject any forbidden write/DDL/PRAGMA keyword anywhere (word-boundary match).
-  // This blocks e.g. `WITH x AS (...) DELETE ...` and `PRAGMA writable_schema`.
-  const upper = masked.toUpperCase()
-  for (const kw of FORBIDDEN_SQL_KEYWORDS) {
-    if (new RegExp(`\\b${kw}\\b`).test(upper)) {
-      throw new QueryDbError(`Disallowed keyword "${kw}" — query_db is read-only.`)
-    }
-  }
-}
-
-/** A query_db parameter value: bound positionally, never interpolated. */
+//   6. Enforce max_rows (default 1000, hard cap 5000), a byte budget, an index
+//      pre-flight, and a hard wall-clock timeout via out-of-process execution.
+//
+// The validation/budget/plan-guard primitives live in ./queryGuard.js so the
+// queryRunner child process can share them. See that module's header for the
+// full threat model.
 
 /**
  * Acquire a read-only Database handle for a query. For an on-disk DB this
@@ -1293,6 +1201,67 @@ function acquireReadHandle(ctx) {
   return { db: ro, close: () => ro.close() }
 }
 
+/** Absolute path to the query_db child-process runner. */
+const QUERY_RUNNER_PATH = new URL('./queryRunner.js', import.meta.url).pathname
+
+/**
+ * Execute an arbitrary read-only query in a SEPARATE OS process bounded by a
+ * hard wall-clock timeout. This is the core safeguard: an in-process query (even
+ * on a worker thread) stuck inside a single native sqlite3_step() — exactly what
+ * a fan-out/cartesian aggregate does — cannot be interrupted, so it can wedge the
+ * single-threaded server for hours. A child process can always be SIGKILL'd, so
+ * the worst case is bounded to `timeoutMs`, and the server stays responsive to
+ * every other tool throughout (Bun.spawn is async).
+ */
+async function runQueryInSubprocess(ctx, { sql, params, maxRows }) {
+  const timeoutMs = ctx.config.queryDbTimeoutMs ?? QUERY_DB_TIMEOUT_MS
+  const proc = Bun.spawn(['bun', QUERY_RUNNER_PATH], {
+    stdin: 'pipe',
+    stdout: 'pipe',
+    stderr: 'pipe',
+    timeout: timeoutMs,
+    killSignal: 'SIGKILL',
+  })
+  proc.stdin.write(
+    JSON.stringify({
+      dbPath: ctx.config.dbPath,
+      sql,
+      params,
+      maxRows,
+      maxBytes: QUERY_DB_MAX_BYTES,
+      scanThreshold: LARGE_SCAN_ROW_THRESHOLD,
+    }),
+  )
+  proc.stdin.end()
+
+  const stdout = await proc.stdout.text()
+  await proc.exited
+
+  // Bun sets signalCode when it kills the child on timeout (killSignal above).
+  if (proc.signalCode != null) {
+    throw new QueryDbError(
+      `Query exceeded the ${Math.round(timeoutMs / 1000)}s limit and was aborted. ` +
+        'This usually means a fan-out: do not JOIN several child tables of the same ' +
+        'parent in one query (it produces a cartesian product). Query each table ' +
+        'separately, add an indexed WHERE filter, or use the data_overview tool for ' +
+        'ingestion counts.',
+    )
+  }
+
+  let parsed
+  try {
+    parsed = JSON.parse(stdout)
+  } catch {
+    throw new QueryDbError(
+      'query runner returned no parseable output (the query may have crashed).',
+    )
+  }
+  if (!parsed.ok) {
+    throw new QueryDbError(parsed.error ?? 'query failed')
+  }
+  return { columns: parsed.columns, rows: parsed.rows, truncated: parsed.truncated }
+}
+
 function registerQueryDbTool(server, ctx) {
   const outputSchema = z.object({
     ...provenanceSchema.shape,
@@ -1311,7 +1280,11 @@ function registerQueryDbTool(server, ctx) {
         'Run a read-only SELECT/WITH SQL query against the local lazy-flow SQLite store and ' +
         'get back columns + rows. Read the lazy-flow://schema resource first for the table ' +
         'layout and how to resolve a person via the identities table. Writes/DDL/PRAGMA are ' +
-        'rejected. Params are bound positionally (use ? placeholders).',
+        'rejected. Params are bound positionally (use ? placeholders). Queries run in an ' +
+        'isolated process with a hard time limit and must use an index when scanning large ' +
+        'tables — NEVER JOIN several child tables of the same parent in one query (that fans ' +
+        'out to a cartesian product); query each separately. For ingestion counts, prefer the ' +
+        'data_overview tool.',
       inputSchema: z.object({
         sql: z.string().describe('A single read-only SELECT/WITH query. Use ? for bound params.'),
         params: z
@@ -1334,33 +1307,38 @@ function registerQueryDbTool(server, ctx) {
       const maxRows = Math.min(max_rows ?? QUERY_DB_DEFAULT_MAX_ROWS, QUERY_DB_HARD_CAP_ROWS)
       const bind = params ?? []
 
-      let handle = null
       try {
+        // Fast static reject (no process spawn) before doing any work.
         assertReadOnlyQuery(sql)
 
-        handle = acquireReadHandle(ctx)
-        const stmt = handle.db.prepare(sql)
-        // Fetch one extra row to detect truncation without a second query.
-        const allRows = stmt.all(...bind)
-        const truncated = allRows.length > maxRows
-        const rows = truncated ? allRows.slice(0, maxRows) : allRows
-
-        // Column order from the prepared statement when available, else infer
-        // from the first row's keys (statements with no result columns -> []).
-        // bun:sqlite exposes the result column names as `columnNames`.
-        const columns =
-          Array.isArray(stmt.columnNames) && stmt.columnNames.length > 0
-            ? stmt.columnNames
-            : rows[0] !== undefined
-              ? Object.keys(rows[0])
-              : []
+        let result
+        if (ctx.config.dbPath === ':memory:') {
+          // An in-memory DB is not visible to a child process, so we cannot
+          // sandbox it out-of-process. Run in-process with the same index
+          // pre-flight + budgets. There is no hard timeout here, but :memory: is
+          // only ever ephemeral/test data of trivial size.
+          const handle = acquireReadHandle(ctx)
+          try {
+            assertIndexedPlan(handle.db, sql, bind)
+            result = runBudgetedQuery(handle.db, sql, bind, {
+              maxRows,
+              maxBytes: QUERY_DB_MAX_BYTES,
+            })
+          } finally {
+            handle.close()
+          }
+        } else {
+          // On-disk: execute in an isolated, time-bounded child process so a
+          // runaway query can never wedge the long-lived server.
+          result = await runQueryInSubprocess(ctx, { sql, params: bind, maxRows })
+        }
 
         const output = {
-          ...provenance('deterministic', rows.length === 0 ? 'no_data' : 'ok'),
-          columns,
-          rows,
-          row_count: rows.length,
-          truncated,
+          ...provenance('deterministic', result.rows.length === 0 ? 'no_data' : 'ok'),
+          columns: result.columns,
+          rows: result.rows,
+          row_count: result.rows.length,
+          truncated: result.truncated,
         }
         return {
           content: [{ type: 'text', text: JSON.stringify(output) }],
@@ -1383,8 +1361,111 @@ function registerQueryDbTool(server, ctx) {
           content: [{ type: 'text', text: JSON.stringify(output) }],
           structuredContent: output,
         }
+      }
+    },
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Tool: data_overview — safe, index-backed ingestion summary
+// ---------------------------------------------------------------------------
+//
+// The descriptive "what / how much did we ingest" surface, so callers never need
+// raw SQL (and never reach for a multi-child JOIN) just to see volumes. Every
+// query here is a single-table COUNT / GROUP-BY on an indexed FK, merged in JS —
+// there is no cross-table fan-out, so it is fast at any scale.
+
+function registerDataOverviewTool(server, ctx) {
+  const outputSchema = z.object({
+    ...provenanceSchema.shape,
+    totals: z.record(z.number()),
+    repos: z.array(z.record(z.unknown())),
+    jira_projects: z.array(z.record(z.unknown())),
+  })
+
+  server.registerTool(
+    'data_overview',
+    {
+      title: 'Data overview (ingestion summary)',
+      description:
+        'Per-repo and per-project counts of everything ingested (PRs, commits, deployments, ' +
+        'check runs, PR files, Jira issues) plus global totals. Use this instead of writing ' +
+        'raw query_db SQL when you just need to know how much data is in the store.',
+      inputSchema: z.object({}),
+      outputSchema,
+    },
+    async () => {
+      const handle = acquireReadHandle(ctx)
+      try {
+        const db = handle.db
+        const count = (table) =>
+          Number(db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()?.n ?? 0)
+        // Single-table GROUP BY on the indexed FK; merged into repos in JS. NEVER
+        // a JOIN across children — that is exactly the cartesian trap this tool
+        // exists to avoid.
+        const groupCount = (table, col = 'repo_id') => {
+          const m = new Map()
+          for (const r of db
+            .prepare(`SELECT ${col} AS k, COUNT(*) AS n FROM ${table} GROUP BY ${col}`)
+            .all()) {
+            m.set(r.k, Number(r.n))
+          }
+          return m
+        }
+
+        const totals = {
+          repositories: count('repositories'),
+          pull_requests: count('pull_requests'),
+          commits: count('commits'),
+          pr_files: count('pr_files'),
+          reviews: count('reviews'),
+          review_comments: count('review_comments'),
+          check_runs: count('check_runs'),
+          deployments: count('deployments'),
+          issues: count('issues'),
+          issue_transitions: count('issue_transitions'),
+          identities: count('identities'),
+          persons: count('persons'),
+          metric_snapshots: count('metric_snapshots'),
+        }
+
+        const prByRepo = groupCount('pull_requests')
+        const commitByRepo = groupCount('commits')
+        const deployByRepo = groupCount('deployments')
+        const checkByRepo = groupCount('check_runs')
+        const fileByRepo = groupCount('pr_files')
+        const repos = db
+          .prepare(
+            "SELECT id, owner || '/' || name AS repo FROM repositories WHERE deleted_at IS NULL ORDER BY repo",
+          )
+          .all()
+          .map((r) => ({
+            repo: r.repo,
+            prs: prByRepo.get(r.id) ?? 0,
+            commits: commitByRepo.get(r.id) ?? 0,
+            deployments: deployByRepo.get(r.id) ?? 0,
+            check_runs: checkByRepo.get(r.id) ?? 0,
+            pr_files: fileByRepo.get(r.id) ?? 0,
+          }))
+
+        const issuesByProject = groupCount('issues', 'project_id')
+        const jiraProjects = db
+          .prepare('SELECT id, key FROM jira_projects ORDER BY key')
+          .all()
+          .map((p) => ({ project: p.key, issues: issuesByProject.get(p.id) ?? 0 }))
+
+        const output = {
+          ...provenance('deterministic', totals.repositories === 0 ? 'no_data' : 'ok'),
+          totals,
+          repos,
+          jira_projects: jiraProjects,
+        }
+        return {
+          content: [{ type: 'text', text: JSON.stringify(output) }],
+          structuredContent: output,
+        }
       } finally {
-        handle?.close()
+        handle.close()
       }
     },
   )
@@ -1596,6 +1677,11 @@ function registerGenerateReportTool(server, ctx) {
           windowDays: window_days,
           benchmark: buildBenchmarkProvider(),
           narrative: buildNarrativeProvider(),
+          // Person-scope presets have no persisted snapshots (sync only writes
+          // team/org). Provide a live-compute fallback so a person report is not
+          // an empty facade — mirrors get_person_report's live path.
+          liveCompute: (metricId, cellScope, from, to) =>
+            computeMetric(ctx.store, cellScope.type, cellScope.id, metricId, from, to, now),
         },
         fmt,
       )
@@ -1780,7 +1866,22 @@ Example — count merged PRs per person:
 - Soft-deleted rows (repositories, pull_requests, issues) carry a non-NULL
   \`deleted_at\`; filter \`deleted_at IS NULL\` for live data.
 - Timestamps are ISO-8601 TEXT. Booleans are INTEGER 0/1.
-- query_db is read-only: only a single SELECT/WITH statement runs.`
+
+## query_db rules (so it stays fast)
+- Read-only: only a single SELECT/WITH statement runs; it executes in an isolated
+  process with a hard time limit and is force-killed if it overruns.
+- DO NOT join several CHILD tables of the same parent in one query
+  (e.g. pull_requests + commits + deployments + check_runs all joined to
+  repositories). Each parent→child join is one-to-many, so joining N children
+  multiplies their row counts into a CARTESIAN PRODUCT (millions–trillions of
+  intermediate rows) even when the final result is tiny. Instead, run one
+  \`GROUP BY\` per child table and combine the results yourself.
+- Large tables (pr_files, check_runs, commits, reviews, issue_transitions,
+  metric_snapshots) must be accessed via an index — add a WHERE on an indexed
+  column (repo_id, pr_id, created_at, …). A planned full scan of a large table is
+  rejected up front.
+- For "how much did we ingest" counts per repo/project, call the \`data_overview\`
+  tool instead of writing SQL.`
 
 function registerSchemaResource(server, ctx) {
   server.registerResource(
@@ -2021,6 +2122,7 @@ export function createServer(ctx) {
   registerExplainMetricTool(server, ctx)
   registerExportTool(server, ctx)
   registerQueryDbTool(server, ctx)
+  registerDataOverviewTool(server, ctx)
 
   // Tools — per-person insight suite + in-session-Claude verdict pipeline
   registerGetPersonReportTool(server, ctx)

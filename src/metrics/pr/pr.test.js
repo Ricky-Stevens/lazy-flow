@@ -101,6 +101,27 @@ describe('prCycleTime', () => {
     expect(result.value).toBeNull()
     expect(result.dataQuality).toBe('no_data')
   })
+
+  // REGRESSION: merged PRs but NO deploy feed (this tool's common case). The
+  // 4-phase total needs a post-merge deploy, so the headline is null — but the
+  // module used to report dataQuality 'ok' alongside a null value (an internal
+  // lie) and never surfaced the headline's sample size.
+  it('merged PRs but no deploys → null headline is insufficient_sample, not ok; phases still populated', () => {
+    const result = prCycleTime.compute({ prs, deploys: [] }, AS_OF)
+    expect(result.value).toBeNull()
+    expect(result.totalSampleSize).toBe(0)
+    expect(result.dataQuality).toBe('insufficient_sample')
+    // Per-phase signals that don't need a deploy remain available.
+    expect(result.coding.sampleSize).toBeGreaterThan(0)
+    expect(result.review.sampleSize).toBeGreaterThan(0)
+  })
+
+  it('full-lifecycle PR exposes totalSampleSize alongside the headline p50', () => {
+    const result = prCycleTime.compute({ prs, deploys }, AS_OF)
+    expect(result.totalSampleSize).toBeGreaterThan(0)
+    expect(result.totalSampleSize).toBe(result.deploy.sampleSize > 0 ? result.totalSampleSize : 0)
+    expect(result.value).not.toBeNull()
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -181,6 +202,21 @@ describe('prSize', () => {
     const result = prSize.compute({ prs: [] }, AS_OF)
     expect(result.value).toBeNull()
     expect(result.dataQuality).toBe('no_data')
+  })
+
+  it('falls back to additions+deletions when haloc is undefined (field absent)', () => {
+    // Regression: a projection that omits haloc entirely supplies `undefined`.
+    // `pr.haloc !== null` would let undefined through → NaN median + everything
+    // bucketed XL. With `??` it falls back to additions+deletions (130 → M).
+    const undefPrs = prs.map((pr) => {
+      const { haloc, ...rest } = pr
+      return { ...rest, state: 'merged', mergedAt: pr.mergedAt ?? '2024-03-02T10:00:00Z' }
+    })
+    const result = prSize.compute({ prs: undefPrs }, AS_OF)
+    expect(result.medianHaloc).toBe(130)
+    expect(Number.isFinite(result.medianHaloc)).toBe(true)
+    expect(result.bucketCounts.M).toBe(undefPrs.length)
+    expect(result.bucketCounts.XL).toBe(0)
   })
 })
 

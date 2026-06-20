@@ -205,6 +205,58 @@ describe('assembleReportModel', () => {
     store.close()
   })
 
+  it('person-scope cells fall back to liveCompute when no snapshots exist (not an empty facade)', async () => {
+    // Sync never persists person-scope snapshots, so without a live fallback the
+    // annual:person preset renders all-no_data. The injected liveCompute must
+    // populate the cells so the advertised person report actually has content.
+    const store = mkStore()
+    const seen = []
+    const liveCompute = async (metricId, scope, _from, _to) => {
+      seen.push({ metricId, scopeType: scope.type })
+      return { value: 0.42, trustTier: 'deterministic', dataQuality: 'ok' }
+    }
+
+    const model = await assembleReportModel({
+      store,
+      presetKey: 'annual:person',
+      scope: { type: 'person', id: 'alice' },
+      periodEnd: '2026-12-31',
+      now: '2027-01-01T00:00:00.000Z',
+      liveCompute,
+    })
+
+    const cells = model.sections.flatMap((s) => s.cells)
+    expect(cells.length).toBeGreaterThan(0)
+    // Every cell was filled from the live path, none left as no_data facade.
+    expect(cells.every((c) => c.value === 0.42)).toBe(true)
+    expect(model.provenance.dataQuality).toBe('ok')
+    // liveCompute was invoked with person scope for each metric.
+    expect(seen.length).toBe(cells.length)
+    expect(seen.every((s) => s.scopeType === 'person')).toBe(true)
+    store.close()
+  })
+
+  it('team-scope reports do NOT use the live fallback (snapshot path only)', async () => {
+    // Guard: the live fallback is person/self only — team/org must stay on the
+    // fast persisted-snapshot path even when a liveCompute is provided.
+    const store = mkStore()
+    let liveCalled = false
+    const model = await assembleReportModel({
+      store,
+      presetKey: 'monthly:team',
+      scope: { type: 'team', id: 'platform' },
+      periodEnd: '2026-05-31',
+      now: '2026-06-01T00:00:00.000Z',
+      liveCompute: async () => {
+        liveCalled = true
+        return { value: 99 }
+      },
+    })
+    expect(liveCalled).toBe(false)
+    expect(model.sections.flatMap((s) => s.cells).every((c) => c.value === null)).toBe(true)
+    store.close()
+  })
+
   it('shows a real DORA band when the snapshot dataSource is real (proxy-capable preset overridden)', async () => {
     const store = mkStore()
     // 1.5 deploys/day ⇒ DORA "elite". Org scope, snapshot provenance = real.
@@ -270,6 +322,72 @@ describe('assembleReportModel', () => {
     expect(cell?.benchmark?.note).toContain('connect real deploy/incident data')
     expect(cell?.proxy).toBe(true)
     store.close()
+  })
+
+  it('bands a duration DORA metric in DISPLAY units, not raw seconds (lead_time)', async () => {
+    // Regression: lead_time is stored in SECONDS but its preset unit is 'hours'.
+    // An elite 6-hour lead time = 21600 s. The benchmark classifier expects
+    // hours and bands <24h as elite. If the call site passes raw seconds it
+    // computes `21600 < 24` → 'low', mislabelling an elite team as worst-band
+    // on the executive/quarterly presets. The displayed value must be banded.
+    const store = mkStore()
+    await seed(store, 'dora.lead_time', '2026-06-28', 21600, 'org', 'acme', 'deterministic', 'real')
+
+    const model = await assembleReportModel({
+      store,
+      presetKey: 'quarterly:dept',
+      scope: { type: 'org', id: 'acme' },
+      periodEnd: '2026-06-30',
+      now: '2026-07-01T00:00:00.000Z',
+      benchmark: buildBenchmarkProvider(),
+    })
+
+    const cell = model.sections.flatMap((s) => s.cells).find((c) => c.metricId === 'dora.lead_time')
+    // Stored value stays in canonical seconds; the band is computed in hours.
+    expect(cell?.value).toBe(21600)
+    expect(cell?.benchmark?.suppressed).toBe(false)
+    expect(cell?.benchmark?.band).toBe('elite')
+  })
+
+  it('bands recovery_time in display hours and CFR in display percent', async () => {
+    // recovery_time: 30 min = 1800 s ⇒ <1h ⇒ elite (raw seconds would be 'high').
+    // change_failure_rate: 0.03 ratio ⇒ 3% ⇒ elite, verifying the % path also
+    // survives the display-unit conversion.
+    const store = mkStore()
+    await seed(
+      store,
+      'dora.recovery_time',
+      '2026-06-28',
+      1800,
+      'org',
+      'acme',
+      'deterministic',
+      'real',
+    )
+    await seed(
+      store,
+      'dora.change_failure_rate',
+      '2026-06-28',
+      0.03,
+      'org',
+      'acme',
+      'deterministic',
+      'real',
+    )
+
+    const model = await assembleReportModel({
+      store,
+      presetKey: 'quarterly:dept',
+      scope: { type: 'org', id: 'acme' },
+      periodEnd: '2026-06-30',
+      now: '2026-07-01T00:00:00.000Z',
+      benchmark: buildBenchmarkProvider(),
+    })
+    const cells = model.sections.flatMap((s) => s.cells)
+    expect(cells.find((c) => c.metricId === 'dora.recovery_time')?.benchmark?.band).toBe('elite')
+    expect(cells.find((c) => c.metricId === 'dora.change_failure_rate')?.benchmark?.band).toBe(
+      'elite',
+    )
   })
 
   it('suppresses the DORA band when dataSource is absent (NULL ⇒ proxy, conservative)', async () => {

@@ -29,9 +29,9 @@
  * not deleted — the data is retained but flagged).
  */
 
-import { computeHaloc } from '../code-analysis/index.js'
-
-import { buildIdentityId, scrubFreeText } from '../core/index.js'
+import { classifyIsGenerated, computeHaloc } from '../code-analysis/index.js'
+import { isLikelyBotLogin } from '../core/identity/bot.js'
+import { buildIdentityId, mapWithConcurrency, scrubFreeText } from '../core/index.js'
 import { fetchPrComplexityBatch, writePrComplexity } from './complexity.js'
 
 // ---------------------------------------------------------------------------
@@ -53,7 +53,18 @@ import { fetchPrComplexityBatch, writePrComplexity } from './complexity.js'
  * `now` is injectable so the orchestrator can stamp one coherent timestamp
  * across GitHub + Jira + the full-cycle watermark (and for deterministic tests).
  */
-export async function syncGitHub(store, client, scope, mode, now = new Date().toISOString()) {
+export async function syncGitHub(
+  store,
+  client,
+  scope,
+  mode,
+  now = new Date().toISOString(),
+  opts = {},
+) {
+  // Optional REPO_FETCH_CONCURRENCY override (used by the safety test that
+  // asserts a concurrent fetch+serial write produces the same store state as
+  // a strictly serial run). Default at runtime is 4.
+  const repoFetchConcurrency = Math.max(1, opts.repoFetchConcurrency ?? 4)
   // Ensure the org record exists.
   const orgId = `org-${scope.org}`
   await store.upsertOrganisation({
@@ -103,16 +114,38 @@ export async function syncGitHub(store, client, scope, mode, now = new Date().to
   }
 
   const repoNames = []
-
+  const repos = []
   for (const rawRepo of filteredRaw) {
     const repo = mapRepository(rawRepo, orgId, now)
     await store.upsertRepository(repo)
     repoNames.push(`${repo.owner}/${repo.name}`)
+    repos.push(repo)
+  }
 
-    if (mode === 'tombstone') {
+  if (mode === 'tombstone') {
+    // Tombstone walks the authoritative set per repo and soft-deletes locally
+    // absent rows; the existing serial path preserves that ordering / behaviour.
+    for (const repo of repos) {
       await tombstoneRepo(store, client, repo, now)
-    } else {
-      await syncRepo(store, client, repo, mode, now)
+    }
+  } else {
+    // Repo parallelism — FETCH/WRITE split. The fetch phase is network-bound
+    // GraphQL; we run it across REPO_FETCH_CONCURRENCY repos at a time. The
+    // write phase MUST stay serial — BunSqliteStore is a single synchronous
+    // connection, no two concurrent transactions. mapWithConcurrency preserves
+    // input order so the writer sees results in input order.
+    //
+    // Memory: peak = (concurrency × one-repo payload). We process repos in
+    // CHUNKS of concurrency size: fetch up to N, write all N serially, release,
+    // then next chunk. This keeps memory bounded to N payloads, not |repos|.
+    for (let i = 0; i < repos.length; i += repoFetchConcurrency) {
+      const chunk = repos.slice(i, i + repoFetchConcurrency)
+      const payloads = await mapWithConcurrency(chunk, repoFetchConcurrency, (repo) =>
+        fetchRepoPayload(store, client, repo, mode, now),
+      )
+      for (let j = 0; j < chunk.length; j++) {
+        await writeRepoPayload(store, chunk[j], payloads[j], now)
+      }
     }
   }
 
@@ -145,7 +178,17 @@ function subtractMinutes(iso, minutes) {
   return new Date(new Date(iso).getTime() - minutes * 60_000).toISOString()
 }
 
-async function syncRepo(store, client, repo, mode, now) {
+/**
+ * Phase A — NETWORK FETCH. Reads all GraphQL data for one repo into an
+ * in-memory payload, plus the watermark/dedup READS the writer needs. Pure
+ * over the store at the read level (no transactions, no writes), so multiple
+ * repo fetches can run concurrently. Memory is bounded to one repo's worth.
+ *
+ * NB: `store.hasFileComplexity` (used by fetchPrComplexityBatch) is a single
+ * indexed point read; bun:sqlite is a single synchronous connection, so even
+ * concurrent JS callers serialise those reads at the driver level — no race.
+ */
+async function fetchRepoPayload(store, client, repo, mode, now) {
   const owner = repo.owner
   const name = repo.name
   const repoId = repo.id
@@ -164,114 +207,16 @@ async function syncRepo(store, client, repo, mode, now) {
       : undefined
   }
 
-  // ---- Commits ----
+  // ---- Commits ---- (fetch only)
   // BULK GraphQL: one paginated `history` query returns every default-branch
   // commit WITH line stats and check runs INLINE — replacing the REST list +
-  // per-commit DETAIL + per-commit check-runs N+1 (~2 REST calls PER commit)
-  // with ~O(commits/100) requests. Each returned commit carries `__detail`
-  // (additions/deletions/haloc — HALOC from line stats, since GraphQL exposes no
-  // per-file patch) and `__checks` (REST-shaped check runs). `since` bounds
-  // incremental runs to the committer-date window.
+  // per-commit DETAIL + per-commit check-runs N+1.
   const rawCommits = await client.fetchCommitHistory(owner, name, since)
+  // existingShas is a READ (sync stmt.all). Safe under concurrent fetch — even
+  // if another repo's writer is mid-transaction, this repo's shas are disjoint.
   const existingShas = await store.getCommitShasByRepo(repoId)
-  const detailBySha = new Map()
-  // Commits are immutable: skip re-writing SHAs already ingested. `__detail` /
-  // `__checks` come inline with the bulk fetch, so there is no per-commit fetch.
-  for (const raw of rawCommits) {
-    if (raw.sha && !existingShas.has(raw.sha)) {
-      detailBySha.set(raw.sha, raw.__detail)
-    }
-  }
 
-  // Anchor the watermark on the max committer date actually seen (robust to
-  // local/GitHub clock skew), not the local sync-start clock.
-  // ONE transaction writes commits, authors AND their check runs together — a
-  // single durable fsync.
-  let maxCommitAt = null
-  await store.transaction(async () => {
-    for (const raw of rawCommits) {
-      if (!raw.sha || existingShas.has(raw.sha)) continue
-      for (const rawCheck of raw.__checks ?? []) {
-        await store.upsertCheckRun(mapCheckRun(rawCheck, repoId, raw.sha, now))
-      }
-    }
-    for (const raw of rawCommits) {
-      const commitData0 = raw.commit ?? {}
-      const committedAt = commitData0.committer?.date ?? commitData0.author?.date
-      if (committedAt && (maxCommitAt === null || committedAt > maxCommitAt)) {
-        maxCommitAt = committedAt
-      }
-      // Already-ingested commit: watermark above still accounts for it, but its
-      // rows are immutable and present, so skip the redundant re-writes.
-      if (raw.sha && existingShas.has(raw.sha)) continue
-      // Upsert author identity BEFORE the commit row — the commits table has
-      // author_identity_id TEXT NOT NULL REFERENCES identities(id).
-      const login = raw.author?.login
-      const commitData = raw.commit ?? {}
-      const authorData = commitData.author ?? {}
-      const authorEmail = authorData.email ?? 'unknown'
-      if (login) {
-        await store.upsertIdentity(mapIdentityFromLogin(login, now))
-      } else {
-        // No login in raw; ensure an email-based identity exists for the FK.
-        await store.upsertIdentity(mapIdentityFromEmail(authorEmail, now))
-      }
-
-      const commit = mapCommit(raw, repoId, now, detailBySha.get(raw.sha))
-      await store.upsertCommit(commit)
-
-      // CommitAuthor record for co-authorship tracking
-      if (login) {
-        const identity = mapIdentityFromLogin(login, now)
-        const commitAuthor = {
-          repoId,
-          sha: commit.sha,
-          identityId: identity.id,
-          role: 'author',
-          source: 'api',
-        }
-        await store.upsertCommitAuthor(commitAuthor)
-      }
-
-      // Co-author trailer parsing (SPEC §6.1 commit_authors)
-      const message = raw.commit?.message ?? ''
-      const coAuthors = parseCoAuthors(message)
-      for (const ca of coAuthors) {
-        const caIdentity = mapIdentityFromEmail(ca.email, now)
-        await store.upsertIdentity(caIdentity)
-        const caRecord = {
-          repoId,
-          sha: commit.sha,
-          identityId: caIdentity.id,
-          role: 'co_author',
-          source: 'trailer',
-        }
-        await store.upsertCommitAuthor(caRecord)
-      }
-    }
-  })
-
-  // Persist commits watermark anchored on the max committer date seen (with the
-  // overlap margin applied on the next read). When NO commits were processed
-  // (e.g. a transient empty list), keep the PRIOR watermark rather than jumping
-  // to local now — advancing past unseen commits would skip them forever, since
-  // GitHub's `since` filter would exclude them on the next incremental run.
-  await store.putSyncState(
-    buildSyncState(
-      'github',
-      'commits',
-      repoId,
-      null,
-      maxCommitAt ?? priorCommitWatermark ?? now,
-      now,
-      'idle',
-      null,
-    ),
-  )
-
-  // ---- Pull requests ----
-  // Incremental mode uses the prs watermark to fetch only changed PRs (and stop
-  // pagination early) instead of re-paginating the entire PR history each cycle.
+  // ---- Pull requests ---- (fetch only)
   let prsSince
   let priorPrWatermark = null
   if (mode === 'incremental') {
@@ -281,15 +226,11 @@ async function syncRepo(store, client, repo, mode, now) {
       ? subtractMinutes(prCursor.watermarkAt, INCREMENTAL_OVERLAP_MINUTES)
       : undefined
   }
-  // BULK GraphQL: one paginated query returns every PR WITH its reviews,
-  // comments, changed files and head check runs nested inline — replacing the
-  // REST PR list + the per-PR reviews/comments/files/check-runs N+1 (4 REST
-  // calls PER pr). File complexity (base/head blobs) is still fetched per PR,
-  // but CONCURRENTLY, and via the batched GraphQL blob query. Writes stay
-  // sequential + per-PR transactional (SQLite is single-writer).
   const prs = await client.fetchPullRequests(owner, name, prsSince)
-  // Repo-wide complexity: collect every PR's changed-code files and fetch all
-  // needed blobs in ONE chunked GraphQL call (instead of one call per PR).
+  // Repo-wide complexity: blobs are fetched here (network), persistence is
+  // deferred to the writer. fetchPrComplexityBatch also does store.hasFileComplexity
+  // reads to skip already-ingested (repoId,sha,path) tuples — those are
+  // single-row indexed reads, safe under concurrent fetch.
   let complexities
   try {
     complexities = await fetchPrComplexityBatch(
@@ -319,33 +260,165 @@ async function syncRepo(store, client, repo, mode, now) {
       rows: [],
     }))
   }
+
+  // ---- Deployments ---- (fetch only)
+  const deployCursor =
+    mode === 'incremental' ? await store.getSyncState('github', 'deployments', repoId) : null
+  const priorDeployWatermark = deployCursor?.watermarkAt ?? null
+  const ghDeploys = await client.fetchDeployments(owner, name)
+  // D9 priority 2: releases → deployments when no deployments_api signal. The
+  // releases list is the only conditional network call — fetch it now (cheap)
+  // so the write phase is pure persistence.
+  const rawReleases = ghDeploys.length === 0 ? await client.listReleases(owner, name) : []
+
+  return {
+    rawCommits,
+    existingShas,
+    priorCommitWatermark,
+    prs,
+    complexities,
+    priorPrWatermark,
+    ghDeploys,
+    rawReleases,
+    priorDeployWatermark,
+  }
+}
+
+/**
+ * Phase B — WRITE. Persists one repo's payload. MUST run serially across repos
+ * (BunSqliteStore is a single synchronous connection — never two concurrent
+ * transactions). The caller (syncGitHub) iterates write phases one at a time.
+ */
+async function writeRepoPayload(store, repo, payload, now) {
+  const repoId = repo.id
+  const {
+    rawCommits,
+    existingShas,
+    priorCommitWatermark,
+    prs,
+    complexities,
+    priorPrWatermark,
+    ghDeploys,
+    rawReleases,
+    priorDeployWatermark,
+  } = payload
+
+  // ---- Commits ----
+  // Anchor the watermark on the max committer date actually seen (robust to
+  // local/GitHub clock skew), not the local sync-start clock. ONE transaction
+  // writes commits, authors AND their check runs together — a single durable
+  // fsync.
+  const detailBySha = new Map()
+  for (const raw of rawCommits) {
+    if (raw.sha && !existingShas.has(raw.sha)) detailBySha.set(raw.sha, raw.__detail)
+  }
+  let maxCommitAt = null
+  await store.transaction(async () => {
+    for (const raw of rawCommits) {
+      if (!raw.sha || existingShas.has(raw.sha)) continue
+      for (const rawCheck of raw.__checks ?? []) {
+        await store.upsertCheckRun(mapCheckRun(rawCheck, repoId, raw.sha, now))
+      }
+    }
+    for (const raw of rawCommits) {
+      const commitData0 = raw.commit ?? {}
+      const committedAt = commitData0.committer?.date ?? commitData0.author?.date
+      if (committedAt && (maxCommitAt === null || committedAt > maxCommitAt)) {
+        maxCommitAt = committedAt
+      }
+      if (raw.sha && existingShas.has(raw.sha)) continue
+      const login = raw.author?.login
+      const commitData = raw.commit ?? {}
+      const authorData = commitData.author ?? {}
+      const authorEmail = authorData.email ?? 'unknown'
+      if (login) {
+        await store.upsertIdentity(mapIdentityFromLogin(login, now))
+      } else {
+        await store.upsertIdentity(mapIdentityFromEmail(authorEmail, now))
+      }
+
+      const commit = mapCommit(raw, repoId, now, detailBySha.get(raw.sha))
+      await store.upsertCommit(commit)
+
+      if (login) {
+        const identity = mapIdentityFromLogin(login, now)
+        const commitAuthor = {
+          repoId,
+          sha: commit.sha,
+          identityId: identity.id,
+          role: 'author',
+          source: 'api',
+        }
+        await store.upsertCommitAuthor(commitAuthor)
+      }
+
+      const message = raw.commit?.message ?? ''
+      const coAuthors = parseCoAuthors(message)
+      for (const ca of coAuthors) {
+        const caIdentity = mapIdentityFromEmail(ca.email, now)
+        await store.upsertIdentity(caIdentity)
+        const caRecord = {
+          repoId,
+          sha: commit.sha,
+          identityId: caIdentity.id,
+          role: 'co_author',
+          source: 'trailer',
+        }
+        await store.upsertCommitAuthor(caRecord)
+      }
+    }
+  })
+
+  await store.putSyncState(
+    buildSyncState(
+      'github',
+      'commits',
+      repoId,
+      null,
+      maxCommitAt ?? priorCommitWatermark ?? now,
+      now,
+      'idle',
+      null,
+    ),
+  )
+
+  // ---- Pull requests ----
+  // Batch PR writes in chunks under an OUTER transaction so a chunk lands as
+  // ONE WAL fsync instead of one per PR (~N× fewer fsyncs over the loop).
+  // Re-entrancy: writePr does not itself open a transaction today, but any
+  // store.transaction() it (or its callees) might add will join this outer
+  // bracket via BunSqliteStore's _inTransaction guard — single connection,
+  // never two concurrent transactions. Tradeoff: a throw mid-chunk rolls back
+  // the whole chunk; idempotent upserts + watermark logic make a re-sync
+  // converge to identical state.
+  const PR_WRITE_CHUNK = 25
   let maxPrUpdatedAt = null
-  for (let i = 0; i < prs.length; i++) {
-    const p = prs[i]
-    const u = p.rawPr.updated_at
-    if (u && (maxPrUpdatedAt === null || u > maxPrUpdatedAt)) maxPrUpdatedAt = u
-    // One transaction per PR so its reviews/comments writes are one durable
-    // commit instead of one WAL fsync per row.
-    await store.transaction(() =>
-      writePr(
-        store,
-        p.rawPr,
-        {
-          rawReviews: p.reviews,
-          rawComments: p.comments,
-          rawFiles: p.files,
-          headChecks: p.headChecks,
-          headSha: p.headSha,
-          complexity: complexities[i],
-        },
-        repoId,
-        repo.defaultBranch,
-        now,
-      ),
-    )
+  for (let chunkStart = 0; chunkStart < prs.length; chunkStart += PR_WRITE_CHUNK) {
+    const chunkEnd = Math.min(chunkStart + PR_WRITE_CHUNK, prs.length)
+    await store.transaction(async () => {
+      for (let i = chunkStart; i < chunkEnd; i++) {
+        const p = prs[i]
+        const u = p.rawPr.updated_at
+        if (u && (maxPrUpdatedAt === null || u > maxPrUpdatedAt)) maxPrUpdatedAt = u
+        await writePr(
+          store,
+          p.rawPr,
+          {
+            rawReviews: p.reviews,
+            rawComments: p.comments,
+            rawFiles: p.files,
+            headChecks: p.headChecks,
+            headSha: p.headSha,
+            complexity: complexities[i],
+          },
+          repoId,
+          repo.defaultBranch,
+          now,
+        )
+      }
+    })
   }
 
-  // Keep the prior watermark when no PRs were processed (see commits rationale).
   await store.putSyncState(
     buildSyncState(
       'github',
@@ -360,20 +433,9 @@ async function syncRepo(store, client, repo, mode, now) {
   )
 
   // ---- Deployments (priority chain D9) ----
-  const deployCursor =
-    mode === 'incremental' ? await store.getSyncState('github', 'deployments', repoId) : null
-  const priorDeployWatermark = deployCursor?.watermarkAt ?? null
-  // GraphQL returns each deployment's outcome INLINE via `latestStatus`,
-  // collapsing the REST list + per-deployment status sub-resource N+1 (one extra
-  // REST call PER deployment) into O(pages) queries. The outcome is essential:
-  // the REST LIST carries none, so without it every deploy defaulted to 'success'
-  // and DORA change-failure / frequency were wrong.
-  const ghDeploys = await client.fetchDeployments(owner, name)
   let maxDeployUpdatedAt = null
   await store.transaction(async () => {
     for (const node of ghDeploys) {
-      // databaseId is non-null on Deployment per GitHub's schema, but guard so a
-      // malformed node can never collapse to the literal id "null" and collide.
       if (node.databaseId == null) continue
       const u = node.updatedAt ?? node.createdAt
       if (u && (maxDeployUpdatedAt === null || u > maxDeployUpdatedAt)) maxDeployUpdatedAt = u
@@ -381,18 +443,15 @@ async function syncRepo(store, client, repo, mode, now) {
     }
   })
 
-  // Releases → deployments if no deployments_api signal (D9 priority 2).
+  // Releases → deployments (D9 priority 2). Releases were fetched in phase A.
   if (ghDeploys.length === 0) {
-    const rawReleases = await client.listReleases(owner, name)
     for (const rawRelease of rawReleases) {
       const deploy = mapReleaseAsDeployment(rawRelease, repoId, now)
       await store.upsertDeployment(deploy)
     }
   }
 
-  // Merge-to-default-branch proxy (D9 priority 4) — create a proxy deployment
-  // for each merged PR targeting the default branch when no other signal exists.
-  // Reuse the PR list already fetched above rather than re-paginating it.
+  // Merge-to-default-branch proxy (D9 priority 4).
   if (ghDeploys.length === 0) {
     for (const { rawPr } of prs) {
       const mergedAt = rawPr.merged_at
@@ -783,6 +842,12 @@ function mapPrFile(raw, prId, repoId, now) {
     haloc,
     status: raw.status ?? 'modified',
     patch: patch !== undefined && patch !== null ? scrubFreeText(patch) : null,
+    // Persist the generated/vendored classification at ingest. Read-time metrics
+    // filter on this column so lockfiles / .min.js / vendor/** never enter the
+    // authored-code numerator. Computed from the path against the SAME default
+    // glob set computeHaloc uses, so the in-diff `generatedHaloc` bucket and the
+    // per-file `is_generated` flag never disagree on the same path.
+    isGenerated: classifyIsGenerated(path),
     createdAt: now,
     updatedAt: now,
   }
@@ -816,7 +881,12 @@ function mapCheckRun(raw, repoId, headSha, now) {
 }
 
 function mapIdentityFromLogin(login, now) {
-  const isBot = login.endsWith('[bot]')
+  // Catch GitHub-App-shaped logins (e.g. graphite-app, detail-app, greptile-apps)
+  // at first-ingest so they never enter the human cohort even briefly. The
+  // post-ingest resolveIdentities pass re-applies this with the richer `type`
+  // signal from the raw payload — both must agree, or a row could briefly read
+  // human at write time.
+  const isBot = isLikelyBotLogin(login)
   return {
     id: buildIdentityId('github_login', login),
     personId: null,

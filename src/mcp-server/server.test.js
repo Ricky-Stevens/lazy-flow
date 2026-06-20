@@ -18,6 +18,9 @@
  */
 
 import { describe, expect, it } from 'bun:test'
+import { rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import { BunSqliteStore, ENGINE_VERSION, migrate } from '../core/index.js'
@@ -57,6 +60,37 @@ async function makeConnectedPair() {
   return { client, ctx }
 }
 
+/**
+ * Connected pair backed by an ON-DISK DB so query_db routes through the isolated
+ * child-process (subprocess) path — the only path with a hard SIGKILL timeout.
+ * Returns a `cleanup()` that closes the store and removes the temp files.
+ */
+async function makeOnDiskConnectedPair({ queryDbTimeoutMs } = {}) {
+  const dbPath = join(tmpdir(), `lazyflow-querydb-${process.pid}-${crypto.randomUUID()}.db`)
+  const store = new BunSqliteStore(dbPath)
+  migrate(store.db)
+  const config = { ...loadConfig(), dbPath, queryDbTimeoutMs }
+  const ctx = { config, store, githubClient: null, jiraClient: null }
+
+  const server = createServer(ctx)
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+  await server.connect(serverTransport)
+  const client = new Client({ name: 'test-client', version: '0.0.0' })
+  await client.connect(clientTransport)
+
+  const cleanup = () => {
+    try {
+      store.db.close()
+    } catch {
+      // best-effort
+    }
+    for (const suffix of ['', '-wal', '-shm']) {
+      rmSync(`${dbPath}${suffix}`, { force: true })
+    }
+  }
+  return { client, ctx, cleanup }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -70,6 +104,7 @@ describe('MCP server — bootstrap', () => {
 
     const expected = [
       'backfill_pr_patches',
+      'data_overview',
       'doctor',
       'explain_metric',
       'export',
@@ -194,6 +229,27 @@ describe('MCP server — tool: explain_metric', () => {
     expect(sc.found).toBe(true)
     // Should mention SonarSource rules
     expect(sc.formula_doc).toContain('SonarSource')
+  })
+
+  it('resolves FULLY-QUALIFIED metric ids (the ids the other tools emit)', async () => {
+    // Regression: the curated short-name table only had ~10 entries, so every
+    // qualified id a user gets back from get_dora/get_flow/get_person_report
+    // (dora.*, flow.*, pr.*, code.*, agile.*, person.*) returned "not
+    // documented". They must resolve from the engine modules' own formulaDoc.
+    const { client } = await makeConnectedPair()
+    for (const metric of [
+      'dora.lead_time',
+      'flow.cycle_time',
+      'code.haloc_aggregate',
+      'agile.say_do',
+      'person.review_reciprocity',
+      'pr.review_bypass_rate_received',
+    ]) {
+      const result = await client.callTool({ name: 'explain_metric', arguments: { metric } })
+      const sc = result.structuredContent
+      expect(sc.found, metric).toBe(true)
+      expect(sc.formula_doc.length, metric).toBeGreaterThan(10)
+    }
   })
 })
 
@@ -480,6 +536,22 @@ describe('MCP server — tool: query_db', () => {
     expect(sc.truncated).toBe(true)
   })
 
+  it('bounds output by byte budget on a wide single row (no OOM)', async () => {
+    // Regression: max_rows caps row COUNT, not width. A single wide row could
+    // materialise hundreds of MB. The byte budget must truncate before the
+    // response balloons. randomblob(20MB) hex-expands to 40MB > the 16MB budget.
+    const { client } = await makeConnectedPair()
+    const result = await client.callTool({
+      name: 'query_db',
+      arguments: { sql: 'SELECT hex(randomblob(20000000)) AS big' },
+    })
+    const sc = result.structuredContent
+    // The over-budget row is dropped and the response is flagged truncated,
+    // rather than returning a 40MB string.
+    expect(sc.truncated).toBe(true)
+    expect(sc.row_count).toBe(0)
+  })
+
   it('rejects a non-SELECT (DML) statement', async () => {
     const { client } = await makeConnectedPair()
 
@@ -644,4 +716,98 @@ describe('MCP server — run_sync (no clients configured)', () => {
     expect(sc.jira.issues_upserted).toBe(0)
     expect(sc.jira.errors).toEqual([])
   })
+})
+
+describe('MCP server — tool: data_overview', () => {
+  it('returns per-repo / per-project counts and totals without raw SQL', async () => {
+    const { client, ctx } = await makeConnectedPair()
+    const now = '2026-01-01T00:00:00.000Z'
+
+    ctx.store.db
+      .prepare(
+        'INSERT INTO organisations (id, github_login, name, created_at, updated_at) VALUES (?,?,?,?,?)',
+      )
+      .run('org1', 'acme', 'Acme', now, now)
+    ctx.store.db
+      .prepare(
+        'INSERT INTO repositories (id, github_node_id, org_id, owner, name, default_branch, is_archived, is_fork, raw, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+      )
+      .run('repo1', 'node1', 'org1', 'acme', 'web', 'main', 0, 0, '{}', now, now)
+    ctx.store.db
+      .prepare(
+        'INSERT INTO identities (id, person_id, kind, external_id, raw, updated_at) VALUES (?,?,?,?,?,?)',
+      )
+      .run('id1', null, 'github_login', 'octocat', '{}', now)
+    ctx.store.db
+      .prepare(
+        'INSERT INTO pull_requests (id, repo_id, number, author_identity_id, state, head_ref, base_ref, created_at, updated_at, raw) VALUES (?,?,?,?,?,?,?,?,?,?)',
+      )
+      .run('repo1#1', 'repo1', 1, 'id1', 'merged', 'feature', 'main', now, now, '{}')
+    ctx.store.db
+      .prepare(
+        'INSERT INTO jira_projects (id, key, name, jira_cloud_id, raw, created_at, updated_at) VALUES (?,?,?,?,?,?,?)',
+      )
+      .run('proj1', 'BP', 'Big Project', 'cloud1', '{}', now, now)
+
+    const result = await client.callTool({ name: 'data_overview', arguments: {} })
+    const sc = result.structuredContent
+
+    expect(sc.error).toBeUndefined()
+    expect(sc.totals.repositories).toBe(1)
+    expect(sc.totals.pull_requests).toBe(1)
+    const repo = sc.repos.find((r) => r.repo === 'acme/web')
+    expect(repo).toBeDefined()
+    expect(repo.prs).toBe(1)
+    const proj = sc.jira_projects.find((p) => p.project === 'BP')
+    expect(proj).toBeDefined()
+    expect(proj.issues).toBe(0)
+  })
+})
+
+describe('MCP server — tool: query_db (on-disk, isolated)', () => {
+  it('runs a SELECT through the isolated child process and returns rows', async () => {
+    const { client, ctx, cleanup } = await makeOnDiskConnectedPair()
+    try {
+      ctx.store.db
+        .prepare(
+          'INSERT INTO persons (id, display_name, primary_account_ref, updated_at) VALUES (?,?,?,?)',
+        )
+        .run('p1', 'Disk Person', 'github:octocat', '2026-01-01T00:00:00.000Z')
+
+      const result = await client.callTool({
+        name: 'query_db',
+        arguments: { sql: 'SELECT display_name FROM persons WHERE id = ?', params: ['p1'] },
+      })
+      const sc = result.structuredContent
+      expect(sc.error).toBeUndefined()
+      expect(sc.row_count).toBe(1)
+      expect(sc.rows[0]?.display_name).toBe('Disk Person')
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('force-kills a runaway query at the timeout instead of hanging forever', async () => {
+    // The whole point: an unbounded query must NOT be able to wedge the server.
+    // A recursive CTE with no termination would run until the heat death of the
+    // universe in-process; here it is SIGKILL'd at the (short, test-only) limit.
+    const { client, cleanup } = await makeOnDiskConnectedPair({ queryDbTimeoutMs: 1500 })
+    try {
+      const started = Date.now()
+      const result = await client.callTool({
+        name: 'query_db',
+        arguments: {
+          sql: 'WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c) SELECT count(*) FROM c',
+        },
+      })
+      const elapsed = Date.now() - started
+      const sc = result.structuredContent
+      expect(typeof sc.error).toBe('string')
+      expect(sc.error).toMatch(/exceeded|aborted|limit/i)
+      // Killed near the deadline, not run away for minutes/hours.
+      expect(elapsed).toBeLessThan(8000)
+    } finally {
+      cleanup()
+    }
+  }, 15000)
 })

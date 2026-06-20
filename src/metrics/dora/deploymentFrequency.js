@@ -1,4 +1,4 @@
-import { ENGINE_VERSION, safeRatio } from '../../core/index.js'
+import { ENGINE_VERSION, environmentMatches, safeRatio } from '../../core/index.js'
 
 /** Map deploys/day to a DORA 2025 band. */
 export function doraBandFromRate(deploysPerDay) {
@@ -26,7 +26,7 @@ export const deploymentFrequency = {
   compute(inputs, asOf) {
     const env = inputs.environment ?? 'production'
     const successDeploys = inputs.deploys.filter(
-      (d) => d.status === 'success' && d.environment === env,
+      (d) => d.status === 'success' && environmentMatches(d.environment, env),
     )
     const total = successDeploys.length
 

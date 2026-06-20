@@ -28,20 +28,43 @@
 // ── Default generated/vendored glob patterns ─────────────────────────────────
 
 const DEFAULT_GENERATED_GLOBS = [
+  // Lockfiles — pinned-dependency churn, never authored intent.
   '*-lock.json',
   'package-lock.json',
   'yarn.lock',
   'pnpm-lock.yaml',
   'bun.lockb',
+  'Gemfile.lock',
+  'Cargo.lock',
+  'composer.lock',
+  'poetry.lock',
+  'Pipfile.lock',
+  'go.sum',
+  // Build outputs / vendored trees — same intent: not authored on this PR.
   'dist/**',
+  'build/**',
+  'out/**',
   'vendor/**',
+  'third_party/**',
   'node_modules/**',
+  // Bundle blobs and WASM payloads emitted by webpack/rollup/esbuild/emscripten.
+  // The observed bad case `public/tesseract/tesseract-core-*.wasm.js` lives
+  // under public/ which is intentionally NOT blacklisted (some repos keep real
+  // source there) — the extension / .bundle / .chunk patterns catch it instead.
+  '*.wasm',
+  '*.wasm.js',
+  '*.bundle.js',
+  '*.chunk.js',
   '*.min.js',
   '*.min.css',
+  '*.map',
+  // Codegen markers (Protobuf/GRPC/Snapshot/etc.).
   '*.generated.*',
   '*.pb.go',
   '*.pb.ts',
   '*.snap',
+  '*_pb2.py',
+  '*_pb2_grpc.py',
 ]
 
 // ── Glob matching (minimal, no dependencies) ─────────────────────────────────
@@ -95,6 +118,18 @@ function globToRegExp(pattern) {
 function isGeneratedPath(path, extraGlobs) {
   const allGlobs = [...DEFAULT_GENERATED_GLOBS, ...extraGlobs]
   return allGlobs.some((g) => matchGlob(g, path))
+}
+
+/**
+ * Public helper: returns true if `path` matches the default generated/vendored
+ * glob set (plus any caller-supplied additions). Single source of truth used by
+ * both `computeHaloc` (per-file classification in a diff) AND the pr_files
+ * ingestion mapper (persists `is_generated` so the numerator-filtering metrics
+ * never have to re-derive the classification at read time).
+ */
+export function classifyIsGenerated(path, extraGlobs = []) {
+  if (typeof path !== 'string' || path.length === 0) return false
+  return isGeneratedPath(path, extraGlobs)
 }
 
 // ── Diff parser ───────────────────────────────────────────────────────────────
@@ -205,6 +240,14 @@ function parseDiff(diff, wsInsensitive) {
 export function computeHaloc(diff, options = {}) {
   const extraGlobs = options.additionalGeneratedGlobs ?? []
   const wsInsensitive = options.whitespaceSensitive === false
+
+  // A null/undefined/non-string diff (e.g. a PR file whose patch was never
+  // ingested — common after the GraphQL migration leaves pr_files.patch NULL)
+  // must contribute zero HALOC, NOT throw. parseDiff does `diff.replace(...)`
+  // which would TypeError on null and crash the whole halocAggregate run.
+  if (typeof diff !== 'string' || diff.length === 0) {
+    return { haloc: 0, binaryHaloc: 0, generatedHaloc: 0, files: [] }
+  }
 
   const parsedFiles = parseDiff(diff, wsInsensitive)
 

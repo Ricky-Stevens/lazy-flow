@@ -48,6 +48,9 @@ export {
   COMPUTE_METRIC_IDS,
   computeMetric,
   computePersonReportLive,
+  invalidateLookupsCache,
+  knownMetricIds,
+  metricFormulaDoc,
 } from './compute/index.js'
 // Group A — DORA
 

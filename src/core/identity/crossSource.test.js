@@ -267,6 +267,167 @@ describe('stitchCrossSource', () => {
     expect(second.queued).toBe(0)
   })
 
+  // ---------------------------------------------------------------------------
+  // FIX 4: tighter auto-merge bars
+  // ---------------------------------------------------------------------------
+
+  it('FIX 4a: behaviour-only signal (no name, no email) now QUEUES instead of auto-merging', async () => {
+    // GitHub person whose login/name shares no tokens with the Jira target,
+    // but whose PRs link to that Jira person's tickets 6 out of 8 times
+    // (share = 0.75, count = 6 — would previously satisfy STRONG behaviour
+    // and auto-merge at conf 0.85). Now it must land in the queue.
+    const store = freshStore()
+    await seedScaffold(store)
+    // GitHub person — neutral handle, no name overlap with the Jira target.
+    await addPerson(store, 'p-ghx', 'octohandle', 'gh:9001')
+    await addIdentity(
+      store,
+      'p-ghx',
+      'github_login',
+      'octohandle',
+      '{"login":"octohandle","id":9001}',
+    )
+    // Jira target — completely distinct name.
+    await addPerson(store, 'p-jirax', 'jira-target', 'jira:jira-target')
+    await addIdentity(
+      store,
+      'p-jirax',
+      'jira_account',
+      'jira-target',
+      '{"accountId":"jira-target","displayName":"Distant Stranger"}',
+    )
+    // 6 of 8 PRs link to tickets assigned to jira-target.
+    for (let i = 1; i <= 6; i++) {
+      await addPr(store, `pr-bx-${i}`, buildIdentityId('github_login', 'octohandle'))
+      await addIssue(store, `iss-bx-${i}`, buildIdentityId('jira_account', 'jira-target'))
+      await link(store, `pr-bx-${i}`, `iss-bx-${i}`)
+    }
+    // 2 noise links to a different Jira person (so share = 6/8 = 0.75, not 1.0).
+    await addPerson(store, 'p-noise', 'jira-noise', 'jira:jira-noise')
+    await addIdentity(
+      store,
+      'p-noise',
+      'jira_account',
+      'jira-noise',
+      '{"accountId":"jira-noise","displayName":"Noise Person"}',
+    )
+    for (let i = 7; i <= 8; i++) {
+      await addPr(store, `pr-bx-${i}`, buildIdentityId('github_login', 'octohandle'))
+      await addIssue(store, `iss-bx-${i}`, buildIdentityId('jira_account', 'jira-noise'))
+      await link(store, `pr-bx-${i}`, `iss-bx-${i}`)
+    }
+
+    const res = await stitchCrossSource(store, { now: NOW })
+    expect(res.autoMerged).toBe(0)
+    expect(res.queued).toBeGreaterThanOrEqual(1)
+
+    // The Jira target stays its own person — NOT silently merged into octohandle.
+    const jiraTargetPerson = await personIdOfIdentity(
+      store,
+      buildIdentityId('jira_account', 'jira-target'),
+    )
+    expect(jiraTargetPerson).toBe('p-jirax')
+
+    // A pending candidate must exist for the (octohandle, jira-target) pair.
+    const matches = await store.getCandidateMatches()
+    const pending = matches.find(
+      (m) =>
+        m.status === 'pending' &&
+        m.reason === 'xsrc_behavioral' &&
+        (m.identityIdA === buildIdentityId('github_login', 'octohandle') ||
+          m.identityIdB === buildIdentityId('github_login', 'octohandle')),
+    )
+    expect(pending).toBeTruthy()
+  })
+
+  it('FIX 4b: name+behaviour with count below the new floor (3) queues instead of auto-merging', async () => {
+    // Alex with only 3 corroborating PRs — used to clear the old count≥2 floor;
+    // must now land in the queue at count<5.
+    const store = freshStore()
+    await seedScaffold(store)
+    await addPerson(store, 'p-alex-gh', 'alex-barnes-IPH', 'gh:111')
+    await addIdentity(
+      store,
+      'p-alex-gh',
+      'github_login',
+      'alex-barnes-IPH',
+      '{"login":"alex-barnes-IPH","id":111}',
+    )
+    await addPerson(store, 'p-alex-jira', 'jira-alex', 'jira:jira-alex')
+    await addIdentity(
+      store,
+      'p-alex-jira',
+      'jira_account',
+      'jira-alex',
+      '{"accountId":"jira-alex","displayName":"Alex Barnes"}',
+    )
+    for (let i = 1; i <= 3; i++) {
+      await addPr(store, `pr-alex-${i}`, buildIdentityId('github_login', 'alex-barnes-IPH'))
+      await addIssue(store, `iss-alex-${i}`, buildIdentityId('jira_account', 'jira-alex'))
+      await link(store, `pr-alex-${i}`, `iss-alex-${i}`)
+    }
+
+    const res = await stitchCrossSource(store, { now: NOW })
+    // Alex must NOT auto-merge at 3 corroborating PRs — drop to the queue.
+    expect(res.autoMerged).toBe(0)
+    expect(res.queued).toBeGreaterThanOrEqual(1)
+    const jiraAlexPerson = await personIdOfIdentity(
+      store,
+      buildIdentityId('jira_account', 'jira-alex'),
+    )
+    expect(jiraAlexPerson).toBe('p-alex-jira')
+  })
+
+  it('FIX 4b: name+behaviour with count at the new floor (5) DOES auto-merge', async () => {
+    // Mirror of the above but with 5 PRs — should auto-merge the same way the
+    // existing seedTeam Alex case already does. This pins the boundary.
+    const store = freshStore()
+    await seedScaffold(store)
+    await addPerson(store, 'p-alex-gh', 'alex-barnes-IPH', 'gh:111')
+    await addIdentity(
+      store,
+      'p-alex-gh',
+      'github_login',
+      'alex-barnes-IPH',
+      '{"login":"alex-barnes-IPH","id":111}',
+    )
+    await addPerson(store, 'p-alex-jira', 'jira-alex', 'jira:jira-alex')
+    await addIdentity(
+      store,
+      'p-alex-jira',
+      'jira_account',
+      'jira-alex',
+      '{"accountId":"jira-alex","displayName":"Alex Barnes"}',
+    )
+    for (let i = 1; i <= 5; i++) {
+      await addPr(store, `pr-alex-${i}`, buildIdentityId('github_login', 'alex-barnes-IPH'))
+      await addIssue(store, `iss-alex-${i}`, buildIdentityId('jira_account', 'jira-alex'))
+      await link(store, `pr-alex-${i}`, `iss-alex-${i}`)
+    }
+
+    const res = await stitchCrossSource(store, { now: NOW })
+    expect(res.autoMerged).toBeGreaterThanOrEqual(1)
+    const jiraAlexPerson = await personIdOfIdentity(
+      store,
+      buildIdentityId('jira_account', 'jira-alex'),
+    )
+    expect(jiraAlexPerson).toBe('p-alex-gh')
+  })
+
+  it('FIX 4: email-based auto-merge is unchanged (safe tier preserved)', async () => {
+    // Reuses the existing seedTeam setup — Ricky has matching emails on both
+    // sides and must still deterministically auto-merge at confidence 1.0.
+    const store = freshStore()
+    await seedTeam(store)
+    const res = await stitchCrossSource(store, { now: NOW })
+    expect(res.autoMerged).toBeGreaterThanOrEqual(1)
+    const jiraRickyPerson = await personIdOfIdentity(
+      store,
+      buildIdentityId('jira_account', 'jira-ricky'),
+    )
+    expect(jiraRickyPerson).toBe('p-ricky-gh')
+  })
+
   it('respects a prior rejection — a rejected pair is never re-merged', async () => {
     const store = freshStore()
     await seedScaffold(store)

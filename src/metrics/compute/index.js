@@ -1,4 +1,4 @@
-import { ENGINE_VERSION, percentile } from '../../core/index.js'
+import { ENGINE_VERSION, isProductionEnv, percentile } from '../../core/index.js'
 
 import { estimationAccuracy, sayDo, sprintPredictability, sprintVelocity } from '../agile/index.js'
 import {
@@ -239,6 +239,73 @@ async function resolveOrgId(store) {
 }
 
 /**
+ * Bulk-load globally-window-INDEPENDENT lookups used across every metric and
+ * day of the backfill — pr_refs, file_complexity, and the current status
+ * category per status. Returns three maps:
+ *   - prRefById               : prId → { repoId, baseSha, headSha }
+ *   - fileComplexityByKey     : fcKey(repoId,sha,path) → { language, loc, totalCyclomatic, functionCount, functions }
+ *   - statusCategoryById      : statusId → 'new' | 'indeterminate' | 'done'
+ *
+ * These eliminate three N+1 patterns from the snapshot backfill:
+ *   1. complexity_delta            — getPrRef + getFileComplexity per PR×file×day
+ *   2. maintainability_index       — same pair, per PR×file×day
+ *   3. buildStatusBoundaries       — getStatusCategory per status × metric × day
+ *
+ * Attached to BOTH `loadFullScopeData` and `loadScopeDataWindowed` so the
+ * equivalence oracle continues to compute identical values.
+ */
+// Per-store memo: window-INDEPENDENT global lookups don't change between window
+// slices in a backfill or between the cohort load and trend load of a person
+// report. WeakMap keys on the store instance so test stores GC normally and
+// production stores share one lookup-load across every call inside a run.
+// Tests / callers that need to force a re-read can `delete store.__lookupsMemo`
+// or use a fresh store; we attach the promise (not the value) so concurrent
+// callers de-dupe instead of racing duplicate scans.
+const GLOBAL_LOOKUPS_MEMO = new WeakMap()
+async function loadGlobalLookups(store) {
+  let p = GLOBAL_LOOKUPS_MEMO.get(store)
+  if (!p) {
+    p = (async () => {
+      const [prRefs, fcRows, statusCategoryById] = await Promise.all([
+        store.getAllPrRefs(),
+        store.getAllFileComplexity(),
+        store.getCurrentStatusCategories(),
+      ])
+      const prRefById = new Map()
+      for (const ref of prRefs) {
+        prRefById.set(ref.prId, {
+          repoId: ref.repoId,
+          baseSha: ref.baseSha,
+          headSha: ref.headSha,
+        })
+      }
+      const fileComplexityByKey = new Map()
+      for (const fc of fcRows) {
+        fileComplexityByKey.set(fcKey(fc.repoId, fc.sha, fc.path), {
+          language: fc.language,
+          loc: fc.loc,
+          totalCyclomatic: fc.totalCyclomatic,
+          functionCount: fc.functionCount,
+          functions: fc.functions,
+        })
+      }
+      return { prRefById, fileComplexityByKey, statusCategoryById }
+    })()
+    GLOBAL_LOOKUPS_MEMO.set(store, p)
+  }
+  return p
+}
+
+/**
+ * Drop the per-store memo for window-independent lookups. Call after a sync
+ * (writes that mutate pr_refs / file_complexity / status_category_history)
+ * so the next compute reads the fresh state. Cheap — just a WeakMap delete.
+ */
+export function invalidateLookupsCache(store) {
+  GLOBAL_LOOKUPS_MEMO.delete(store)
+}
+
+/**
  * Load all the team/org-scoped entities for the window, once.
  * Window applies to PRs (createdAt), deploys (createdAt), commits (authoredAt),
  * check runs (completedAt/startedAt). Issues + transitions are loaded whole.
@@ -324,6 +391,12 @@ export async function loadFullScopeData(store) {
   }
   const transitionsByIssue = groupBy(await store.getAllIssueTransitions(), (t) => t.issueId)
 
+  // Window-INDEPENDENT global lookups (pr_refs, file_complexity, status
+  // category-by-id). Attached to the scope data so per-metric code can read
+  // them as in-memory maps instead of point-querying inside per-PR/per-file
+  // loops on every day of the backfill.
+  const lookups = await loadGlobalLookups(store)
+
   return {
     repos,
     prsByRepo,
@@ -337,6 +410,9 @@ export async function loadFullScopeData(store) {
     issuesByProject,
     transitionsByIssue,
     botIdentityIds,
+    prRefById: lookups.prRefById,
+    fileComplexityByKey: lookups.fileComplexityByKey,
+    statusCategoryById: lookups.statusCategoryById,
   }
 }
 
@@ -390,7 +466,15 @@ export function sliceScopeData(full, windowFrom, windowTo) {
         prFilesByPr.set(pr.id, files)
       }
       if (pr.createdAt <= priorUntilIso) {
-        for (const f of files) priorHaloc += f.haloc
+        // Filter generated/vendored files so the prior-window HALOC term matches
+        // the generated-filter applied to the window numerator (totalWindowHaloc).
+        // Without this, Nagappan-Ball M1 = haloc/(priorHaloc+haloc) divides an
+        // authored-only numerator by a denominator polluted with lockfile/.min.js
+        // churn, understating relative churn by an arbitrary factor.
+        for (const f of files) {
+          if (f.isGenerated) continue
+          priorHaloc += f.haloc
+        }
       }
     }
 
@@ -443,6 +527,10 @@ export function sliceScopeData(full, windowFrom, windowTo) {
     botIdentityIds: full.botIdentityIds,
     prFilesByPr,
     priorHaloc,
+    // Window-independent lookups — passed through verbatim from the bulk load.
+    prRefById: full.prRefById,
+    fileComplexityByKey: full.fileComplexityByKey,
+    statusCategoryById: full.statusCategoryById,
   }
 }
 
@@ -491,7 +579,12 @@ export async function loadScopeDataWindowed(store, windowFrom, windowTo) {
 
     const priorUntilIso = new Date(fromMs - 1).toISOString()
     const repoPriorFiles = await store.getPrFilesByRepo(repo.id, undefined, priorUntilIso)
-    for (const f of repoPriorFiles) priorHaloc += f.haloc
+    // Filter generated/vendored files to match the window numerator's filter
+    // (totalWindowHaloc) — see the parallel loop above for why.
+    for (const f of repoPriorFiles) {
+      if (f.isGenerated) continue
+      priorHaloc += f.haloc
+    }
 
     deploys.push(...(await store.getDeploymentsByRepo(repo.id, fromIso, toIso)))
 
@@ -529,6 +622,12 @@ export async function loadScopeDataWindowed(store, windowFrom, windowTo) {
     }
   }
 
+  // Window-INDEPENDENT global lookups — attached here too so the oracle path
+  // (computeMetric called with `preloaded = await loadScopeDataWindowed(...)`)
+  // computes identical values to the bulk slice path. The equivalence test
+  // depends on this.
+  const lookups = await loadGlobalLookups(store)
+
   return {
     prs,
     reviewsByPr,
@@ -542,6 +641,9 @@ export async function loadScopeDataWindowed(store, windowFrom, windowTo) {
     botIdentityIds,
     prFilesByPr,
     priorHaloc,
+    prRefById: lookups.prRefById,
+    fileComplexityByKey: lookups.fileComplexityByKey,
+    statusCategoryById: lookups.statusCategoryById,
   }
 }
 
@@ -562,10 +664,16 @@ function toPrInput(pr, files) {
   let haloc = 0
   let hasFiles = false
   for (const f of files ?? []) {
+    hasFiles = true
+    // Skip generated/vendored/lockfile/minified files. They are persisted with
+    // is_generated=1 by the ingest mapper. pr.size, code.haloc_aggregate, and
+    // code.change_impact all derive their authored-volume from this aggregate,
+    // so the filter has to happen once HERE rather than per-metric. Robust to
+    // 0/1/true/false/undefined (older rows pre-migration default to authored).
+    if (f.isGenerated) continue
     additions += f.additions
     deletions += f.deletions
     haloc += f.haloc
-    hasFiles = true
   }
   return {
     id: pr.id,
@@ -679,10 +787,18 @@ async function buildStatusBoundaries(store, data) {
     }
   }
 
+  // PERF: getStatusCategory is global (no `at`), so the bulk loader stashes a
+  // statusId→category map onto `data` once per backfill. Reading from the map
+  // collapses ~|statusIds| × (metric × day) point queries to zero. Defensive
+  // fallback to the per-status async query for callers that build `data`
+  // without the map.
+  const statusCategoryById = data.statusCategoryById
   const startedIds = new Set()
   const doneIds = new Set()
   for (const statusId of statusIds) {
-    const category = await store.getStatusCategory(statusId)
+    const category = statusCategoryById
+      ? (statusCategoryById.get(statusId) ?? null)
+      : await store.getStatusCategory(statusId)
     if (category === 'indeterminate') startedIds.add(statusId)
     else if (category === 'done') doneIds.add(statusId)
   }
@@ -748,6 +864,26 @@ function weeklyThroughputSamples(issues, doneStatusIds, fromMs, toMs) {
     buckets[idx] = (buckets[idx] ?? 0) + 1
   }
   return buckets
+}
+
+/**
+ * The team's ACTIVE throughput span: the number of weeks from the first non-zero
+ * completion week to the last (inclusive). Interior zero weeks count (a real slow
+ * week is signal); leading/trailing zero-padding does not (the team did not exist
+ * or shipped nothing yet). Returns 0 when no week had any completions. This is the
+ * genuine observation count the Monte Carlo sample floor gates on, distinct from
+ * the padded weeklySamples.length (the full window width).
+ */
+function activeThroughputSpan(weeklySamples) {
+  let first = -1
+  let last = -1
+  for (let i = 0; i < weeklySamples.length; i++) {
+    if ((weeklySamples[i] ?? 0) > 0) {
+      if (first === -1) first = i
+      last = i
+    }
+  }
+  return first === -1 ? 0 : last - first + 1
 }
 
 /**
@@ -1091,11 +1227,19 @@ function buildCodeChanges(data) {
   return changes
 }
 
-/** Total HALOC across the window's pr_files (denormalised per-file haloc). */
+/**
+ * Total HALOC across the window's pr_files (denormalised per-file haloc),
+ * filtering generated/vendored files so lockfiles / .min.js / vendor blobs
+ * never enter the authored-code total. Mirrors the per-file filter that
+ * `toPrInput` applies for pr.size.
+ */
 function totalWindowHaloc(data) {
   let total = 0
   for (const files of data.prFilesByPr.values()) {
-    for (const f of files) total += f.haloc
+    for (const f of files) {
+      if (f.isGenerated) continue
+      total += f.haloc
+    }
   }
   return total
 }
@@ -1167,6 +1311,31 @@ const MODULES = {
   'person.convention_adherence': conventionAdherence,
   'pr.feedback_severity_mix_received': feedbackSeverityMix,
   'person.review_depth_mentorship': reviewDepthMentorship,
+}
+
+/**
+ * Public transparency lookup for `explain_metric`. Returns the engine module's
+ * own `formulaDoc` (and trustTier/scope) keyed by the FULLY-QUALIFIED metric id
+ * the get_* tools and schema guide use (e.g. 'dora.lead_time',
+ * 'code.haloc_aggregate', 'person.review_reciprocity'). Returns null for an
+ * unknown id so the caller can report `found: false` honestly. Sourcing the doc
+ * from the module — rather than a hand-maintained short-name table — keeps
+ * explain_metric in lockstep with what the engine actually computes and covers
+ * all wired metrics, not a curated subset.
+ */
+export function metricFormulaDoc(metricId) {
+  const mod = MODULES[metricId]
+  if (mod === undefined) return null
+  return {
+    formulaDoc: mod.formulaDoc ?? `Metric ${metricId} is wired but carries no formula doc.`,
+    trustTier: mod.trustTier ?? 'deterministic',
+    scope: mod.scope ?? 'team',
+  }
+}
+
+/** Every fully-qualified metric id the engine has a module for. */
+export function knownMetricIds() {
+  return Object.keys(MODULES)
 }
 
 /** Best-effort default unit for an unknown metric, derived from its id family. */
@@ -1265,7 +1434,7 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
       // returns no_data when there are zero prod deploys in the window.
       const { doneIds } = await buildStatusBoundaries(store, data)
       const deploys = data.deploys.map(toDeployRecord)
-      const prodDeploys = deploys.filter((d) => d.environment === 'production')
+      const prodDeploys = deploys.filter((d) => isProductionEnv(d.environment))
       const incidents = buildIncidents(
         data.issues,
         data.transitionsByIssue,
@@ -1287,7 +1456,7 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
       const { doneIds } = await buildStatusBoundaries(store, data)
       const prodDeploys = data.deploys
         .map(toDeployRecord)
-        .filter((d) => d.environment === 'production')
+        .filter((d) => isProductionEnv(d.environment))
       // Prefer REAL deployment-to-recovery time (failed→next-success deploy) from
       // ingested statuses; fall back to the proximity-linked incident set when no
       // failed deployment is observed. dataSource follows the signal actually used.
@@ -1313,7 +1482,7 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
       const { doneIds } = await buildStatusBoundaries(store, data)
       const prodDeploys = data.deploys
         .map(toDeployRecord)
-        .filter((d) => d.environment === 'production')
+        .filter((d) => isProductionEnv(d.environment))
       // dataSource 'proxy': derived from the proximity-linked incident set.
       const result = incidentReopenRate.compute(
         {
@@ -1335,7 +1504,7 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
       const { doneIds } = await buildStatusBoundaries(store, data)
       const prodDeploys = data.deploys
         .map(toDeployRecord)
-        .filter((d) => d.environment === 'production')
+        .filter((d) => isProductionEnv(d.environment))
       // dataSource 'proxy': derived from the proximity-linked incident set.
       const result = reliabilityProxy.compute(
         {
@@ -1363,7 +1532,7 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
       // honest available signal. Module returns no_data on zero prod deploys.
       const { doneIds } = await buildStatusBoundaries(store, data)
       const deploys = data.deploys.map(toDeployRecord)
-      const prodDeploys = deploys.filter((d) => d.environment === 'production')
+      const prodDeploys = deploys.filter((d) => isProductionEnv(d.environment))
       const incidents = buildIncidents(
         data.issues,
         data.transitionsByIssue,
@@ -1438,7 +1607,23 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
       const flowIssues = data.issues.map((i) =>
         toFlowIssueRecord(i, data.transitionsByIssue.get(i.id) ?? []),
       )
-      return wipLoad.compute({ issues: flowIssues, boardColumns, now, avgCycleTimeDays: null }, now)
+      // Derive the window cycle-time p50 (in days) so Little's-Law sanity-check
+      // and the stationarity guard actually fire — previously hardcoded null,
+      // which made the entire avgCycleTimeDays branch permanently dead.
+      const ctResult = cycleTime.compute(
+        {
+          issues: flowIssues,
+          boardColumns,
+          resolveFlowState: () => null,
+          windowStart: dayStartIso(windowFrom),
+          windowEnd: dayEndIso(windowTo),
+          now,
+        },
+        now,
+      )
+      const avgCycleTimeDays =
+        ctResult.p50Seconds !== null && ctResult.p50Seconds > 0 ? ctResult.p50Seconds / 86400 : null
+      return wipLoad.compute({ issues: flowIssues, boardColumns, now, avgCycleTimeDays }, now)
     }
 
     case 'flow.aging_wip': {
@@ -1512,12 +1697,19 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
       )
       const weeklySamples = weeklyThroughputSamples(flowIssues, doneIds, fromMs, toMs)
       const remainingItems = countOpenWip(flowIssues, startedIds, doneIds, toMs)
+      // observedWeeks = the team's ACTIVE span (first→last non-zero throughput
+      // week, inclusive), not the padded window width. The sample floor must
+      // count genuine observations, not leading/trailing zero-padding for weeks
+      // the team did not exist or shipped nothing — otherwise the upper
+      // percentiles read precise off a couple of real data points.
+      const observedWeeks = activeThroughputSpan(weeklySamples)
       // remainingItems === 0 → nothing to forecast: the module returns value=null
       // with dataQuality 'ok' (no backlog, not missing data). weeklySamples empty →
       // the module returns no_data. Both are honest module-level outcomes.
       return monteCarlo.compute(
         {
           weeklySamples,
+          observedWeeks,
           remainingItems,
           seed: forecastSeed(windowFrom, windowTo),
         },
@@ -1699,14 +1891,59 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
         transitionedAt: e.transitionedAt,
         wasPresentAtStart: e.wasPresentAtStart,
       }))
-      return sprintVelocity.compute(
+      const issueRecords = data.issues.map(toIssueRecord)
+      const latestResult = sprintVelocity.compute(
         {
           sprint: sprintRecord,
           membershipEvents: memberEvents,
-          issues: data.issues.map(toIssueRecord),
+          issues: issueRecords,
         },
         now,
       )
+      // HONESTY: the headline `value` is the LATEST sprint's completed points,
+      // not a window total/trend. Surface sprintCount + the window average of
+      // completed points across all in-window sprints so a consumer never reads
+      // a single sprint as the period's velocity.
+      const completedAcrossWindow = []
+      for (const s of sprints) {
+        const bc = await store.getBoardConfig(s.boardId)
+        const events = (await store.getSprintMembershipEvents(s.id)).map((e) => ({
+          sprintId: e.sprintId,
+          issueId: e.issueId,
+          change: e.change,
+          pointsAtEvent: e.pointsAtEvent,
+          transitionedAt: e.transitionedAt,
+          wasPresentAtStart: e.wasPresentAtStart,
+        }))
+        const r = sprintVelocity.compute(
+          {
+            sprint: {
+              id: s.id,
+              boardId: s.boardId,
+              type: bc?.type ?? 'scrum',
+              startAt: s.startAt,
+              endAt: s.endAt,
+              completeAt: s.completeAt,
+            },
+            membershipEvents: events,
+            issues: issueRecords,
+          },
+          now,
+        )
+        if (r.completed !== null) completedAcrossWindow.push(r.completed)
+      }
+      const windowAvgCompleted =
+        completedAcrossWindow.length > 0
+          ? completedAcrossWindow.reduce((a, b) => a + b, 0) / completedAcrossWindow.length
+          : null
+      return {
+        ...latestResult,
+        sprintCount: sprints.length,
+        sprintId: latest.id,
+        sprintName: latest.name ?? null,
+        isLatestSprintOnly: true,
+        windowAvgCompleted,
+      }
     }
 
     case 'agile.sprint_predictability': {
@@ -1760,15 +1997,22 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
       const haloc = totalWindowHaloc(data)
       let changedLines = 0
       for (const files of data.prFilesByPr.values()) {
-        for (const f of files) changedLines += f.additions + f.deletions
+        // Filter generated/vendored files: lockfile churn is not authored intent
+        // and would inflate the rework-rate denominator at scale.
+        for (const f of files) {
+          if (f.isGenerated) continue
+          changedLines += f.additions + f.deletions
+        }
       }
       return nagappanBall.compute(
         {
           haloc,
           priorHaloc: data.priorHaloc,
           windowDays: winDays,
-          // Blame not ingested → 0 lines classified as Rework (see REWORK_CHURN_NO_DATA).
-          reworkLines: 0,
+          // Blame not ingested → rework lines are NOT MEASURED. Pass null (not 0)
+          // so M3 reports null rather than a misleading "0 rework density" that is
+          // indistinguishable from a genuine zero (see REWORK_CHURN_NO_DATA).
+          reworkLines: null,
           totalLines: changedLines,
         },
         now,
@@ -1784,6 +2028,9 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
       let changedLines = 0
       for (const files of data.prFilesByPr.values()) {
         for (const f of files) {
+          // Same rationale as nagappan_ball above: generated files are not
+          // authored conceptual surface, do not feed the entropy of directories.
+          if (f.isGenerated) continue
           filePaths.push(f.path)
           changedLines += f.additions + f.deletions
         }
@@ -1806,19 +2053,30 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
       // Pair base↔head file complexity (ingested per-PR via tree-sitter) for each
       // changed code file of the window's PRs. Paths are namespaced by PR id so
       // the same file touched by two PRs is matched within its own PR, not across.
+      //
+      // PERF: pr_refs and file_complexity are window-INDEPENDENT, so the loader
+      // bulk-loads them into data.prRefById / data.fileComplexityByKey once per
+      // backfill. We read from those maps instead of doing one point query per
+      // PR (×~120 days) + one per file (×~120 days), which was an N+1 storm.
+      // Falls back to the point queries when a caller built `data` without the
+      // bulk maps (defensive; tests + on-demand callers go through the loaders).
+      const getPrRef = (prId) =>
+        data.prRefById ? (data.prRefById.get(prId) ?? null) : store.getPrRef(prId)
+      const getFc = (repoId, sha, path) =>
+        data.fileComplexityByKey
+          ? (data.fileComplexityByKey.get(fcKey(repoId, sha, path)) ?? null)
+          : store.getFileComplexity(repoId, sha, path)
       const head = []
       const base = []
       for (const [prId, files] of data.prFilesByPr) {
-        const ref = await store.getPrRef(prId)
+        const ref = await getPrRef(prId)
         if (!ref?.headSha) continue
         for (const f of files) {
-          const headC = await store.getFileComplexity(ref.repoId, ref.headSha, f.path)
+          const headC = await getFc(ref.repoId, ref.headSha, f.path)
           if (!headC) continue
           const key = `${prId}::${f.path}`
           head.push({ path: key, complexity: { functions: headC.functions } })
-          const baseC = ref.baseSha
-            ? await store.getFileComplexity(ref.repoId, ref.baseSha, f.path)
-            : null
+          const baseC = ref.baseSha ? await getFc(ref.repoId, ref.baseSha, f.path) : null
           if (baseC) base.push({ path: key, complexity: { functions: baseC.functions } })
         }
       }
@@ -1831,18 +2089,27 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
     case 'code.maintainability_index': {
       // Average cyclomatic-per-function + LOC over the head-side complexity of the
       // window's changed code files; avgHaloc from the same files' ingested diffs.
+      //
+      // PERF: same bulk-map strategy as code.complexity_delta above — read from
+      // pre-loaded maps, fall back to point queries when absent.
+      const getPrRef = (prId) =>
+        data.prRefById ? (data.prRefById.get(prId) ?? null) : store.getPrRef(prId)
+      const getFc = (repoId, sha, path) =>
+        data.fileComplexityByKey
+          ? (data.fileComplexityByKey.get(fcKey(repoId, sha, path)) ?? null)
+          : store.getFileComplexity(repoId, sha, path)
       const seen = new Set()
       let sumCyclomatic = 0
       let sumLoc = 0
       let sumHaloc = 0
       let n = 0
       for (const [prId, files] of data.prFilesByPr) {
-        const ref = await store.getPrRef(prId)
+        const ref = await getPrRef(prId)
         if (!ref?.headSha) continue
         for (const f of files) {
           const key = `${ref.headSha}::${f.path}`
           if (seen.has(key)) continue
-          const c = await store.getFileComplexity(ref.repoId, ref.headSha, f.path)
+          const c = await getFc(ref.repoId, ref.headSha, f.path)
           if (!c) continue
           seen.add(key)
           sumCyclomatic += c.functionCount > 0 ? c.totalCyclomatic / c.functionCount : 0
@@ -2087,10 +2354,21 @@ async function computePersonRaw(store, metricId, windowFrom, windowTo, now, data
     }
     case 'flow.wip_load': {
       const { boardColumns } = await buildStatusBoundaries(store, data)
-      return wipLoad.compute(
-        { issues: assignedFlowIssues(), boardColumns, now, avgCycleTimeDays: null },
+      const personFlowIssues = assignedFlowIssues()
+      const ctResult = cycleTime.compute(
+        {
+          issues: personFlowIssues,
+          boardColumns,
+          resolveFlowState: () => null,
+          windowStart: dayStartIso(windowFrom),
+          windowEnd: dayEndIso(windowTo),
+          now,
+        },
         now,
       )
+      const avgCycleTimeDays =
+        ctResult.p50Seconds !== null && ctResult.p50Seconds > 0 ? ctResult.p50Seconds / 86400 : null
+      return wipLoad.compute({ issues: personFlowIssues, boardColumns, now, avgCycleTimeDays }, now)
     }
     case 'pr.cycle_time':
       return prCycleTime.compute(
@@ -2650,6 +2928,12 @@ export async function backfillSnapshots(store, opts) {
   let written = 0
 
   const nowMs = new Date(opts.now).getTime()
+
+  // A backfill always runs AFTER a sync's ingestion writes, so any memoised
+  // global lookups (pr_refs / file_complexity / status categories) from a prior
+  // run are stale here. Drop the memo so this backfill reads post-write state;
+  // loadFullScopeData below then repopulates it fresh for the whole run.
+  invalidateLookupsCache(store)
 
   // Bulk-load the ENTIRE dataset ONCE for the whole backfill (~10 queries, zero
   // N+1). Every day's window is then sliced from it in memory (pure CPU, no I/O),

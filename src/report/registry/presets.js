@@ -52,8 +52,8 @@ export const PRESETS = [
           },
           {
             metricId: 'flow.aging_wip',
-            label: 'Aging WIP',
-            unit: 'count',
+            label: 'Aging WIP (p50 age)',
+            unit: 'days',
             chart: 'distribution_bar',
           },
         ],
@@ -66,7 +66,7 @@ export const PRESETS = [
           { metricId: 'agile.say_do', label: 'Say/do ratio', unit: '%', chart: 'trend' },
           {
             metricId: 'agile.sprint_velocity',
-            label: 'Sprint velocity',
+            label: 'Latest sprint velocity',
             unit: 'points',
             chart: 'trend',
           },
@@ -136,7 +136,7 @@ export const PRESETS = [
           { metricId: 'flow.cycle_time', label: 'Cycle time', unit: 'hours', chart: 'trend' },
           { metricId: 'flow.flow_efficiency', label: 'Flow efficiency', unit: '%', chart: 'trend' },
           { metricId: 'pr.review_latency', label: 'Review latency', unit: 'hours' },
-          { metricId: 'flow.aging_wip', label: 'Aging WIP', unit: 'count' },
+          { metricId: 'flow.aging_wip', label: 'Aging WIP (p50 age)', unit: 'days' },
         ],
       },
       {
@@ -148,7 +148,7 @@ export const PRESETS = [
           { metricId: 'agile.sprint_predictability', label: 'Sprint predictability', unit: '%' },
           {
             metricId: 'agile.sprint_velocity',
-            label: 'Sprint velocity',
+            label: 'Latest sprint velocity',
             unit: 'points',
             chart: 'trend',
           },
@@ -264,7 +264,7 @@ export const PRESETS = [
             benchmark: true,
           },
           { metricId: 'flow.throughput', label: 'Throughput', unit: 'count', chart: 'trend' },
-          { metricId: 'flow.aging_wip', label: 'Aging WIP', unit: 'count' },
+          { metricId: 'flow.aging_wip', label: 'Aging WIP (p50 age)', unit: 'days' },
         ],
       },
       {
@@ -342,7 +342,12 @@ export const PRESETS = [
         title: 'Operational Risk Signals',
         purpose: 'Early warning on flow + review load (operational, not morale).',
         metrics: [
-          { metricId: 'flow.aging_wip', label: 'Aging WIP', unit: 'count', chart: 'trend' },
+          {
+            metricId: 'flow.aging_wip',
+            label: 'Aging WIP (p50 age)',
+            unit: 'days',
+            chart: 'trend',
+          },
           { metricId: 'flow.wip_load', label: 'WIP load', unit: 'count' },
           { metricId: 'pr.reviewer_load_gini', label: 'Reviewer load (Gini)', unit: 'index' },
           { metricId: 'pr.review_coverage', label: 'Review coverage', unit: '%' },
@@ -452,7 +457,7 @@ export const PRESETS = [
         purpose: 'Sustainability tripwire vs your own normal — never vs peers.',
         metrics: [
           { metricId: 'pr.review_latency', label: 'Review latency you give', unit: 'hours' },
-          { metricId: 'flow.aging_wip', label: 'Aging in-flight work', unit: 'count' },
+          { metricId: 'flow.aging_wip', label: 'Aging in-flight work (p50 age)', unit: 'days' },
         ],
       },
     ],
@@ -480,7 +485,7 @@ export const PRESETS = [
             unit: 'hours',
             chart: 'sparkline',
           },
-          { metricId: 'flow.aging_wip', label: 'Aging WIP', unit: 'count' },
+          { metricId: 'flow.aging_wip', label: 'Aging WIP (p50 age)', unit: 'days' },
         ],
       },
     ],

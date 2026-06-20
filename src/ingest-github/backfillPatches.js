@@ -85,6 +85,11 @@ export async function backfillPrPatches(store, client, opts) {
       haloc: halocOfPatch(f.path, patch, f.additions, f.deletions),
       status: f.status,
       patch: scrubFreeText(patch),
+      // Preserve the persisted classification — this row is the SAME path the
+      // ingest mapper already classified, so re-derive (instead of trusting an
+      // older row that predates the column) and round-trip it through the
+      // upsert. Otherwise a backfill would silently flip is_generated back to 0.
+      isGenerated: f.isGenerated === true ? true : false,
       createdAt: f.createdAt,
       updatedAt: now,
     })

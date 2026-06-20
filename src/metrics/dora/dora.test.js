@@ -25,6 +25,7 @@ import {
   incidentReopenRate,
   leadTime,
   recoveryTime,
+  reliabilityProxy,
 } from './index.js'
 
 // ---------------------------------------------------------------------------
@@ -178,6 +179,26 @@ describe('deploymentFrequency', () => {
     expect(doraBandFromRate(1 / 30)).toBe('medium')
     expect(doraBandFromRate(1 / 200)).toBe('low')
   })
+
+  it('counts prod-family environment spellings (Production, prod, prod-eu), not only exact "production"', () => {
+    const mk = (id, environment) => ({
+      id,
+      repoId: IDS.repoAlpha,
+      sha: id,
+      environment,
+      status: 'success',
+      createdAt: `2024-03-0${id.at(-1)}T12:00:00Z`,
+      finishedAt: `2024-03-0${id.at(-1)}T12:10:00Z`,
+      source: 'deployments_api',
+    })
+    const deploysVaried = [mk('d1', 'Production'), mk('d2', 'prod'), mk('d3', 'prod-eu')]
+    const result = deploymentFrequency.compute(
+      { deploys: deploysVaried, windowDays: 28, environment: 'production' },
+      AS_OF,
+    )
+    // Before the fix (raw === 'production') only an exact match would count → 0.
+    expect(result.totalSuccessDeploys).toBe(3)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -317,6 +338,27 @@ describe('recoveryTime', () => {
     expect(Number.isNaN(result.value)).toBe(false)
   })
 
+  it('does not crash when incidents is omitted (deploy-only caller)', () => {
+    // Before the fix this threw "Cannot read properties of undefined (reading filter)".
+    const deploys = [
+      { id: 'd1', environment: 'production', status: 'failure', createdAt: '2024-03-01T10:00:00Z' },
+      { id: 'd2', environment: 'production', status: 'success', createdAt: '2024-03-01T11:00:00Z' },
+    ]
+    const result = recoveryTime.compute({ deploys }, AS_OF)
+    expect(result.recoverySource).toBe('deployment')
+    expect(result.sampleSize).toBe(1)
+    expect(result.p50Seconds).toBeCloseTo(3600, 0)
+  })
+
+  it('deploy-only with no failed deploy and no incidents → no_data, not crash', () => {
+    const deploys = [
+      { id: 'd1', environment: 'production', status: 'success', createdAt: '2024-03-01T10:00:00Z' },
+    ]
+    const result = recoveryTime.compute({ deploys }, AS_OF)
+    expect(result.dataQuality).toBe('no_data')
+    expect(result.value).toBeNull()
+  })
+
   it('prefers REAL deployment recovery (failed→next-success) when deploy statuses exist', () => {
     // A failed prod deploy recovered by the next successful prod deploy 1h later.
     // A second failed deploy is recovered 2h later. Median = 1.5h.
@@ -365,6 +407,38 @@ describe('incidentReopenRate', () => {
     expect(result.rate).toBeNull()
     expect(result.dataQuality).toBe('no_data')
     expect(Number.isNaN(result.rate)).toBe(false)
+  })
+})
+
+describe('reliabilityProxy', () => {
+  const mkIncidents = (n) => Array.from({ length: n }, (_, i) => ({ id: `inc-${i}` }))
+
+  it('zero incidents over an observed window → best-case score 1, ok', () => {
+    const r = reliabilityProxy.compute({ incidents: [], windowDays: 28 }, AS_OF)
+    expect(r.value).toBe(1)
+    expect(r.dataQuality).toBe('ok')
+  })
+
+  it('does NOT saturate at 0 — a 10× worse incident rate scores distinctly lower', () => {
+    // Regression: 1 − rate clamped both of these to exactly 0 (no signal at the
+    // bad end). 1/(1+rate) must keep them distinct and ordered.
+    const bad = reliabilityProxy.compute({ incidents: mkIncidents(28), windowDays: 28 }, AS_OF)
+    const muchWorse = reliabilityProxy.compute(
+      { incidents: mkIncidents(280), windowDays: 28 },
+      AS_OF,
+    )
+    expect(bad.value).toBeGreaterThan(0)
+    expect(muchWorse.value).toBeGreaterThan(0)
+    expect(muchWorse.value).toBeLessThan(bad.value)
+    // Monotone in incident count, always in (0, 1].
+    expect(bad.value).toBeLessThanOrEqual(1)
+    expect(muchWorse.value).toBeLessThanOrEqual(1)
+  })
+
+  it('windowDays 0 → no_data, never NaN', () => {
+    const r = reliabilityProxy.compute({ incidents: mkIncidents(3), windowDays: 0 }, AS_OF)
+    expect(r.dataQuality).toBe('no_data')
+    expect(r.value).toBeNull()
   })
 })
 

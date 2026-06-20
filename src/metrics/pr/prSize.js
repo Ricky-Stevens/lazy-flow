@@ -22,8 +22,13 @@ export const prSize = {
     const halocValues = []
 
     for (const pr of mergedPrs) {
-      // Use haloc if available, else additions + deletions
-      const size = pr.haloc !== null ? pr.haloc : pr.additions + pr.deletions
+      // Use haloc if available, else additions + deletions. Nullish (`??`), not
+      // `!== null`: a projection that omits the field entirely supplies
+      // `undefined`, and `undefined !== null` is true — that would push
+      // `undefined` into the median sort (NaN comparisons) and bucket every such
+      // PR as 'XL' (undefined <= 10 is false). Post-GraphQL, haloc fields are
+      // frequently absent, so this path is real.
+      const size = pr.haloc ?? pr.additions + pr.deletions
       halocValues.push(size)
       const bucket = prSizeBucket(size)
       buckets[bucket]++

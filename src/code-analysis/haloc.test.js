@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { computeHaloc } from './haloc.js'
+import { classifyIsGenerated, computeHaloc } from './haloc.js'
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -139,6 +139,39 @@ describe('generated / vendored paths', () => {
     expect(result.generatedHaloc).toBe(0)
     expect(result.files[0]?.isGenerated).toBe(false)
   })
+
+  it('extended globs catch wasm/bundle blobs and vendored dirs', () => {
+    // The observed-in-the-wild bad case + the new categories.
+    const cases = [
+      'public/tesseract/tesseract-core-7.0.0.wasm.js',
+      'public/wasm/module.wasm',
+      'dist/app.bundle.js',
+      'src/chunks/0042.chunk.js',
+      'styles/site.min.css',
+      'vendor/jquery/jquery.js',
+      'third_party/some-lib/index.js',
+      'Cargo.lock',
+      'go.sum',
+      'Gemfile.lock',
+    ]
+    for (const path of cases) {
+      expect(classifyIsGenerated(path)).toBe(true)
+    }
+  })
+
+  it('classifyIsGenerated does NOT flag real source files', () => {
+    for (const path of [
+      'src/index.ts',
+      'src/components/Button.tsx',
+      'README.md',
+      // Files whose names contain a generated-ish substring but are not.
+      'src/min/index.ts', // path contains "min" but is not a min.js
+      'src/wasm-loader.ts', // wasm-loader is hand-written
+      'public/index.html', // public/ is NOT a blanket exclude
+    ]) {
+      expect(classifyIsGenerated(path)).toBe(false)
+    }
+  })
 })
 
 // ── rename handling ───────────────────────────────────────────────────────
@@ -228,4 +261,17 @@ describe('NUL byte in hunk body', () => {
     expect(result.haloc).toBe(0)
     expect(result.binaryHaloc).toBeGreaterThan(0)
   })
+})
+
+// Regression: a PR file whose patch was never ingested (NULL after the GraphQL
+// migration) reaches computeHaloc as null/undefined. parseDiff does
+// `diff.replace(...)`, which threw a TypeError and crashed the whole
+// halocAggregate run. A missing diff must contribute zero, not crash.
+describe('null / empty / non-string diff (un-ingested patch)', () => {
+  for (const bad of [null, undefined, '', 123]) {
+    it(`returns an empty zero result for ${String(bad)} without throwing`, () => {
+      const result = computeHaloc(bad)
+      expect(result).toEqual({ haloc: 0, binaryHaloc: 0, generatedHaloc: 0, files: [] })
+    })
+  }
 })

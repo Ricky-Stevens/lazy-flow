@@ -48,7 +48,13 @@ export const throughput = {
       if (firstDoneInWindowAt !== null) {
         // Count once (first Done dedup)
         completedIssueIds.push(issue.id)
-        if (reopenCountInWindow > 0 && completionCountInWindow > 1) {
+        // Transparency flag: this counted issue churned inside the window (it
+        // left Done at least once after completing). The old guard also required
+        // completionCountInWindow > 1, which silently dropped the common case of
+        // an issue that completes once in-window, is reopened in-window, then
+        // re-completes OUTSIDE the window — exactly the instability the flag
+        // exists to surface. A reopen in-window on a counted issue is enough.
+        if (reopenCountInWindow > 0) {
           reopenedInWindowIds.push(issue.id)
         }
       }

@@ -135,4 +135,50 @@ describe('verdicts pipeline (in-session, no API)', () => {
     const pend = await listPendingVerdicts(store, 'person.design_bearing_ratio', 'p-1')
     expect(pend.pendingCount).toBe(0)
   })
+
+  it('skips a malformed stored verdict row instead of crashing the read', async () => {
+    // A valid verdict plus a corrupt structured_verdict_json (possible via the
+    // directly-writable store under the full-transparency contract). The read
+    // must return the valid row and silently drop the corrupt one, not throw.
+    await recordVerdict(
+      store,
+      {
+        metric: 'person.design_bearing_ratio',
+        subjectId: 'pr-good',
+        verdict: { designBearing: true, difficulty: 3 },
+        confidence: 0.9,
+      },
+      { id: 'v-good', now: NOW },
+    )
+    // Inject a corrupt row directly.
+    store.db
+      .prepare(
+        `INSERT INTO ai_verdicts
+           (id, subject_type, subject_id, metric, prompt_version, model_id, model_snapshot,
+            request_shape, feature_vector_json, structured_verdict_json, evidence_json,
+            confidence, created_at, corrected_by, correction_json)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      )
+      .run(
+        'v-bad',
+        'pull_request',
+        'pr-bad',
+        'person.design_bearing_ratio',
+        'session-claude-v1',
+        'in-session-claude',
+        'in-session-claude',
+        'session',
+        '{}',
+        '{not valid json',
+        '[]',
+        0.5,
+        NOW,
+        null,
+        null,
+      )
+
+    const stored = await store.getAiVerdictsByMetric('pull_request', 'person.design_bearing_ratio')
+    expect(stored).toHaveLength(1)
+    expect(stored[0].subjectId).toBe('pr-good')
+  })
 })

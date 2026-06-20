@@ -22,7 +22,7 @@ import { describe, expect, it } from 'bun:test'
 import { baseOrg, IDS } from '../../testkit/index.js'
 import { migrate } from '../migrate/runner.js'
 import { BunSqliteStore } from '../store/BunSqliteStore.js'
-import { isGitHubBot } from './bot.js'
+import { isGitHubBot, isLikelyBotLogin } from './bot.js'
 import {
   confirmCandidateMatch,
   listCandidateMatches,
@@ -1060,6 +1060,42 @@ describe('identity audit regressions', () => {
     expect(isGitHubBot('acme-eng', 'Organization')).toBe(false)
     expect(isGitHubBot('dependabot[bot]', 'Bot')).toBe(true)
     expect(isGitHubBot('renovate', 'User')).toBe(true) // known-bot list still applies
+  })
+
+  it('isLikelyBotLogin catches GitHub-App-shaped logins observed in the wild', () => {
+    // The three live cases that poisoned the cohort.
+    expect(isLikelyBotLogin('graphite-app')).toBe(true)
+    expect(isLikelyBotLogin('detail-app')).toBe(true)
+    expect(isLikelyBotLogin('greptile-apps')).toBe(true)
+    // Plus the `[bot]` suffix convention.
+    expect(isLikelyBotLogin('renovate[bot]')).toBe(true)
+    // Plus an explicit GraphQL `__typename`.
+    expect(isLikelyBotLogin('weird-name', { __typename: 'Bot' })).toBe(true)
+    // Plus a REST `type` payload.
+    expect(isLikelyBotLogin('weird-name', { type: 'Bot' })).toBe(true)
+    // Plus the bare string-form type argument (matches isGitHubBot's signature).
+    expect(isLikelyBotLogin('weird-name', 'Bot')).toBe(true)
+  })
+
+  it('isLikelyBotLogin does NOT flag normal human logins', () => {
+    expect(isLikelyBotLogin('ricky-iph')).toBe(false)
+    expect(isLikelyBotLogin('octocat')).toBe(false)
+    expect(isLikelyBotLogin('alex-barnes')).toBe(false)
+    // A login whose name happens to contain "app" but does not end with -app/-apps.
+    expect(isLikelyBotLogin('appleseed')).toBe(false)
+    expect(isLikelyBotLogin('mapper')).toBe(false)
+    // Pathological inputs — must not throw, must default to "not a bot".
+    expect(isLikelyBotLogin('')).toBe(false)
+    expect(isLikelyBotLogin(null)).toBe(false)
+    expect(isLikelyBotLogin(undefined)).toBe(false)
+  })
+
+  it('isGitHubBot delegates to isLikelyBotLogin so app-suffix logins flag without a Bot type', () => {
+    // Historic rows ingested with type 'User' (or no type) but the login carries
+    // a GitHub-App suffix — these are the rows that currently poison the cohort.
+    expect(isGitHubBot('graphite-app', 'User')).toBe(true)
+    expect(isGitHubBot('detail-app', undefined)).toBe(true)
+    expect(isGitHubBot('greptile-apps', null)).toBe(true)
   })
 
   it('buildIdentityId uses the single canonical scheme', () => {

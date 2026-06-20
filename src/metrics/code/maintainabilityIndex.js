@@ -14,6 +14,33 @@ export const maintainabilityIndex = {
   params: {},
 
   compute(inputs, asOf) {
+    // Guard against missing/NaN inputs: ln() and the arithmetic below would
+    // otherwise yield NaN, which clamps to NaN (Math.max/min(0,100,NaN)===NaN) and
+    // would be emitted as `{ value: NaN, dataQuality: 'ok' }` — a nonsense headline
+    // that propagates silently through any aggregation. A deterministic primitive
+    // with no valid inputs has no_data, not a bogus index.
+    if (
+      !Number.isFinite(inputs?.avgHaloc) ||
+      !Number.isFinite(inputs?.avgCyclomatic) ||
+      !Number.isFinite(inputs?.avgLoc)
+    ) {
+      return {
+        id: 'code.maintainability_index',
+        trustTier: 'deterministic',
+        scope: 'team',
+        value: null,
+        unit: 'index',
+        dataQuality: 'no_data',
+        engineVersion: ENGINE_VERSION,
+        asOf,
+        formulaDoc: FORMULA_DOC,
+        mi: null,
+        avgHaloc: inputs?.avgHaloc ?? null,
+        avgCyclomatic: inputs?.avgCyclomatic ?? null,
+        avgLoc: inputs?.avgLoc ?? null,
+      }
+    }
+
     const rawMi =
       171 -
       5.2 * Math.log(inputs.avgHaloc + 1) -

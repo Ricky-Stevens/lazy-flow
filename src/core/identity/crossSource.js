@@ -34,8 +34,15 @@ import crypto from 'node:crypto'
 
 // Fusion thresholds. Behavioural `share` = co-occurrences with this Jira person /
 // total co-occurrences for the GitHub person; `count` = absolute co-occurrences.
+//
+// History: `BEHAV_AUTO_COUNT` was 2 — a single corroborating PR was enough to
+// auto-merge with a name match. Bumped to 5 so at-scale near-namesakes (two
+// "Alex Barnes" working on overlapping tickets) need real volume of evidence
+// before a name+behaviour merge fires. Behaviour-only (no name) auto-merge has
+// been REMOVED entirely; that tier now goes to the human queue regardless of
+// share/count, because behaviour can be coincidental at low cohort sizes.
 const BEHAV_AUTO_SHARE = 0.5
-const BEHAV_AUTO_COUNT = 2
+const BEHAV_AUTO_COUNT = 5
 const BEHAV_STRONG_SHARE = 0.7
 const BEHAV_STRONG_COUNT = 5
 const BEHAV_QUEUE_SHARE = 0.4
@@ -244,9 +251,13 @@ export async function stitchCrossSource(store, options = {}) {
     ) {
       return { jp: behavJp, reason: 'xsrc_name_behavioral', confidence: 0.95, auto: true }
     }
-    // 3. Dominant behaviour alone → auto-merge.
+    // 3. Dominant behaviour ALONE (no name corroboration) → human queue.
+    // Previously this tier auto-merged at share≥0.7 / count≥5 with confidence
+    // 0.85. At scale, behaviour-only signals can fuse two genuinely different
+    // people (e.g. a tech lead who repeatedly links to a junior's tickets), so
+    // any merge without a name or email corroboration must be human-confirmed.
     if (behavIsJiraTarget && behavShare >= BEHAV_STRONG_SHARE && behavCount >= BEHAV_STRONG_COUNT) {
-      return { jp: behavJp, reason: 'xsrc_behavioral', confidence: 0.85, auto: true }
+      return { jp: behavJp, reason: 'xsrc_behavioral', confidence: 0.85, auto: false }
     }
 
     // 4. Name match (single unambiguous candidate) → human queue.

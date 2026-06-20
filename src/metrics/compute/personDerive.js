@@ -26,12 +26,21 @@ export const fcKey = (repoId, sha, path) => `${repoId}${KEY_SEP}${sha}${KEY_SEP}
 export const repoShaKey = (repoId, sha) => `${repoId}${KEY_SEP}${sha}`
 export const repoPathKey = (repoId, path) => `${repoId}${KEY_SEP}${path}`
 
+/**
+ * Filter generated/vendored files out of a pr_files list. Tolerant of older
+ * rows that predate the `is_generated` column (those come back as `undefined`
+ * which is treated as authored). The SAME filter is applied in compute/index.js
+ * `toPrInput` and `totalWindowHaloc`, so per-PR and per-person volumes agree.
+ */
+const isAuthored = (f) => !f?.isGenerated
+
 const prHaloc = (files) => {
   let h = 0
   let add = 0
   let del = 0
   let has = false
   for (const f of files ?? []) {
+    if (!isAuthored(f)) continue
     h += f.haloc
     add += f.additions
     del += f.deletions
@@ -122,6 +131,12 @@ export function buildReviewBypassInputs(authoredMergedPrs, reviewsByPr, identity
   }
 }
 
+// Review round-trip cadence proxy (see feedbackResponseLatency LATENCY_DOC).
+// We measure changes_requested → the next review event. This is gated by when
+// the REVIEWER returns, so it is NOT a clean author-response time — the metric
+// is surfaced as descriptive (polarity 0), never as a lower-is-better author
+// score. Anchoring on the author's next push would need commit→PR linkage that
+// the GraphQL ingest does not populate.
 export function buildFeedbackLatencyInputs(authoredMergedPrs, reviewsByPr, identityIds, bots) {
   const samples = []
   for (const pr of authoredMergedPrs) {
@@ -152,6 +167,10 @@ export function buildComplexityDeltaInputs(authoredMergedPrs, prFilesByPr, refBy
     let positive = 0
     let covered = false
     for (const f of files) {
+      // Generated files (lockfiles, .min.js, .pb.*) carry no authored complexity
+      // signal — tree-sitter may still parse them but their cyclomatic delta is
+      // noise from the generator, not the author.
+      if (!isAuthored(f)) continue
       const head = fcGet(fcByKey, pr.repoId, ref.headSha, f.path)
       const base = fcGet(fcByKey, pr.repoId, ref.baseSha, f.path)
       if (head === null && base === null) continue
@@ -183,6 +202,10 @@ export function buildHighComplexityShareInputs(
     let prHasHigh = false
     let prHasCoverage = false
     for (const f of files) {
+      // Skip generated/vendored files: a 100k-line minified bundle would
+      // dwarf the authored line-weight and read as "always reviewing high-
+      // complexity files" even when the author only touched a config map.
+      if (!isAuthored(f)) continue
       const lw = f.additions + f.deletions
       totalLineWeight += lw
       const head = fcGet(fcByKey, pr.repoId, ref?.headSha, f.path)
@@ -209,6 +232,9 @@ export function buildConceptualSurfaceInputs(authoredMergedPrs, prFilesByPr, ref
     let covered = false
     const dirs = new Set()
     for (const f of files) {
+      // Generated files do not contribute conceptual surface — their volume
+      // belongs to the bundler/codegen, not to the human reviewer.
+      if (!isAuthored(f)) continue
       const head = fcGet(fcByKey, pr.repoId, ref?.headSha, f.path)
       if (head === null) continue
       covered = true
@@ -265,6 +291,8 @@ export function buildSkillDomainInputs(authoredPrs, prFilesByPr) {
   const byDomain = new Map()
   for (const pr of authoredPrs) {
     for (const f of prFilesByPr.get(pr.id) ?? []) {
+      // Lockfile churn is not a "skill domain" — filter it before bucketing.
+      if (!isAuthored(f)) continue
       const d = skillDomain(f.path)
       byDomain.set(d, (byDomain.get(d) ?? 0) + f.additions + f.deletions)
     }
@@ -280,6 +308,9 @@ export function buildKnowledgeOwnershipInputs(allPrs, prFilesByPr, identityIds, 
   for (const pr of allPrs) {
     const mine = pr.authorIdentityId !== null && identityIds.has(pr.authorIdentityId)
     for (const f of prFilesByPr.get(pr.id) ?? []) {
+      // Don't credit anyone with "owning" yarn.lock just because they bumped
+      // a dep. Knowledge-ownership reads authored source only.
+      if (!isAuthored(f)) continue
       const lines = f.additions + f.deletions
       let a = agg.get(f.path)
       if (!a) {

@@ -157,16 +157,24 @@ CREATE INDEX IF NOT EXISTS idx_pull_requests_created_at ON pull_requests(created
 -- Per-PR file diffs (GET /pulls/{n}/files); source for code.* churn/HALOC metrics.
 -- ON DELETE CASCADE so a tombstoned PR's files do not linger.
 CREATE TABLE IF NOT EXISTS pr_files (
-  pr_id      TEXT NOT NULL REFERENCES pull_requests(id) ON DELETE CASCADE,
-  repo_id    TEXT NOT NULL,
-  path       TEXT NOT NULL,
-  additions  INTEGER NOT NULL DEFAULT 0,
-  deletions  INTEGER NOT NULL DEFAULT 0,
-  haloc      INTEGER NOT NULL DEFAULT 0,
-  status     TEXT NOT NULL,
-  patch      TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
+  pr_id        TEXT NOT NULL REFERENCES pull_requests(id) ON DELETE CASCADE,
+  repo_id      TEXT NOT NULL,
+  path         TEXT NOT NULL,
+  additions    INTEGER NOT NULL DEFAULT 0,
+  deletions    INTEGER NOT NULL DEFAULT 0,
+  haloc        INTEGER NOT NULL DEFAULT 0,
+  status       TEXT NOT NULL,
+  patch        TEXT,
+  -- 1 when the path matches generated/vendored/lockfile/minified globs (see
+  -- classifyIsGenerated). Persisted so authored-code-volume metrics (pr.size,
+  -- code.haloc_aggregate, code.nagappan_ball, code.change_impact, plus the
+  -- per-person ownership/skill/complexity builders) can filter the numerator
+  -- without re-deriving the classification at read time. Defaults to 0 so older
+  -- rows (and the in-test fixture rows that never go through the mapper) are
+  -- treated as authored — preserving every existing oracle test.
+  is_generated INTEGER NOT NULL DEFAULT 0,
+  created_at   TEXT NOT NULL,
+  updated_at   TEXT NOT NULL,
   PRIMARY KEY (pr_id, path)
 );
 

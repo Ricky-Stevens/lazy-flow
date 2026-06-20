@@ -289,6 +289,25 @@ describe('nagappanBall', () => {
     expect(result.m2ChurnRate).toBeNull()
     expect(Number.isNaN(result.m2ChurnRate)).toBe(false)
   })
+
+  it('reworkLines null (blame unavailable) → M3 null ("not measured"), NOT a misleading 0', () => {
+    // The pipeline passes reworkLines: null because git blame is not ingested.
+    // M3 must report null so a consumer cannot mistake "not measured" for "no
+    // rework" — the rest of the result (M1/M2) is still real.
+    const result = nagappanBall.compute(
+      { haloc: 100, priorHaloc: 400, windowDays: 30, reworkLines: null, totalLines: 100 },
+      AS_OF,
+    )
+    expect(result.m3ReworkDensity).toBeNull()
+    expect(result.m1RelativeChurn).toBeCloseTo(0.2, 5)
+  })
+
+  it('M3 is never NaN even when inputs are undefined (safeRatio guard)', () => {
+    const result = nagappanBall.compute({ haloc: 100, priorHaloc: 400, windowDays: 30 }, AS_OF)
+    // reworkLines undefined → treated as not-measured → null (never NaN).
+    expect(result.m3ReworkDensity).toBeNull()
+    expect(Number.isNaN(result.m3ReworkDensity)).toBe(false)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -343,11 +362,41 @@ describe('complexityDelta', () => {
     expect(result.functionsDecreased).toBe(0)
   })
 
-  it('new file (no base) → base treated as empty', () => {
+  it('new file (no base) → counted as NEW code, not increase of existing complexity', () => {
     const result = complexityDelta.compute({ base: [], head: [headSnap] }, AS_OF)
-    // head has cyclomatic=5, cognitive=4; base=0 → delta=5 cyclomatic, 4 cognitive
-    expect(result.totalCyclomaticIncrease).toBe(5)
-    expect(result.totalCognitiveIncrease).toBe(4)
+    // A brand-new function must NOT inflate the "increase" headline — its full
+    // complexity is new code, tracked under newFunction*/functionsAdded instead.
+    expect(result.totalCyclomaticIncrease).toBe(0)
+    expect(result.totalCognitiveIncrease).toBe(0)
+    expect(result.functionsAdded).toBe(1)
+    expect(result.functionsIncreased).toBe(0)
+    expect(result.newFunctionCyclomatic).toBe(5)
+    expect(result.newFunctionCognitive).toBe(4)
+  })
+
+  it('removed function (in base, gone from head) is surfaced, not silently dropped', () => {
+    const base = [
+      {
+        path: 'a.js',
+        complexity: {
+          functions: [
+            { name: 'gone', startLine: 1, cyclomatic: 7, cognitive: 6 },
+            { name: 'kept', startLine: 20, cyclomatic: 2, cognitive: 1 },
+          ],
+        },
+      },
+    ]
+    const head = [
+      {
+        path: 'a.js',
+        complexity: {
+          functions: [{ name: 'kept', startLine: 20, cyclomatic: 2, cognitive: 1 }],
+        },
+      },
+    ]
+    const result = complexityDelta.compute({ base, head }, AS_OF)
+    expect(result.functionsRemoved).toBe(1)
+    expect(result.fileDeltae[0].removedFunctions[0].name).toBe('gone')
   })
 
   it('empty head → no_data', () => {
@@ -383,6 +432,23 @@ describe('maintainabilityIndex', () => {
   it('trivial file (1 haloc, 1 cyclomatic, 1 loc) → high MI', () => {
     const result = maintainabilityIndex.compute({ avgHaloc: 1, avgCyclomatic: 1, avgLoc: 1 }, AS_OF)
     expect(result.mi).toBeGreaterThan(80)
+  })
+
+  // Regression: a missing/NaN input must yield no_data, NOT { value: NaN,
+  // dataQuality: 'ok' } — a NaN headline would propagate silently through any
+  // aggregation as if it were a real index.
+  it('missing/NaN inputs → no_data with null value, never NaN at ok quality', () => {
+    for (const bad of [
+      { avgHaloc: undefined, avgCyclomatic: 5, avgLoc: 100 },
+      { avgHaloc: 50, avgCyclomatic: Number.NaN, avgLoc: 100 },
+      { avgHaloc: 50, avgCyclomatic: 5, avgLoc: null },
+      {},
+    ]) {
+      const r = maintainabilityIndex.compute(bad, AS_OF)
+      expect(r.value).toBeNull()
+      expect(r.mi).toBeNull()
+      expect(r.dataQuality).toBe('no_data')
+    }
   })
 })
 

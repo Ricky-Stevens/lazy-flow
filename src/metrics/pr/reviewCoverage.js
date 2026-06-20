@@ -181,11 +181,15 @@ export const reviewerLoad = {
   compute(inputs, asOf) {
     const bots = inputs.botIdentityIds ?? new Set()
     const mergedPrs = inputs.prs.filter((pr) => pr.state === 'merged')
+    // Index merged PRs by id so the per-review lookup is O(1). A linear
+    // `mergedPrs.find` inside the review loop is O(reviews × prs) — quadratic on
+    // a large window (tens of thousands of reviews × thousands of PRs).
+    const mergedById = new Map(mergedPrs.map((p) => [p.id, p]))
 
     // Count reviews per reviewer (non-author, non-bot)
     const reviewerCounts = new Map()
     for (const rev of inputs.reviews) {
-      const pr = mergedPrs.find((p) => p.id === rev.prId)
+      const pr = mergedById.get(rev.prId)
       if (!pr) continue
       if (rev.reviewerIdentityId === pr.authorIdentityId) continue
       if (bots.has(rev.reviewerIdentityId)) continue

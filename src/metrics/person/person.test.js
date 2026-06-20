@@ -32,4 +32,21 @@ describe('person.review_reciprocity', () => {
     expect(r.value).toBeCloseTo(1, 10)
     expect(r.scope).toBe('person')
   })
+
+  // Regression: a single review interaction is noise, not a collaboration balance.
+  // Before the sample floor it returned dataQuality:'ok' on n=1 and that value
+  // would be folded into the peer cohort distribution as if trustworthy.
+  it('flags insufficient_sample below the interaction floor but still returns the value', () => {
+    const oneGiven = reviewReciprocity.compute({ reviewsGiven: 1, reviewsReceived: 0 }, NOW)
+    expect(oneGiven.value).toBeCloseTo(1, 10) // 1 / (0 + 1)
+    expect(oneGiven.dataQuality).toBe('insufficient_sample')
+
+    // received counts toward the interaction total too
+    const fourTotal = reviewReciprocity.compute({ reviewsGiven: 2, reviewsReceived: 2 }, NOW)
+    expect(fourTotal.dataQuality).toBe('insufficient_sample') // 2 + 2 = 4 < 5
+
+    // exactly at the floor clears to ok
+    const atFloor = reviewReciprocity.compute({ reviewsGiven: 3, reviewsReceived: 2 }, NOW)
+    expect(atFloor.dataQuality).toBe('ok') // 3 + 2 = 5
+  })
 })

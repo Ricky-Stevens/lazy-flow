@@ -24,6 +24,14 @@ export const monteCarlo = {
     const simCount = inputs.simulations ?? DEFAULT_SIMULATIONS
     const sampleSize = inputs.weeklySamples.length
     const remaining = inputs.remainingItems
+    // Weeks of GENUINE history backing the forecast. The weeklySamples array is
+    // padded with zeros to the full window width (a zero week is a valid
+    // bootstrap draw), but those padding weeks are NOT observations and must not
+    // satisfy the sample floor — otherwise a team active in 2 of 13 weeks reads
+    // sampleSize=13, clears the p95 floor, and emits a false-precise forecast off
+    // two data points. Gate the floor on observedWeeks (the active span);
+    // default to sampleSize when the caller doesn't supply it (back-compat).
+    const observedWeeks = inputs.observedWeeks ?? sampleSize
 
     if (sampleSize === 0 || remaining <= 0) {
       return {
@@ -47,9 +55,38 @@ export const monteCarlo = {
       }
     }
 
-    // CANONICAL SORTED sample order (SPEC §8.6 — reproducible).
-    const sortedSamples = [...inputs.weeklySamples].sort((a, b) => a - b)
+    // CANONICAL SORTED sample order (SPEC §8.6 — reproducible). Throughput is a
+    // non-negative count; a negative weekly sample (corrupt ingest) would let
+    // `completed` move backwards and inflate the forecast, so clamp at 0.
+    const sortedSamples = [...inputs.weeklySamples].map((s) => Math.max(0, s)).sort((a, b) => a - b)
     const n = sortedSamples.length
+
+    // A history of all-zero (or non-positive) throughput cannot complete any
+    // remaining work: every simulation would hit the MAX_WEEKS cap and report a
+    // false-precise "~10 years" at ok quality. There is no signal to forecast
+    // from, so this is no_data, not a trustworthy number.
+    const maxThroughput = n > 0 ? sortedSamples[n - 1] : 0
+    if (maxThroughput <= 0) {
+      return {
+        id: 'flow.monte_carlo_forecast',
+        trustTier: 'deterministic',
+        scope: 'team',
+        value: null,
+        unit: 'weeks',
+        dataQuality: 'no_data',
+        engineVersion: ENGINE_VERSION,
+        asOf,
+        formulaDoc: FORMULA_DOC,
+        p50Weeks: null,
+        p75Weeks: null,
+        p85Weeks: null,
+        p90Weeks: null,
+        p95Weeks: null,
+        sampleSize,
+        simulationCount: 0,
+        hasInfiniteRisk: false,
+      }
+    }
 
     const prng = createPrng(inputs.seed)
     const weeksToComplete = []
@@ -86,8 +123,8 @@ export const monteCarlo = {
     // weeks, p90 ≥8, p95 ≥12. Below the p50 floor the history is too thin to
     // trust at all → insufficient_sample.
     const WEEK_FLOORS = { p50: 4, p90: 8, p95: 12 }
-    const p90 = sampleSize >= WEEK_FLOORS.p90 ? (qs?.p90 ?? null) : null
-    const p95 = sampleSize >= WEEK_FLOORS.p95 ? (qs?.p95 ?? null) : null
+    const p90 = observedWeeks >= WEEK_FLOORS.p90 ? (qs?.p90 ?? null) : null
+    const p95 = observedWeeks >= WEEK_FLOORS.p95 ? (qs?.p95 ?? null) : null
 
     return {
       id: 'flow.monte_carlo_forecast',
@@ -95,7 +132,7 @@ export const monteCarlo = {
       scope: 'team',
       value: qs?.p50 ?? null,
       unit: 'weeks',
-      dataQuality: sampleSize >= WEEK_FLOORS.p50 ? 'ok' : 'insufficient_sample',
+      dataQuality: observedWeeks >= WEEK_FLOORS.p50 ? 'ok' : 'insufficient_sample',
       engineVersion: ENGINE_VERSION,
       asOf,
       formulaDoc: FORMULA_DOC,
@@ -105,8 +142,14 @@ export const monteCarlo = {
       p90Weeks: p90,
       p95Weeks: p95,
       sampleSize,
+      observedWeeks,
       simulationCount: simCount,
       hasInfiniteRisk: infiniteCount > 0,
+      // Fraction of simulations that hit the MAX_WEEKS cap without completing.
+      // When > 0 the upper-tail percentiles are CENSORED at MAX_WEEKS (a floor,
+      // not a true quantile); a consumer should render "≥520 / may never
+      // complete" rather than a precise week count for any percentile ≥ this.
+      infiniteFraction: infiniteCount / simCount,
     }
   },
 }

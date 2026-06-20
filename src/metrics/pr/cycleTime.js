@@ -104,9 +104,19 @@ export const prCycleTime = {
     const review = buildPhaseQuantiles(reviewValues)
     const deploy = buildPhaseQuantiles(deployValues)
 
-    const totalP50 = totalValues.length > 0 ? (quantiles(totalValues)?.p50 ?? null) : null
+    const totalSampleSize = totalValues.length
+    const totalP50 = totalSampleSize > 0 ? (quantiles(totalValues)?.p50 ?? null) : null
 
-    const dataQuality = mergedPrs.length === 0 ? 'no_data' : 'ok'
+    // dataQuality describes the HEADLINE (the 4-phase total p50). The total needs
+    // every phase — including a post-merge prod deploy — so for a team with no
+    // prod-deploy feed (this tool's common case) totalValues is empty even though
+    // coding/pickup/review have ample samples. Reporting 'ok' with a null headline
+    // is an internal lie (a null value is never 'ok'); distinguish the states:
+    //   - no merged PRs at all          → no_data
+    //   - merged PRs but no full-phase PR → insufficient_sample (phases still populated)
+    //   - at least one full-phase PR     → ok
+    const dataQuality =
+      mergedPrs.length === 0 ? 'no_data' : totalSampleSize === 0 ? 'insufficient_sample' : 'ok'
 
     return {
       id: 'pr.cycle_time',
@@ -123,6 +133,9 @@ export const prCycleTime = {
       review,
       deploy,
       totalP50Seconds: totalP50,
+      // The headline's sample size. Without this an EM cannot tell a p50 built
+      // from 1 PR from one built from 200 — both rendered identically.
+      totalSampleSize,
     }
   },
 }

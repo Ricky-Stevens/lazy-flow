@@ -33,7 +33,8 @@ const VERDICT_TOOL = {
       tells: {
         type: 'array',
         items: { type: 'string' },
-        description: 'Short labels for the stylistic tells observed (e.g. "em-dash", "section-headers").',
+        description:
+          'Short labels for the stylistic tells observed (e.g. "em-dash", "section-headers").',
       },
     },
     required: ['ai_assisted', 'confidence', 'reasoning'],
@@ -77,7 +78,9 @@ export function createAnthropicClassifier(opts = {}) {
           tools: [VERDICT_TOOL],
           tool_choice: { type: 'tool', name: 'record_ai_verdict' },
           // Cap the text so a huge dependabot body can't blow the request.
-          messages: [{ role: 'user', content: `<change>\n${String(text).slice(0, 6000)}\n</change>` }],
+          messages: [
+            { role: 'user', content: `<change>\n${String(text).slice(0, 6000)}\n</change>` },
+          ],
         }),
         signal: AbortSignal.timeout(timeoutMs),
       })

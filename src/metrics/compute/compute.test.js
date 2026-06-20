@@ -25,6 +25,8 @@ import {
   backfillSnapshots,
   COMPUTE_METRIC_IDS,
   computeMetric,
+  invalidateLookupsCache,
+  loadFullScopeData,
   loadScopeDataWindowed,
 } from './index.js'
 
@@ -448,6 +450,19 @@ describe('computeMetric', () => {
     expect(r.value).toBeGreaterThan(0)
   })
 
+  it("flow.wip_load wires a derived cycle time (Little's Law not hardcoded dead)", async () => {
+    // Regression: the dispatch hardcoded avgCycleTimeDays: null, so
+    // littlesLawThroughputPerDay/stationarityWarning could never fire. The
+    // result must carry the field (number when WIP>0 and cycle time exists,
+    // null only when there is no WIP or no cycle-time sample) — and never crash.
+    const r = await compute('flow.wip_load')
+    expect(r.id).toBe('flow.wip_load')
+    expect('littlesLawThroughputPerDay' in r).toBe(true)
+    if (r.wip > 0 && r.littlesLawThroughputPerDay !== null) {
+      expect(r.littlesLawThroughputPerDay).toBeGreaterThan(0)
+    }
+  })
+
   it('flow.flow_distribution → ok with a positive total', async () => {
     const r = await compute('flow.flow_distribution')
     expect(r.dataQuality).toBe('ok')
@@ -584,6 +599,22 @@ describe('computeMetric', () => {
     const r = await compute('agile.sprint_velocity')
     expect(r.dataQuality).toBe('ok')
     expect(r.value).not.toBeNull()
+  })
+
+  it('agile.sprint_velocity headline is honestly scoped to the LATEST sprint, not the window', async () => {
+    // The headline `value` is a single sprint's completed points. It must say so:
+    // sprintCount (how many sprints fell in the window), the sprint identity, an
+    // explicit isLatestSprintOnly flag, and a window average so a consumer never
+    // reads one sprint as the period's velocity.
+    const r = await compute('agile.sprint_velocity')
+    expect(typeof r.sprintCount).toBe('number')
+    expect(r.sprintCount).toBeGreaterThanOrEqual(1)
+    expect(r.isLatestSprintOnly).toBe(true)
+    expect(r.sprintId).toBeTruthy()
+    // windowAvgCompleted is the across-sprint average; equals the headline only
+    // when there is exactly one in-window sprint.
+    expect(r.windowAvgCompleted).not.toBeNull()
+    if (r.sprintCount === 1) expect(r.windowAvgCompleted).toBe(r.completed)
   })
 
   it('pr.stale surfaces a long-open PR created BEFORE the window (event-appropriate loading)', async () => {
@@ -735,6 +766,55 @@ describe('computeMetric', () => {
     // M2 = haloc(19) / windowDays — real churn rate, strictly positive.
     expect(nb.m2ChurnRate).not.toBeNull()
     expect(nb.m2ChurnRate).toBeGreaterThan(0)
+  })
+
+  it('nagappan_ball M1 prior-HALOC term excludes generated/vendored files', async () => {
+    // Regression: the window numerator (totalWindowHaloc) filters generated
+    // files, but the prior rolling-HALOC denominator term did not. A prior
+    // lockfile regeneration would inflate priorHaloc and crush M1 =
+    // haloc/(priorHaloc+haloc) toward 0, understating relative churn by an
+    // arbitrary factor. Insert a prior PR whose only file is generated; M1 must
+    // be unchanged from the no-prior case (= 1 for the golden window HALOC of 19).
+    await store.upsertPullRequest({
+      id: 'pr-prior-generated',
+      repoId: IDS.repoAlpha,
+      number: 9001,
+      authorIdentityId: IDS.identityAliceGh,
+      state: 'merged',
+      headRef: 'chore/lockfile',
+      baseRef: 'main',
+      isDraft: false,
+      mergedViaQueue: false,
+      createdAt: '2023-12-01T00:00:00Z', // BEFORE the window start (FROM=2024-01-01)
+      readyAt: '2023-12-01T00:00:00Z',
+      firstCommitAt: '2023-12-01T00:00:00Z',
+      firstReviewAt: null,
+      approvedAt: null,
+      mergedAt: '2023-12-02T00:00:00Z',
+      mergedByIdentityId: IDS.identityAliceGh,
+      deletedAt: null,
+      raw: '{}',
+      updatedAt: '2023-12-02T00:00:00Z',
+    })
+    await store.upsertPrFile({
+      prId: 'pr-prior-generated',
+      repoId: IDS.repoAlpha,
+      path: 'package-lock.json',
+      additions: 5000,
+      deletions: 5000,
+      haloc: 10000,
+      status: 'modified',
+      patch: null,
+      isGenerated: true,
+      createdAt: '2023-12-01T00:00:00Z',
+      updatedAt: '2023-12-01T00:00:00Z',
+    })
+
+    const r = await compute('code.nagappan_ball')
+    // Prior generated churn is excluded → priorHaloc = 0 → M1 = 19/(0+19) = 1.
+    // With the bug, M1 would be 19/(10000+19) ≈ 0.0019.
+    expect(r.value).toBe(1)
+    expect(r.m1RelativeChurn).toBe(1)
   })
 
   it('code.change_impact → ok with a REAL deterministic impact score', async () => {
@@ -894,9 +974,12 @@ describe('computeMetric', () => {
       NOW,
     )
     // alice has review activity in the golden dataset (authored + reviewed PRs).
+    // Below the interaction sample floor the ratio is still computed but honestly
+    // flagged insufficient_sample (a few reviews are not a stable balance), so that
+    // is a valid quality here alongside ok/no_data.
     expect(r.scope).toBe('person')
-    expect(['ok', 'no_data']).toContain(r.dataQuality)
-    if (r.dataQuality === 'ok') {
+    expect(['ok', 'insufficient_sample', 'no_data']).toContain(r.dataQuality)
+    if (r.dataQuality !== 'no_data') {
       expect(r.value).toBeGreaterThanOrEqual(0)
       expect(r.reviewsGiven + r.reviewsReceived).toBeGreaterThan(0)
     }
@@ -1261,4 +1344,186 @@ describe('sliceScopeData ≡ loadScopeDataWindowed (perf-rewrite equivalence)', 
       })
     }
   }
+})
+
+// ---------------------------------------------------------------------------
+// Backfill N+1 kill: code.complexity_delta and code.maintainability_index used
+// to call `store.getPrRef(prId)` and `store.getFileComplexity(...)` INSIDE the
+// per-PR/per-file loop on every day of the backfill. Both are now read from
+// bulk maps that the loader populates ONCE via store.getAllPrRefs +
+// store.getAllFileComplexity. The point-query fallback is preserved for callers
+// that build `data` without the maps — this test pins both paths produce
+// byte-identical metric values.
+// ---------------------------------------------------------------------------
+
+describe('complexity_delta / maintainability_index — bulk-map ≡ point-query fallback', () => {
+  let store
+  beforeEach(async () => {
+    store = freshStore()
+    await seed(store)
+    // Seed pr_refs + file_complexity so the metrics produce 'ok' results
+    // through both the bulk-map path and the point-query fallback.
+    await store.upsertPrRef({
+      prId: IDS.pr1,
+      repoId: IDS.repoAlpha,
+      baseSha: 'base-sha',
+      headSha: 'head-sha',
+      updatedAt: NOW,
+    })
+    await store.upsertFileComplexity({
+      repoId: IDS.repoAlpha,
+      sha: 'base-sha',
+      path: 'src/widget.ts',
+      language: 'typescript',
+      loc: 40,
+      totalCyclomatic: 3,
+      functionCount: 1,
+      functions: [{ name: 'render', cyclomatic: 3, cognitive: 2 }],
+      computedAt: NOW,
+    })
+    await store.upsertFileComplexity({
+      repoId: IDS.repoAlpha,
+      sha: 'head-sha',
+      path: 'src/widget.ts',
+      language: 'typescript',
+      loc: 52,
+      totalCyclomatic: 6,
+      functionCount: 2,
+      functions: [
+        { name: 'render', cyclomatic: 4, cognitive: 3 },
+        { name: 'mount', cyclomatic: 2, cognitive: 1 },
+      ],
+      computedAt: NOW,
+    })
+  })
+
+  // A window where pr-1 is in scope.
+  const FROM = '2024-02-01'
+  const TO = '2024-03-31'
+
+  for (const metricId of ['code.complexity_delta', 'code.maintainability_index']) {
+    it(`${metricId} — bulk-map value === point-query fallback value`, async () => {
+      // (a) Normal path — loadScopeDataWindowed bulk-loads prRefById /
+      //     fileComplexityByKey and the metric reads from the maps.
+      const withMaps = await loadScopeDataWindowed(store, FROM, TO)
+      // Sanity: the loader attached the bulk maps the metric reads from.
+      expect(withMaps.prRefById).toBeInstanceOf(Map)
+      expect(withMaps.fileComplexityByKey).toBeInstanceOf(Map)
+      expect(withMaps.prRefById.size).toBeGreaterThan(0)
+      expect(withMaps.fileComplexityByKey.size).toBeGreaterThan(0)
+      const viaMaps = await computeMetric(store, 'org', 'org', metricId, FROM, TO, NOW, withMaps)
+
+      // (b) Fallback path — strip the maps so the metric MUST call
+      //     store.getPrRef / store.getFileComplexity for each PR / file.
+      const withoutMaps = { ...withMaps, prRefById: undefined, fileComplexityByKey: undefined }
+      const viaPointQuery = await computeMetric(
+        store,
+        'org',
+        'org',
+        metricId,
+        FROM,
+        TO,
+        NOW,
+        withoutMaps,
+      )
+
+      expect(viaMaps.dataQuality).toBe('ok')
+      expect(viaPointQuery.dataQuality).toBe('ok')
+      expect(viaMaps.value).toBe(viaPointQuery.value)
+    })
+  }
+})
+
+// Regression: the global-lookups memo is keyed on the (long-lived) store, so in
+// a persistent MCP server a SECOND sync's recompute must not read lookups cached
+// before that sync's ingestion writes. backfillSnapshots (and the engine-bump
+// rederive) must invalidate the memo so freshly-ingested file_complexity /
+// pr_refs / status categories are seen. Fails before the invalidateLookupsCache
+// wiring; passes after.
+describe('global-lookups memo — invalidated by recompute entry points', () => {
+  let store
+  beforeEach(async () => {
+    store = freshStore()
+    await seed(store)
+    await store.upsertPrRef({
+      prId: IDS.pr1,
+      repoId: IDS.repoAlpha,
+      baseSha: 'base-sha',
+      headSha: 'head-sha',
+      updatedAt: NOW,
+    })
+    await store.upsertFileComplexity({
+      repoId: IDS.repoAlpha,
+      sha: 'head-sha',
+      path: 'src/widget.ts',
+      language: 'typescript',
+      loc: 52,
+      totalCyclomatic: 6,
+      functionCount: 2,
+      functions: [{ name: 'render', cyclomatic: 4, cognitive: 3 }],
+      computedAt: NOW,
+    })
+  })
+
+  it('a new file_complexity row is invisible until the memo is invalidated', async () => {
+    // Prime the memo (simulates a get_* / prior backfill populating it).
+    const before = await loadFullScopeData(store)
+    const baseSize = before.fileComplexityByKey.size
+    expect(baseSize).toBeGreaterThan(0)
+
+    // A later "sync" ingests a new complexity row.
+    await store.upsertFileComplexity({
+      repoId: IDS.repoAlpha,
+      sha: 'head-sha',
+      path: 'src/added-after-memo.ts',
+      language: 'typescript',
+      loc: 10,
+      totalCyclomatic: 2,
+      functionCount: 1,
+      functions: [{ name: 'added', cyclomatic: 2, cognitive: 1 }],
+      computedAt: NOW,
+    })
+
+    // Without invalidation the memo is stale — the new row is not yet visible.
+    const stale = await loadFullScopeData(store)
+    expect(stale.fileComplexityByKey.size).toBe(baseSize)
+
+    // Explicit invalidation surfaces it.
+    invalidateLookupsCache(store)
+    const fresh = await loadFullScopeData(store)
+    expect(fresh.fileComplexityByKey.size).toBe(baseSize + 1)
+  })
+
+  it('backfillSnapshots invalidates the memo so the recompute reads post-write state', async () => {
+    // Prime the memo, then ingest a new complexity row AFTER it is cached.
+    const before = await loadFullScopeData(store)
+    const baseSize = before.fileComplexityByKey.size
+    await store.upsertFileComplexity({
+      repoId: IDS.repoAlpha,
+      sha: 'head-sha',
+      path: 'src/added-before-backfill.ts',
+      language: 'typescript',
+      loc: 12,
+      totalCyclomatic: 3,
+      functionCount: 1,
+      functions: [{ name: 'fn', cyclomatic: 3, cognitive: 2 }],
+      computedAt: NOW,
+    })
+
+    // A backfill (always runs after a sync's ingestion) must refresh the memo.
+    await backfillSnapshots(store, {
+      scopeType: 'org',
+      scopeId: 'org',
+      metricIds: ['code.maintainability_index'],
+      fromDay: '2024-06-01',
+      toDay: '2024-06-01',
+      windowDays: 1,
+      now: NOW,
+      ingestWatermarkVersion: '1',
+      coverageFingerprint: 'test',
+    })
+
+    const fresh = await loadFullScopeData(store)
+    expect(fresh.fileComplexityByKey.size).toBe(baseSize + 1)
+  })
 })

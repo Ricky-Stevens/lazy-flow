@@ -5,7 +5,18 @@ const RECIPROCITY_DOC =
   'reviews their own authored PRs RECEIVE. reciprocity = reviewsGiven / (reviewsReceived + 1). ' +
   '>1 = net reviewer (carries review load); <1 = net receiver. Counts non-author, non-bot ' +
   'reviews only. A collaboration-health signal compared to a peer cohort — never a rank, and ' +
-  'low reciprocity is not "bad" (juniors receive more than they give by design).'
+  'low reciprocity is not "bad" (juniors receive more than they give by design). ' +
+  'Below SAMPLE_FLOOR total review interactions the ratio is reported but flagged ' +
+  'insufficient_sample — a value from one or two reviews is noise, not a balance.'
+
+/**
+ * Minimum total review interactions (given + received) for the ratio to be a
+ * stable signal rather than a coin-flip. Mirrors the SAMPLE_FLOOR convention the
+ * sibling person metrics use, so a single review never reads as an authoritative
+ * collaboration balance (and never seeds the peer baseline — the report only
+ * folds `ok`-quality peers into the cohort distribution).
+ */
+const SAMPLE_FLOOR = 5
 
 /**
  * Person-scope review give/receive balance. Inputs are pre-aggregated by the
@@ -47,6 +58,7 @@ export const reviewReciprocity = {
     // +1 smoothing on the denominator keeps the ratio finite for a pure giver
     // (received = 0) and bounds an early-tenure receiver near 0 rather than at it.
     const reciprocity = safeRatio(given, received + 1)
-    return { ...base, value: reciprocity, dataQuality: 'ok', reciprocity }
+    const dataQuality = given + received < SAMPLE_FLOOR ? 'insufficient_sample' : 'ok'
+    return { ...base, value: reciprocity, dataQuality, reciprocity }
   },
 }

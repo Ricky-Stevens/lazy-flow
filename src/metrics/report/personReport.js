@@ -21,6 +21,12 @@ import { assertNotRankingList } from '../visibility/index.js'
  * Metrics surfaced in the report, with comparison polarity.
  * polarity: +1 higher-is-healthier, -1 lower-is-healthier, 0 descriptive (no
  * better/worse — shown as position only, never oriented).
+ *
+ * `requiresBucketing: true` flags a metric whose pure-module formulaDoc states
+ * the peer baseline must be segmented (by language, role, etc.) before any
+ * cross-person comparison is fair. Bucketing is not yet implemented; until it
+ * is, those metrics are emitted as descriptive + self-baseline trend ONLY, with
+ * `comparison.band = 'requires_bucketing'` instead of a raw peer placement.
  */
 export const REPORT_METRICS = [
   { id: 'person.review_reciprocity', polarity: 0, question: 'Collaboration' },
@@ -33,14 +39,25 @@ export const REPORT_METRICS = [
   { id: 'pr.changes_requested_rate_received', polarity: 0, question: 'Q6' },
   { id: 'pr.review_iterations', polarity: 0, question: 'Q6' },
   { id: 'pr.comments_per_pr', polarity: 0, question: 'Q6' },
-  { id: 'pr.feedback_response_latency', polarity: -1, question: 'Q6' },
-  { id: 'person.complexity_authored_delta', polarity: 0, question: 'Q1' },
-  { id: 'person.high_complexity_file_share', polarity: 0, question: 'Q1' },
-  { id: 'person.pr_conceptual_surface', polarity: 0, question: 'Q4' },
+  // Descriptive (polarity 0), NOT lower-is-better: the underlying sample is the
+  // review-to-review round-trip cadence (the next review arriving after a
+  // changes_requested), which is gated by when the REVIEWER returns — it is not
+  // a clean measure of how fast the IC addressed feedback. Treating it as
+  // lower-is-better would penalise an author for a slow reviewer. Surface it as
+  // a stuck/overload prompt only, with no better/worse orientation.
+  { id: 'pr.feedback_response_latency', polarity: 0, question: 'Q6' },
+  { id: 'person.complexity_authored_delta', polarity: 0, question: 'Q1', requiresBucketing: true },
+  { id: 'person.high_complexity_file_share', polarity: 0, question: 'Q1', requiresBucketing: true },
+  { id: 'person.pr_conceptual_surface', polarity: 0, question: 'Q4', requiresBucketing: true },
   { id: 'pr.size', polarity: 0, question: 'Q4' },
   { id: 'person.worktype_mix', polarity: 0, question: 'Q2' },
   { id: 'person.bugfix_share', polarity: 0, question: 'Q2' },
-  { id: 'person.skill_domain_footprint', polarity: 0, question: 'Differentiator' },
+  {
+    id: 'person.skill_domain_footprint',
+    polarity: 0,
+    question: 'Differentiator',
+    requiresBucketing: true,
+  },
   { id: 'person.knowledge_ownership_index', polarity: 0, question: 'Differentiator' },
   { id: 'person.ai_blend_rework_coupling', polarity: 0, question: 'Differentiator' },
   // Probabilistic — populated once in-session verdicts exist (else no_data).
@@ -108,7 +125,7 @@ export async function computePersonReport(store, personId, opts, deps) {
   const cohortViable = cohort.length >= MIN_COHORT
 
   const metrics = []
-  for (const { id, polarity, question } of REPORT_METRICS) {
+  for (const { id, polarity, question, requiresBucketing = false } of REPORT_METRICS) {
     const personResult = await deps.computeMetric(
       store,
       'person',
@@ -120,14 +137,40 @@ export async function computePersonReport(store, personId, opts, deps) {
       data,
     )
     // Cohort distribution for the SAME metric (shared preloaded data, no reload).
+    // Exclude the subject themselves — including the person in the distribution
+    // they are compared against pulls the median toward their own value and
+    // suppresses any deviation; the comparison must be "this person vs everyone
+    // ELSE on the team", not "this person vs a distribution that contains them".
     const cohortValues = []
-    if (cohortViable) {
+    // Skip cohort gather when bucketing-required (we never emit a peer placement
+    // for those metrics) — saves M × P computes that would be thrown away.
+    if (cohortViable && !requiresBucketing) {
       for (const peer of cohort) {
+        if (peer.id === personId) continue
         const r = await deps.computeMetric(store, 'person', peer.id, id, fromDay, toDay, now, data)
-        if (r.value !== null && Number.isFinite(r.value)) cohortValues.push(r.value)
+        // Only peers whose value cleared the metric's OWN sample floor may seed the
+        // baseline. ~18 person metrics deliberately still return a finite value when
+        // below their floor but flag it `insufficient_sample` (or `no_data`); folding
+        // those into the cohort distribution rebuilds the median/MAD the subject is
+        // judged against out of values the metric itself declared untrustworthy —
+        // defeating the very floor that exists to stop confident bands on noise.
+        if (r.value !== null && Number.isFinite(r.value) && r.dataQuality === 'ok') {
+          cohortValues.push(r.value)
+        }
       }
     }
-    const comparison = comparePersonToCohort(personResult.value, cohortValues, { polarity })
+    const comparison = requiresBucketing
+      ? {
+          value: Number.isFinite(personResult.value) ? personResult.value : null,
+          percentile: null,
+          robustZ: null,
+          band: 'requires_bucketing',
+          cohortN: cohortValues.length,
+          suppressed: true,
+          direction: null,
+          reason: 'requires_bucketing',
+        }
+      : comparePersonToCohort(personResult.value, cohortValues, { polarity })
     metrics.push({
       metric: id,
       question,
@@ -161,13 +204,18 @@ export async function computePersonReport(store, personId, opts, deps) {
     displayName,
     window: { from: fromDay, to: toDay, days: windowDays },
     cohortSize: cohort.length,
-    cohortSuppressed: cohort.length < 8,
+    // The peer distribution EXCLUDES the subject (see line ~143), so the gate
+    // must be on peers-excluding-subject vs MIN_COHORT — matching the per-metric
+    // comparePersonToCohort suppression. Using cohort.length here disagreed with
+    // the bands by one (a team of exactly MIN_COHORT incl. subject reported
+    // not-suppressed while every band said insufficient_cohort).
+    cohortSuppressed: cohort.length - 1 < MIN_COHORT,
     metrics,
     trend,
     contract:
       'Coaching signal, not a scorecard. Compared to this person’s own team distribution and ' +
       'their own history — never a rank. Descriptive metrics carry no better/worse orientation. ' +
-      'Peer comparison is suppressed below a cohort of 8 humans.',
+      `Peer comparison is suppressed below a cohort of ${MIN_COHORT} human peers.`,
   }
 }
 
