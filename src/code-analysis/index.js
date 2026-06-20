@@ -8,7 +8,7 @@ export {
   initParser,
   setGrammarDir,
 } from './complexity.js'
-
+export { synthesizeUnifiedDiff } from './diff.js'
 export { computeHaloc } from './haloc.js'
 
 // Work-type / churn split (SPEC §8.4)

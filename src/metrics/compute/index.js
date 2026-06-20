@@ -1,4 +1,4 @@
-import { ENGINE_VERSION } from '../../core/index.js'
+import { ENGINE_VERSION, percentile } from '../../core/index.js'
 
 import { estimationAccuracy, sayDo, sprintPredictability, sprintVelocity } from '../agile/index.js'
 import {
@@ -39,6 +39,33 @@ import {
 } from '../flow/index.js'
 
 import {
+  aiBlendCoupling,
+  bugfixShare,
+  changesRequestedReceived,
+  ciGreenBeforeMerge,
+  complexityAuthoredDelta,
+  conventionAdherence,
+  designBearingRatio,
+  feedbackResponseLatency,
+  feedbackSeverityMix,
+  highComplexityFileShare,
+  knowledgeOwnership,
+  momentumVsTeam,
+  prAtomicity,
+  prConceptualSurface,
+  prDescriptionQuality,
+  prReviewDifficulty,
+  reviewBypassReceived,
+  reviewDepthMentorship,
+  reviewReciprocity,
+  selfBaselineDrift,
+  skillDomainFootprint,
+  smallPrDiscipline,
+  testInclusionRate,
+  ticketLinkageRate,
+  worktypeMix,
+} from '../person/index.js'
+import {
   ciHealth,
   commentsPerPr,
   mergeWithoutReviewRate,
@@ -53,6 +80,26 @@ import {
   timeToFirstReview,
   timeToMerge,
 } from '../pr/index.js'
+import { computePersonReport } from '../report/personReport.js'
+import {
+  buildAiBlendInputs,
+  buildChangesRequestedInputs,
+  buildCiGreenInputs,
+  buildComplexityDeltaInputs,
+  buildConceptualSurfaceInputs,
+  buildFeedbackLatencyInputs,
+  buildHighComplexityShareInputs,
+  buildKnowledgeOwnershipInputs,
+  buildReviewBypassInputs,
+  buildSkillDomainInputs,
+  buildSmallPrInputs,
+  buildTestInclusionInputs,
+  buildTicketLinkageInputs,
+  buildWorktypeUnits,
+  fcKey,
+  repoPathKey,
+  repoShaKey,
+} from './personDerive.js'
 
 // ---------------------------------------------------------------------------
 // Wired metric ids
@@ -108,6 +155,33 @@ export const COMPUTE_METRIC_IDS = [
   'code.complexity_delta',
   'code.maintainability_index',
   'code.rework_churn',
+  // Person-only (computed at person/self scope; team scope returns no_data)
+  'person.review_reciprocity',
+  'person.knowledge_ownership_index',
+  'person.ai_blend_rework_coupling',
+  'person.ci_green_before_merge_rate',
+  'person.ticket_linkage_rate',
+  'person.test_inclusion_rate',
+  'person.wip_small_pr_discipline',
+  'pr.changes_requested_rate_received',
+  'pr.review_bypass_rate_received',
+  'pr.feedback_response_latency',
+  'person.complexity_authored_delta',
+  'person.high_complexity_file_share',
+  'person.pr_conceptual_surface',
+  'person.worktype_mix',
+  'person.bugfix_share',
+  'person.skill_domain_footprint',
+  'person.self_baseline_drift',
+  'person.momentum_vs_team',
+  // Probabilistic — aggregate in-session-Claude verdicts from ai_verdicts
+  'person.design_bearing_ratio',
+  'person.pr_review_difficulty',
+  'person.pr_atomicity',
+  'person.pr_description_quality',
+  'person.convention_adherence',
+  'pr.feedback_severity_mix_received',
+  'person.review_depth_mentorship',
 ]
 
 // ---------------------------------------------------------------------------
@@ -496,7 +570,9 @@ function toPrInput(pr, files) {
   return {
     id: pr.id,
     repoId: pr.repoId,
+    number: pr.number,
     authorIdentityId: pr.authorIdentityId,
+    mergedByIdentityId: pr.mergedByIdentityId,
     state: pr.state,
     isDraft: pr.isDraft,
     firstCommitAt: pr.firstCommitAt,
@@ -1066,6 +1142,31 @@ const MODULES = {
   'code.haloc_aggregate': halocAggregate,
   'code.nagappan_ball': nagappanBall,
   'code.change_impact': codeChangeImpact,
+  'person.review_reciprocity': reviewReciprocity,
+  'person.knowledge_ownership_index': knowledgeOwnership,
+  'person.ai_blend_rework_coupling': aiBlendCoupling,
+  'person.ci_green_before_merge_rate': ciGreenBeforeMerge,
+  'person.ticket_linkage_rate': ticketLinkageRate,
+  'person.test_inclusion_rate': testInclusionRate,
+  'person.wip_small_pr_discipline': smallPrDiscipline,
+  'pr.changes_requested_rate_received': changesRequestedReceived,
+  'pr.review_bypass_rate_received': reviewBypassReceived,
+  'pr.feedback_response_latency': feedbackResponseLatency,
+  'person.complexity_authored_delta': complexityAuthoredDelta,
+  'person.high_complexity_file_share': highComplexityFileShare,
+  'person.pr_conceptual_surface': prConceptualSurface,
+  'person.worktype_mix': worktypeMix,
+  'person.bugfix_share': bugfixShare,
+  'person.skill_domain_footprint': skillDomainFootprint,
+  'person.self_baseline_drift': selfBaselineDrift,
+  'person.momentum_vs_team': momentumVsTeam,
+  'person.design_bearing_ratio': designBearingRatio,
+  'person.pr_review_difficulty': prReviewDifficulty,
+  'person.pr_atomicity': prAtomicity,
+  'person.pr_description_quality': prDescriptionQuality,
+  'person.convention_adherence': conventionAdherence,
+  'pr.feedback_severity_mix_received': feedbackSeverityMix,
+  'person.review_depth_mentorship': reviewDepthMentorship,
 }
 
 /** Best-effort default unit for an unknown metric, derived from its id family. */
@@ -1626,10 +1727,29 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
       return estimationAccuracy.compute({ pairs: buildEstimationPairs(data, fromMs, toMs) }, now)
 
     // --- Code (Group D) ----------------------------------------------------
-    case 'code.haloc_aggregate':
+    case 'code.haloc_aggregate': {
       // REAL: recomputes HALOC over the ingested per-PR diffs. Returns no_data
       // inside the module when no pr_files were ingested for the window.
-      return halocAggregate.compute({ changes: buildCodeChanges(data) }, now)
+      const changes = buildCodeChanges(data)
+      const result = halocAggregate.compute({ changes }, now)
+      // GraphQL ingestion stores per-file HALOC in the denormalised column but
+      // leaves pr_files.patch NULL, so the diff-recompute above sums to 0 while
+      // real churn exists — a confident-but-wrong 0 at ok quality. When that
+      // happens, fall back to the denormalised column (the SAME source
+      // code.nagappan_ball already trusts) so the metric reflects real churn.
+      // `halocSource` records which path the value came from for transparency.
+      const denormHaloc = totalWindowHaloc(data)
+      if (result.totalHaloc === 0 && denormHaloc > 0) {
+        return {
+          ...result,
+          value: denormHaloc,
+          totalHaloc: denormHaloc,
+          avgHalocPerChange: result.changeCount > 0 ? denormHaloc / result.changeCount : null,
+          halocSource: 'denormalized_prfile_column',
+        }
+      }
+      return { ...result, halocSource: 'recomputed_from_patch' }
+    }
 
     case 'code.nagappan_ball': {
       // M1 (relative churn) and M2 (churn rate) are REAL from the window HALOC,
@@ -1846,6 +1966,40 @@ const PERSON_SUPPORTED_METRICS = new Set([
   'pr.time_to_merge',
   'pr.time_to_first_review',
   'pr.review_latency', // review latency the person GIVES (as reviewer)
+  // Q5 best-practice + Q6 feedback RECEIVED, scoped to the person's authored PRs:
+  'pr.review_coverage', // were their PRs reviewed before merge?
+  'pr.merge_without_review_rate', // self-merge / review-bypass on their PRs
+  'pr.reviewers_per_pr', // how many reviewers their PRs draw
+  'pr.comments_per_pr', // feedback density received
+  'pr.review_iterations', // changes-requested rounds received (rework signal)
+  'person.review_reciprocity', // reviews given vs received (collaboration balance)
+  // New per-person signals computed by computePersonRaw from loaded data + extras.
+  'person.knowledge_ownership_index',
+  'person.ai_blend_rework_coupling',
+  'person.ci_green_before_merge_rate',
+  'person.ticket_linkage_rate',
+  'person.test_inclusion_rate',
+  'person.wip_small_pr_discipline',
+  'pr.changes_requested_rate_received',
+  'pr.review_bypass_rate_received',
+  'pr.feedback_response_latency',
+  'person.complexity_authored_delta',
+  'person.high_complexity_file_share',
+  'person.pr_conceptual_surface',
+  'person.worktype_mix',
+  'person.bugfix_share',
+  'person.skill_domain_footprint',
+  // Probabilistic — aggregate stored in-session-Claude verdicts (no_data until generated).
+  'person.design_bearing_ratio',
+  'person.pr_review_difficulty',
+  'person.pr_atomicity',
+  'person.pr_description_quality',
+  'person.convention_adherence',
+  'pr.feedback_severity_mix_received',
+  'person.review_depth_mentorship',
+  // NOTE: self_baseline_drift + momentum_vs_team are trend meta-metrics computed
+  // by the person-report orchestrator (they need snapshots + team context), not
+  // by computePersonRaw — they intentionally stay OUT of this set.
 ])
 
 /**
@@ -1870,11 +2024,40 @@ async function computePersonRaw(store, metricId, windowFrom, windowTo, now, data
       .filter((i) => i.assigneeIdentityId !== null && identityIds.has(i.assigneeIdentityId))
       .map((i) => toFlowIssueRecord(i, data.transitionsByIssue.get(i.id) ?? []))
 
-  // PRs the person authored → their authoring slice.
-  const authoredPrInputs = () =>
-    data.prs
-      .filter((pr) => pr.authorIdentityId !== null && identityIds.has(pr.authorIdentityId))
-      .map((pr) => toPrInput(pr, data.prFilesByPr.get(pr.id)))
+  // PRs the person authored → their authoring slice. Derived ONCE per (data,
+  // person) and reused across every metric: identityIds is the SAME Set instance
+  // for all of a person's metrics (memoised in computeMetric), so a WeakMap keyed
+  // by it collapses M O(all-PRs) filter scans per person down to one.
+  if (!data.__personSliceByIds) data.__personSliceByIds = new WeakMap()
+  const sliceMemo = data.__personSliceByIds
+  let slice = sliceMemo.get(identityIds)
+  if (slice === undefined) {
+    const prs = data.prs.filter(
+      (pr) => pr.authorIdentityId !== null && identityIds.has(pr.authorIdentityId),
+    )
+    slice = { authoredPrs: prs, authoredPrIds: new Set(prs.map((pr) => pr.id)) }
+    sliceMemo.set(identityIds, slice)
+  }
+  const { authoredPrs, authoredPrIds } = slice
+  const authoredPrInputs = () => authoredPrs.map((pr) => toPrInput(pr, data.prFilesByPr.get(pr.id)))
+
+  // Reviews / comments RECEIVED on the person's authored PRs — the basis for
+  // "is their work reviewed?" (coverage, merge-without-review) and "how much
+  // feedback/rework do they draw?" (comments, changes-requested iterations).
+  const reviewsOnAuthoredPrs = () => {
+    const out = []
+    for (const [prId, revs] of data.reviewsByPr) {
+      if (authoredPrIds.has(prId)) for (const r of revs) out.push(toReviewInput(r))
+    }
+    return out
+  }
+  const commentsOnAuthoredPrs = () => {
+    const out = []
+    for (const [prId, comments] of data.reviewCommentsByPr) {
+      if (authoredPrIds.has(prId)) for (const c of comments) out.push(toReviewCommentInput(c))
+    }
+    return out
+  }
 
   switch (metricId) {
     case 'flow.cycle_time': {
@@ -1938,9 +2121,446 @@ async function computePersonRaw(store, metricId, windowFrom, windowTo, now, data
         .map((pr) => toPrInput(pr, data.prFilesByPr.get(pr.id)))
       return reviewLatency.compute({ prs, reviews: personReviews }, now)
     }
+    // --- Q5 best-practice + Q6 feedback RECEIVED on the person's authored PRs ---
+    // These reuse the team modules with the inputs narrowed to authored PRs, so a
+    // person's "review coverage" = coverage on the PRs THEY shipped, etc.
+    case 'pr.review_coverage':
+      return reviewCoverage.compute(
+        {
+          prs: authoredPrInputs(),
+          reviews: reviewsOnAuthoredPrs(),
+          reviewComments: [],
+          botIdentityIds: data.botIdentityIds,
+        },
+        now,
+      )
+    case 'pr.merge_without_review_rate':
+      return mergeWithoutReviewRate.compute(
+        {
+          prs: authoredPrInputs(),
+          reviews: reviewsOnAuthoredPrs(),
+          reviewComments: [],
+          botIdentityIds: data.botIdentityIds,
+        },
+        now,
+      )
+    case 'pr.reviewers_per_pr':
+      return reviewersPerPr.compute(
+        {
+          prs: authoredPrInputs(),
+          reviews: reviewsOnAuthoredPrs(),
+          reviewComments: [],
+          botIdentityIds: data.botIdentityIds,
+        },
+        now,
+      )
+    case 'pr.comments_per_pr':
+      return commentsPerPr.compute(
+        {
+          prs: authoredPrInputs(),
+          reviews: reviewsOnAuthoredPrs(),
+          reviewComments: commentsOnAuthoredPrs(),
+          botIdentityIds: data.botIdentityIds,
+        },
+        now,
+      )
+    case 'pr.review_iterations':
+      return reviewIterations.compute(
+        {
+          prs: authoredPrInputs(),
+          reviews: reviewsOnAuthoredPrs(),
+          reviewComments: [],
+          botIdentityIds: data.botIdentityIds,
+        },
+        now,
+      )
+    case 'person.review_reciprocity': {
+      const bots = data.botIdentityIds ?? new Set()
+      // PR→author map is person-independent — build once per data, reuse per person.
+      if (!data.__prAuthorById) {
+        data.__prAuthorById = new Map(data.prs.map((pr) => [pr.id, pr.authorIdentityId]))
+      }
+      const prAuthorById = data.__prAuthorById
+      // Reviews the person GAVE on OTHER people's PRs (not self-reviews).
+      let reviewsGiven = 0
+      const prsReviewed = new Set()
+      for (const [prId, revs] of data.reviewsByPr) {
+        const authorId = prAuthorById.get(prId)
+        if (authorId !== undefined && identityIds.has(authorId)) continue // own PR
+        for (const r of revs) {
+          if (identityIds.has(r.reviewerIdentityId)) {
+            reviewsGiven++
+            prsReviewed.add(prId)
+          }
+        }
+      }
+      // Non-author, non-bot reviews RECEIVED on the person's authored PRs.
+      let reviewsReceived = 0
+      let authoredPrsWithReview = 0
+      for (const pr of authoredPrs) {
+        const revs = data.reviewsByPr.get(pr.id) ?? []
+        let prHadReview = false
+        for (const r of revs) {
+          if (!identityIds.has(r.reviewerIdentityId) && !bots.has(r.reviewerIdentityId)) {
+            reviewsReceived++
+            prHadReview = true
+          }
+        }
+        if (prHadReview) authoredPrsWithReview++
+      }
+      return reviewReciprocity.compute(
+        {
+          reviewsGiven,
+          reviewsReceived,
+          prsReviewed: prsReviewed.size,
+          authoredPrsWithReview,
+        },
+        now,
+      )
+    }
+    default:
+      break
+  }
+
+  // --- Metrics that need the assembled person extras (pr_refs / file_complexity
+  // / pr_issue_links / ai_authorship) or the in-session-Claude verdict store ----
+  const bots = data.botIdentityIds ?? new Set()
+  const mergedAuthored = authoredPrs.filter((pr) => pr.state === 'merged')
+
+  switch (metricId) {
+    case 'person.ticket_linkage_rate': {
+      const ex = await loadPersonExtras(store, data)
+      return ticketLinkageRate.compute(
+        buildTicketLinkageInputs(mergedAuthored, ex.linkCountByPr),
+        now,
+      )
+    }
+    case 'person.test_inclusion_rate':
+      return testInclusionRate.compute(
+        buildTestInclusionInputs(mergedAuthored, data.prFilesByPr),
+        now,
+      )
+    case 'person.wip_small_pr_discipline': {
+      const allMerged = data.prs.filter((pr) => pr.state === 'merged')
+      return smallPrDiscipline.compute(
+        buildSmallPrInputs(mergedAuthored, allMerged, data.prFilesByPr, null),
+        now,
+      )
+    }
+    case 'pr.changes_requested_rate_received':
+      return changesRequestedReceived.compute(
+        buildChangesRequestedInputs(mergedAuthored, data.reviewsByPr, identityIds, bots),
+        now,
+      )
+    case 'pr.review_bypass_rate_received':
+      return reviewBypassReceived.compute(
+        buildReviewBypassInputs(mergedAuthored, data.reviewsByPr, identityIds, bots),
+        now,
+      )
+    case 'pr.feedback_response_latency':
+      return feedbackResponseLatency.compute(
+        buildFeedbackLatencyInputs(mergedAuthored, data.reviewsByPr, identityIds, bots),
+        now,
+      )
+    case 'person.skill_domain_footprint':
+      return skillDomainFootprint.compute(
+        buildSkillDomainInputs(authoredPrs, data.prFilesByPr),
+        now,
+      )
+    case 'person.ci_green_before_merge_rate': {
+      const ex = await loadPersonExtras(store, data)
+      return ciGreenBeforeMerge.compute(
+        buildCiGreenInputs(mergedAuthored, ex.refByPr, ex.checkRunsByRepoSha),
+        now,
+      )
+    }
+    case 'person.complexity_authored_delta': {
+      const ex = await loadPersonExtras(store, data)
+      return complexityAuthoredDelta.compute(
+        buildComplexityDeltaInputs(mergedAuthored, data.prFilesByPr, ex.refByPr, ex.fcByKey),
+        now,
+      )
+    }
+    case 'person.high_complexity_file_share': {
+      const ex = await loadPersonExtras(store, data)
+      return highComplexityFileShare.compute(
+        buildHighComplexityShareInputs(
+          mergedAuthored,
+          data.prFilesByPr,
+          ex.refByPr,
+          ex.fcByKey,
+          ex.cycloThresholdByRepo,
+        ),
+        now,
+      )
+    }
+    case 'person.pr_conceptual_surface': {
+      const ex = await loadPersonExtras(store, data)
+      return prConceptualSurface.compute(
+        buildConceptualSurfaceInputs(mergedAuthored, data.prFilesByPr, ex.refByPr, ex.fcByKey),
+        now,
+      )
+    }
+    case 'person.worktype_mix':
+    case 'person.bugfix_share': {
+      const ex = await loadPersonExtras(store, data)
+      const assignedResolved = data.issues.filter(
+        (i) =>
+          i.assigneeIdentityId !== null &&
+          identityIds.has(i.assigneeIdentityId) &&
+          (i.statusCategory === 'done' || i.resolvedAt),
+      )
+      const built = buildWorktypeUnits(
+        mergedAuthored,
+        data.prFilesByPr,
+        ex.issueIdsByPr,
+        ex.issuesById,
+        assignedResolved,
+      )
+      return metricId === 'person.worktype_mix'
+        ? worktypeMix.compute({ buckets: built.buckets }, now)
+        : bugfixShare.compute(built.bugfix, now)
+    }
+    case 'person.knowledge_ownership_index': {
+      const ex = await loadPersonExtras(store, data)
+      return knowledgeOwnership.compute(
+        buildKnowledgeOwnershipInputs(
+          data.prs,
+          data.prFilesByPr,
+          identityIds,
+          ex.latestCycloByPath,
+        ),
+        now,
+      )
+    }
+    case 'person.ai_blend_rework_coupling': {
+      const ex = await loadPersonExtras(store, data)
+      const aiScores = []
+      for (const id of identityIds) {
+        for (const a of ex.aiByIdentity.get(id) ?? []) aiScores.push(a.aiScore)
+      }
+      return aiBlendCoupling.compute(
+        buildAiBlendInputs(
+          mergedAuthored,
+          ex.aiByEntity,
+          aiScores,
+          data.reviewsByPr,
+          data.reviewCommentsByPr,
+          identityIds,
+          bots,
+        ),
+        now,
+      )
+    }
+    // --- Probabilistic: aggregate stored in-session-Claude verdicts ----------
+    case 'person.design_bearing_ratio':
+    case 'person.pr_review_difficulty':
+    case 'person.pr_atomicity':
+    case 'person.pr_description_quality':
+    case 'person.convention_adherence':
+    case 'pr.feedback_severity_mix_received':
+    case 'person.review_depth_mentorship':
+      return computeVerdictMetric(store, metricId, now, {
+        authoredPrIds,
+        identityIds,
+        reviewsByPr: data.reviewsByPr,
+        reviewCommentsByPr: data.reviewCommentsByPr,
+        data,
+      })
     default:
       return noDataResult(metricId, 'person', now)
   }
+}
+
+/**
+ * Window-INDEPENDENT per-person extras: the maps derived purely from full tables
+ * (pr_issue_links, pr_refs, file_complexity, ai_authorship). These don't change
+ * with the report window, so a multi-window caller (the self-baseline trend, which
+ * slices the same dataset into ~13 weekly buckets) builds them ONCE and injects the
+ * result into each slice via `data.__sharedPersonExtras` — instead of re-scanning
+ * the (potentially huge) file_complexity table once per week.
+ */
+export async function loadSharedPersonExtras(store) {
+  const [prIssueLinks, prRefs, fileComplexity, aiAuthorship] = await Promise.all([
+    store.getAllPrIssueLinks(),
+    store.getAllPrRefs(),
+    store.getAllFileComplexity(),
+    store.getAllAiAuthorship(),
+  ])
+
+  const linkCountByPr = new Map()
+  const issueIdsByPr = new Map()
+  for (const l of prIssueLinks) {
+    linkCountByPr.set(l.prId, (linkCountByPr.get(l.prId) ?? 0) + 1)
+    if (!issueIdsByPr.has(l.prId)) issueIdsByPr.set(l.prId, [])
+    issueIdsByPr.get(l.prId).push(l.issueId)
+  }
+
+  const refByPr = new Map(prRefs.map((r) => [r.prId, r]))
+
+  const fcByKey = new Map()
+  const cycloByRepo = new Map()
+  const latestCycloByPath = new Map()
+  for (const f of fileComplexity) {
+    fcByKey.set(fcKey(f.repoId, f.sha, f.path), f)
+    if (!cycloByRepo.has(f.repoId)) cycloByRepo.set(f.repoId, [])
+    cycloByRepo.get(f.repoId).push(f.totalCyclomatic)
+    const pk = repoPathKey(f.repoId, f.path)
+    latestCycloByPath.set(pk, Math.max(latestCycloByPath.get(pk) ?? 0, f.totalCyclomatic))
+  }
+  const cycloThresholdByRepo = new Map()
+  for (const [repoId, vals] of cycloByRepo) cycloThresholdByRepo.set(repoId, percentile(vals, 0.75))
+
+  const aiByEntity = new Map(aiAuthorship.map((a) => [a.entityId, a]))
+  const aiByIdentity = new Map()
+  for (const a of aiAuthorship) {
+    if (a.authorIdentityId === null) continue
+    if (!aiByIdentity.has(a.authorIdentityId)) aiByIdentity.set(a.authorIdentityId, [])
+    aiByIdentity.get(a.authorIdentityId).push(a)
+  }
+
+  return {
+    linkCountByPr,
+    issueIdsByPr,
+    refByPr,
+    fcByKey,
+    cycloThresholdByRepo,
+    latestCycloByPath,
+    aiByEntity,
+    aiByIdentity,
+  }
+}
+
+/**
+ * Assemble the extra per-person data the richer metrics need. The window-INDEPENDENT
+ * maps come from loadSharedPersonExtras (reused via `data.__sharedPersonExtras` when
+ * a caller pre-built them); only the window-DEPENDENT indexes (check-runs by head
+ * SHA, issues by id) are derived from the sliced `data`. Memoised on `data` so a
+ * cohort loop sharing one preloaded dataset pays the cost once.
+ */
+async function loadPersonExtras(store, data) {
+  if (data.__personExtras) return data.__personExtras
+  const shared = data.__sharedPersonExtras ?? (await loadSharedPersonExtras(store))
+
+  const checkRunsByRepoSha = new Map()
+  for (const cr of data.checkRuns ?? []) {
+    const k = repoShaKey(cr.repoId, cr.headSha)
+    if (!checkRunsByRepoSha.has(k)) checkRunsByRepoSha.set(k, [])
+    checkRunsByRepoSha.get(k).push(cr)
+  }
+
+  const issuesById = new Map(data.issues.map((i) => [i.id, i]))
+
+  data.__personExtras = { ...shared, checkRunsByRepoSha, issuesById }
+  return data.__personExtras
+}
+
+/** ai_verdicts subject_type for each probabilistic person metric. */
+function verdictSubjectType(metricId) {
+  if (metricId === 'person.review_depth_mentorship') return 'review'
+  if (metricId === 'pr.feedback_severity_mix_received') return 'review_comment'
+  return 'pull_request'
+}
+
+/**
+ * Aggregate stored in-session-Claude verdicts (ai_verdicts) into a probabilistic
+ * person metric. Verdicts are produced by the current Claude session (see the
+ * generate_person_verdicts tool) — NEVER by an external API. Returns no_data
+ * until verdicts for the person's subjects exist.
+ */
+async function computeVerdictMetric(store, metricId, now, ctx) {
+  // Read all verdicts for this metric ONCE per data, then index. In a report's
+  // cohort loop this turns 7 metrics × (P+1) persons table reads into 7 total.
+  let memo = null
+  if (ctx.data) {
+    if (!ctx.data.__verdictsByMetric) ctx.data.__verdictsByMetric = new Map()
+    memo = ctx.data.__verdictsByMetric
+  }
+  let verdicts = memo ? memo.get(metricId) : undefined
+  if (verdicts === undefined) {
+    verdicts = await store.getAiVerdictsByMetric(verdictSubjectType(metricId), metricId)
+    if (memo) memo.set(metricId, verdicts)
+  }
+
+  let relevant
+  if (metricId === 'person.review_depth_mentorship') {
+    const reviewNodeIds = new Set()
+    for (const revs of ctx.reviewsByPr.values()) {
+      for (const r of revs)
+        if (ctx.identityIds.has(r.reviewerIdentityId)) reviewNodeIds.add(r.nodeId)
+    }
+    relevant = verdicts.filter((v) => reviewNodeIds.has(v.subjectId))
+  } else if (metricId === 'pr.feedback_severity_mix_received') {
+    const commentNodeIds = new Set()
+    for (const [prId, comments] of ctx.reviewCommentsByPr) {
+      if (ctx.authoredPrIds.has(prId)) for (const c of comments) commentNodeIds.add(c.nodeId)
+    }
+    relevant = verdicts.filter((v) => commentNodeIds.has(v.subjectId))
+  } else {
+    relevant = verdicts.filter((v) => ctx.authoredPrIds.has(v.subjectId))
+  }
+
+  const j = relevant.map((r) => r.verdict)
+  switch (metricId) {
+    case 'person.design_bearing_ratio':
+      return designBearingRatio.compute(
+        {
+          verdicts: relevant.map((r) => ({
+            designBearing: r.verdict.designBearing === true,
+            difficulty: Number(r.verdict.difficulty ?? 0),
+            confidence: r.confidence,
+          })),
+          minConfidence: 0.5,
+        },
+        now,
+      )
+    case 'person.pr_review_difficulty':
+      return prReviewDifficulty.compute({ bands: j.map((x) => Number(x.band)) }, now)
+    case 'person.pr_atomicity':
+      return prAtomicity.compute(
+        {
+          priors: j.map((x) => Number(x.prior)),
+          sprawlingFlags: j.map((x) => x.sprawling === true),
+        },
+        now,
+      )
+    case 'person.pr_description_quality':
+      return prDescriptionQuality.compute({ ratings: j.map((x) => String(x.rating)) }, now)
+    case 'person.convention_adherence':
+      return conventionAdherence.compute({ adherence: j.map((x) => String(x.adherence)) }, now)
+    case 'pr.feedback_severity_mix_received':
+      return feedbackSeverityMix.compute({ severities: j.map((x) => String(x.severity)) }, now)
+    case 'person.review_depth_mentorship':
+      return reviewDepthMentorship.compute(
+        {
+          threads: j.map((x) => ({
+            category: String(x.category),
+            complexityWeight: Number(x.complexityWeight ?? 1),
+          })),
+        },
+        now,
+      )
+    default:
+      return noDataResult(metricId, 'person', now)
+  }
+}
+
+/**
+ * Resolve a person's identity-id Set once per (data, person) and memoise it on the
+ * data object. The returned Set instance is STABLE across all of a person's metrics
+ * for the same data — `computePersonRaw` keys its per-person slice cache off that
+ * instance. Callers holding identities already (e.g. the report, from listPersons)
+ * can pre-seed `data.__identityIdsByPerson` to skip the query entirely.
+ */
+async function resolvePersonIdentityIds(store, data, personId) {
+  if (!data.__identityIdsByPerson) data.__identityIdsByPerson = new Map()
+  const memo = data.__identityIdsByPerson
+  let ids = memo.get(personId)
+  if (ids === undefined) {
+    ids = new Set((await store.getIdentitiesByPerson(personId)).map((i) => i.id))
+    memo.set(personId, ids)
+  }
+  return ids
 }
 
 export async function computeMetric(
@@ -1963,10 +2583,13 @@ export async function computeMetric(
   // per-person-meaningful subset; team-only metrics stay no_data. No gaming pass
   // runs — a private self-view is advisory, not a ranking to game.
   if (scopeType === 'person' || scopeType === 'self') {
-    const identities = await store.getIdentitiesByPerson(scopeId)
-    const identityIds = new Set(identities.map((i) => i.id))
-    if (identityIds.size === 0) return noDataResult(metricId, scopeType, now)
     const personData = preloaded ?? (await loadScopeData(store, windowFrom, windowTo))
+    // Resolve the person's identity ids ONCE per (data, person), memoised on the
+    // data object. A caller computing M metrics for the same person — or one that
+    // pre-seeds this map from listPersons() (the report does) — then pays ZERO
+    // identity queries instead of one per (metric × person).
+    const identityIds = await resolvePersonIdentityIds(store, personData, scopeId)
+    if (identityIds.size === 0) return noDataResult(metricId, scopeType, now)
     return computePersonRaw(store, metricId, windowFrom, windowTo, now, personData, identityIds)
   }
 
@@ -1990,6 +2613,22 @@ export async function computeMetric(
     ...(gamingFlags.length > 0 ? { gamingFlags } : {}),
     ...(goodhart !== null ? { goodhartWarning: goodhart.warning } : {}),
   }
+}
+
+/**
+ * Live per-person insight report: every supported metric for the person, placed
+ * against the human cohort (robust-z + percentile), plus an on-demand self-baseline
+ * trend — routed through the anti-weaponization contract. Injects the internal
+ * loaders so personReport.js stays free of a circular import.
+ */
+export async function computePersonReportLive(store, personId, opts) {
+  return computePersonReport(store, personId, opts, {
+    computeMetric,
+    loadScopeData,
+    loadFullScopeData,
+    sliceScopeData,
+    loadSharedPersonExtras,
+  })
 }
 
 // ---------------------------------------------------------------------------

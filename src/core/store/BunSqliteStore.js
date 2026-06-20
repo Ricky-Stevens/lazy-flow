@@ -227,6 +227,43 @@ export class BunSqliteStore {
     }))
   }
 
+  /**
+   * List every person with their identity handles attached. Used to let a user
+   * pick a person for person/self scope and to fan out per-person snapshots and
+   * peer-baseline cohorts. `isBot` is true when ALL of the person's identities
+   * are bots, so callers can exclude automation from human cohorts.
+   */
+  async listPersons() {
+    const persons = this.stmt(
+      `SELECT id, display_name, primary_account_ref, updated_at FROM persons ORDER BY display_name ASC`,
+    ).all()
+    const idents = this.stmt(
+      `SELECT id, person_id, kind, external_id, is_bot FROM identities WHERE person_id IS NOT NULL`,
+    ).all()
+    const byPerson = new Map()
+    for (const i of idents) {
+      const key = String(i.person_id)
+      if (!byPerson.has(key)) byPerson.set(key, [])
+      byPerson.get(key).push({
+        id: String(i.id),
+        kind: i.kind,
+        externalId: String(i.external_id),
+        isBot: rb(i.is_bot),
+      })
+    }
+    return persons.map((p) => {
+      const identities = byPerson.get(String(p.id)) ?? []
+      return {
+        id: String(p.id),
+        displayName: String(p.display_name),
+        primaryAccountRef: String(p.primary_account_ref),
+        updatedAt: String(p.updated_at),
+        identities,
+        isBot: identities.length > 0 && identities.every((i) => i.isBot),
+      }
+    })
+  }
+
   // ---------------------------------------------------------------------------
   // Repositories
   // ---------------------------------------------------------------------------
@@ -806,6 +843,35 @@ export class BunSqliteStore {
     return rows.map((r) => this._rowToPrFile(r))
   }
 
+  /**
+   * pr_files for a specific set of PR ids only — for callers that have already
+   * narrowed to a handful of PRs (e.g. listPendingVerdicts with limit=25) and must
+   * NOT pull the whole pr_files table (millions of rows at scale). Chunked to stay
+   * under SQLite's 999-variable cap; returns a Map<prId, PrFile[]>.
+   */
+  async getPrFilesByPrIds(prIds) {
+    const byPr = new Map()
+    const ids = [...new Set(prIds)]
+    for (let i = 0; i < ids.length; i += 900) {
+      const chunk = ids.slice(i, i + 900)
+      const placeholders = chunk.map(() => '?').join(', ')
+      const rows = this.stmt(
+        `SELECT f.pr_id, f.repo_id, f.path, f.additions, f.deletions, f.haloc,
+                f.status, f.patch, f.created_at, f.updated_at
+         FROM pr_files f
+         JOIN pull_requests p ON p.id = f.pr_id
+         WHERE p.deleted_at IS NULL AND f.pr_id IN (${placeholders})
+         ORDER BY f.pr_id ASC, f.path ASC`,
+      ).all(...chunk)
+      for (const r of rows) {
+        const file = this._rowToPrFile(r)
+        if (!byPr.has(file.prId)) byPr.set(file.prId, [])
+        byPr.get(file.prId).push(file)
+      }
+    }
+    return byPr
+  }
+
   async getAllDeployments() {
     const rows = this.stmt(
       `SELECT id, repo_id, sha, environment, status, created_at, finished_at, source, raw, updated_at
@@ -931,6 +997,68 @@ export class BunSqliteStore {
   async getAiAuthorshipKeys() {
     const rows = this.stmt(`SELECT entity_type, entity_id FROM ai_authorship`).all()
     return rows.map((r) => ({ entityType: String(r.entity_type), entityId: String(r.entity_id) }))
+  }
+
+  /** Every AI-authorship row with author + score — for per-person AI-blend metrics. */
+  async getAllAiAuthorship() {
+    const rows = this.stmt(
+      `SELECT entity_type, entity_id, repo_id, author_identity_id, authored_at, ai_score
+       FROM ai_authorship`,
+    ).all()
+    return rows.map((r) => ({
+      entityType: String(r.entity_type),
+      entityId: String(r.entity_id),
+      repoId: String(r.repo_id),
+      authorIdentityId: rstr(r.author_identity_id),
+      authoredAt: rstr(r.authored_at),
+      aiScore: Number(r.ai_score),
+    }))
+  }
+
+  /** Every pr_refs row (PR head/base SHA) — for CI-at-merge and complexity joins. */
+  async getAllPrRefs() {
+    const rows = this.stmt(`SELECT pr_id, repo_id, base_sha, head_sha FROM pr_refs`).all()
+    return rows.map((r) => ({
+      prId: String(r.pr_id),
+      repoId: String(r.repo_id),
+      baseSha: rstr(r.base_sha),
+      headSha: rstr(r.head_sha),
+    }))
+  }
+
+  /** Every file_complexity row — for per-person complexity-weighted metrics. */
+  async getAllFileComplexity() {
+    const rows = this.stmt(
+      `SELECT repo_id, sha, path, language, loc, total_cyclomatic, function_count, functions
+       FROM file_complexity`,
+    ).all()
+    return rows.map((r) => ({
+      repoId: String(r.repo_id),
+      sha: String(r.sha),
+      path: String(r.path),
+      language: String(r.language),
+      loc: Number(r.loc),
+      totalCyclomatic: Number(r.total_cyclomatic),
+      functionCount: Number(r.function_count),
+      functions: JSON.parse(String(r.functions)),
+    }))
+  }
+
+  /** Every ai_verdict for a (subjectType, metric) — for per-person LLM-verdict metrics. */
+  async getAiVerdictsByMetric(subjectType, metric) {
+    const rows = this.stmt(
+      `SELECT id, subject_type, subject_id, metric, structured_verdict_json, confidence, created_at
+       FROM ai_verdicts WHERE subject_type = ? AND metric = ?`,
+    ).all(subjectType, metric)
+    return rows.map((r) => ({
+      id: String(r.id),
+      subjectType: String(r.subject_type),
+      subjectId: String(r.subject_id),
+      metric: String(r.metric),
+      verdict: JSON.parse(String(r.structured_verdict_json)),
+      confidence: Number(r.confidence),
+      createdAt: String(r.created_at),
+    }))
   }
 
   // --- Repo AI-tooling maturity signal -------------------------------------
@@ -2023,6 +2151,13 @@ export class BunSqliteStore {
       correctionJson,
       id,
     )
+  }
+
+  /** Remove any verdicts for a (subjectType, subjectId, metric) — for idempotent re-record. */
+  async deleteAiVerdictsForSubject(subjectType, subjectId, metric) {
+    this.stmt(
+      `DELETE FROM ai_verdicts WHERE subject_type = ? AND subject_id = ? AND metric = ?`,
+    ).run(subjectType, subjectId, metric)
   }
 
   _rowToAiVerdict(r) {

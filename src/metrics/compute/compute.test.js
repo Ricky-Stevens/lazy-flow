@@ -696,6 +696,34 @@ describe('computeMetric', () => {
     const byId = new Map(detailed.perChange.map((c) => [c.changeId, c.haloc]))
     expect(byId.get(IDS.pr1)).toBe(8)
     expect(byId.get(IDS.pr4)).toBe(11)
+    // Provenance: value came from re-parsing the stored patch.
+    expect(r.halocSource).toBe('recomputed_from_patch')
+  })
+
+  it('code.haloc_aggregate → falls back to denormalised column when patches are NULL', async () => {
+    // Reproduce the post-GraphQL state: per-file HALOC is denormalised but
+    // pr_files.patch is NULL, so the diff-recompute sums to 0. The metric must
+    // fall back to the denormalised column (= 19) instead of reporting a
+    // confident 0 at ok quality.
+    for (const f of baseOrg.prFiles) {
+      await store.upsertPrFile({
+        prId: f.prId,
+        repoId: f.repoId,
+        path: f.path,
+        additions: f.additions,
+        deletions: f.deletions,
+        haloc: f.haloc,
+        status: f.status,
+        patch: null,
+        createdAt: '2024-01-01T00:00:00Z',
+        updatedAt: '2024-01-01T00:00:00Z',
+      })
+    }
+    const r = await compute('code.haloc_aggregate')
+    expect(r.dataQuality).toBe('ok')
+    expect(r.value).toBe(19)
+    expect(r.totalHaloc).toBe(19)
+    expect(r.halocSource).toBe('denormalized_prfile_column')
   })
 
   it('code.nagappan_ball → ok with a REAL relative-churn M1 from window HALOC', async () => {
@@ -825,6 +853,64 @@ describe('computeMetric', () => {
     // 'self' is an alias for the same per-identity attribution.
     const self = await computeMetric(store, 'self', IDS.personAlice, 'pr.size', FROM, TO, NOW)
     expect(self.dataQuality).toBe('ok')
+  })
+
+  it('person scope computes Q5/Q6 feedback metrics on the person’s authored PRs', async () => {
+    // These reuse the team modules narrowed to alice's authored PRs, so they
+    // report review coverage / feedback RECEIVED on the work she shipped.
+    for (const metricId of [
+      'pr.review_coverage',
+      'pr.merge_without_review_rate',
+      'pr.reviewers_per_pr',
+      'pr.comments_per_pr',
+      'pr.review_iterations',
+    ]) {
+      const r = await computeMetric(store, 'person', IDS.personAlice, metricId, FROM, TO, NOW)
+      expect(r.dataQuality).toBe('ok')
+      expect(r.value).not.toBeNull()
+    }
+    // review_coverage is a [0,1] rate.
+    const cov = await computeMetric(
+      store,
+      'person',
+      IDS.personAlice,
+      'pr.review_coverage',
+      FROM,
+      TO,
+      NOW,
+    )
+    expect(cov.value).toBeGreaterThanOrEqual(0)
+    expect(cov.value).toBeLessThanOrEqual(1)
+  })
+
+  it('person.review_reciprocity computes give/receive balance at person scope', async () => {
+    const r = await computeMetric(
+      store,
+      'person',
+      IDS.personAlice,
+      'person.review_reciprocity',
+      FROM,
+      TO,
+      NOW,
+    )
+    // alice has review activity in the golden dataset (authored + reviewed PRs).
+    expect(r.scope).toBe('person')
+    expect(['ok', 'no_data']).toContain(r.dataQuality)
+    if (r.dataQuality === 'ok') {
+      expect(r.value).toBeGreaterThanOrEqual(0)
+      expect(r.reviewsGiven + r.reviewsReceived).toBeGreaterThan(0)
+    }
+    // Team scope must NOT fabricate a value for a person-only metric.
+    const team = await computeMetric(
+      store,
+      'team',
+      IDS.org,
+      'person.review_reciprocity',
+      FROM,
+      TO,
+      NOW,
+    )
+    expect(team.dataQuality).toBe('no_data')
   })
 
   it('person scope returns no_data for team-only metrics (no per-head fabrication)', async () => {

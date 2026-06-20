@@ -43,7 +43,12 @@ export {
 } from './code/index.js'
 // Compute — real metric computation over the SQLite store (WP-COMPUTE)
 
-export { backfillSnapshots, COMPUTE_METRIC_IDS, computeMetric } from './compute/index.js'
+export {
+  backfillSnapshots,
+  COMPUTE_METRIC_IDS,
+  computeMetric,
+  computePersonReportLive,
+} from './compute/index.js'
 // Group A — DORA
 
 export {

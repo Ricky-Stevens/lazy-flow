@@ -60,5 +60,13 @@ export function loadConfig() {
     dbPath: resolveDbPath(env.LAZYFLOW_DB_PATH),
     githubToken: env.LAZYFLOW_GITHUB_TOKEN ?? null,
     jiraToken: env.LAZYFLOW_JIRA_TOKEN ?? null,
+    // Optional LLM classifier for AI-authorship (the semantic tier that
+    // adjudicates the deterministic residual). Entirely opt-in: absent key =>
+    // the classifier is skipped and only deterministic signals are produced.
+    // Model defaults to a small/fast one (this is bulk per-change classification);
+    // override for a more capable judge. Nothing is sent anywhere without a key.
+    anthropicApiKey: env.LAZYFLOW_ANTHROPIC_API_KEY ?? env.ANTHROPIC_API_KEY ?? null,
+    aiClassifierModel: env.LAZYFLOW_AI_CLASSIFIER_MODEL ?? 'claude-haiku-4-5',
+    aiClassifierMaxPerRun: Number(env.LAZYFLOW_AI_CLASSIFIER_MAX_PER_RUN ?? '50'),
   }
 }

@@ -19,13 +19,20 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 
 import { ENGINE_VERSION } from '../core/index.js'
-
+import { backfillPrPatches } from '../ingest-github/index.js'
 import {
   backfillSnapshots,
   COMPUTE_METRIC_IDS,
   computeMetric,
+  computePersonReportLive,
   rederiveStaleEngineSnapshots,
 } from '../metrics/index.js'
+import {
+  listPendingVerdicts,
+  recordVerdict,
+  VERDICT_METRICS,
+  VERDICT_SHAPE,
+} from '../metrics/verdicts/index.js'
 
 import { runSync, syncStatus } from '../orchestrator/index.js'
 
@@ -715,6 +722,8 @@ const PR_METRIC_IDS = [
   'pr.reviewers_per_pr',
   'pr.comments_per_pr',
   'pr.review_iterations',
+  // Person-only collaboration signal — real value at person/self scope, no_data at team.
+  'person.review_reciprocity',
 ]
 const CODE_METRIC_IDS = [
   'code.haloc_aggregate',
@@ -731,11 +740,53 @@ const AGILE_METRIC_IDS = [
 ]
 
 /**
+ * Shared scope params for the get_* tools. `scope_type` selects team vs an
+ * individual self-view; `person_id` identifies the person for person/self scope.
+ * Person scope attributes work to the person's identities (PRs authored, issues
+ * assigned, reviews given) — team-only metrics return no_data for a person.
+ */
+const SCOPE_TYPE_PARAM = z
+  .enum(['team', 'person', 'self'])
+  .optional()
+  .describe(
+    'Scope kind. "person"/"self" compute an individual view (requires person_id); team-only metrics return no_data. Default "team".',
+  )
+const PERSON_ID_PARAM = z
+  .string()
+  .optional()
+  .describe(
+    'Person id (the persons.id value — find it via query_db) — required when scope_type is "person" or "self".',
+  )
+
+/**
+ * Resolve the (scopeType, scopeId) pair from tool args. For person/self scope a
+ * person_id is mandatory; falls back to the legacy `scope` string for team scope.
+ * Returns an `error` string when person/self is requested without a person_id.
+ */
+function resolveScopeArgs({ scope, scope_type, person_id }) {
+  const scopeType = scope_type ?? 'team'
+  if (scopeType === 'person' || scopeType === 'self') {
+    const scopeId = person_id ?? null
+    return {
+      scopeType,
+      scopeId,
+      error: scopeId ? null : 'person_id is required when scope_type is "person" or "self".',
+    }
+  }
+  return { scopeType: 'team', scopeId: scope ?? 'team', error: null }
+}
+
+/** MCP error result for invalid tool input (e.g. person scope without person_id). */
+function inputError(message) {
+  return { content: [{ type: 'text', text: JSON.stringify({ error: message }) }], isError: true }
+}
+
+/**
  * Compute a group of metrics live from the store over a trailing window ending
  * today, mapping each MetricResult to a tool MetricRow. Metrics that aren't
  * computable from stored data return data_quality 'no_data' (never a stub).
  */
-async function computeRows(ctx, scopeId, metricIds, windowDays) {
+async function computeRows(ctx, scopeType, scopeId, metricIds, windowDays) {
   const now = new Date().toISOString()
   const toDay = now.slice(0, 10)
   const fromDay = new Date(Date.parse(toDay) - (windowDays - 1) * 86_400_000)
@@ -743,7 +794,7 @@ async function computeRows(ctx, scopeId, metricIds, windowDays) {
     .slice(0, 10)
   const rows = []
   for (const metricId of metricIds) {
-    const r = await computeMetric(ctx.store, 'team', scopeId, metricId, fromDay, toDay, now)
+    const r = await computeMetric(ctx.store, scopeType, scopeId, metricId, fromDay, toDay, now)
     rows.push({
       metric: metricId,
       value: r.value,
@@ -768,6 +819,8 @@ function registerGetDoraTool(server, ctx) {
         'Deployment frequency, lead time for changes, change failure rate, failed deployment recovery time — with DORA bands.',
       inputSchema: z.object({
         scope: z.string().optional().describe('Scope identifier (team/repo/org). Default: "team".'),
+        scope_type: SCOPE_TYPE_PARAM,
+        person_id: PERSON_ID_PARAM,
         window_days: z
           .number()
           .int()
@@ -778,12 +831,13 @@ function registerGetDoraTool(server, ctx) {
       }),
       outputSchema: metricBundleOutputSchema,
     },
-    async ({ scope, window_days }) => {
-      const scopeId = scope ?? 'team'
+    async ({ scope, scope_type, person_id, window_days }) => {
+      const { scopeType, scopeId, error } = resolveScopeArgs({ scope, scope_type, person_id })
+      if (error) return inputError(error)
       const days = window_days ?? 30
       const staleness = await stalenessCheck(ctx)
 
-      const metrics = await computeRows(ctx, scopeId, DORA_METRIC_IDS, days)
+      const metrics = await computeRows(ctx, scopeType, scopeId, DORA_METRIC_IDS, days)
       const output = metricBundle(scopeId, days, metrics, staleness)
       return {
         content: [{ type: 'text', text: JSON.stringify(output) }],
@@ -807,6 +861,8 @@ function registerGetFlowTool(server, ctx) {
         'time-in-status, and a Monte Carlo completion forecast.',
       inputSchema: z.object({
         scope: z.string().optional().describe('Scope identifier (default: "team").'),
+        scope_type: SCOPE_TYPE_PARAM,
+        person_id: PERSON_ID_PARAM,
         window_days: z
           .number()
           .int()
@@ -817,12 +873,13 @@ function registerGetFlowTool(server, ctx) {
       }),
       outputSchema: metricBundleOutputSchema,
     },
-    async ({ scope, window_days }) => {
-      const scopeId = scope ?? 'team'
+    async ({ scope, scope_type, person_id, window_days }) => {
+      const { scopeType, scopeId, error } = resolveScopeArgs({ scope, scope_type, person_id })
+      if (error) return inputError(error)
       const days = window_days ?? 30
       const staleness = await stalenessCheck(ctx)
 
-      const metrics = await computeRows(ctx, scopeId, FLOW_METRIC_IDS, days)
+      const metrics = await computeRows(ctx, scopeType, scopeId, FLOW_METRIC_IDS, days)
       const output = metricBundle(scopeId, days, metrics, staleness)
       return {
         content: [{ type: 'text', text: JSON.stringify(output) }],
@@ -844,6 +901,8 @@ function registerGetPrMetricsTool(server, ctx) {
       description: '4-phase PR cycle time, review latency, review coverage, stale PRs, CI health.',
       inputSchema: z.object({
         scope: z.string().optional().describe('Scope identifier (default: "team").'),
+        scope_type: SCOPE_TYPE_PARAM,
+        person_id: PERSON_ID_PARAM,
         window_days: z
           .number()
           .int()
@@ -854,12 +913,13 @@ function registerGetPrMetricsTool(server, ctx) {
       }),
       outputSchema: metricBundleOutputSchema,
     },
-    async ({ scope, window_days }) => {
-      const scopeId = scope ?? 'team'
+    async ({ scope, scope_type, person_id, window_days }) => {
+      const { scopeType, scopeId, error } = resolveScopeArgs({ scope, scope_type, person_id })
+      if (error) return inputError(error)
       const days = window_days ?? 30
       const staleness = await stalenessCheck(ctx)
 
-      const metrics = await computeRows(ctx, scopeId, PR_METRIC_IDS, days)
+      const metrics = await computeRows(ctx, scopeType, scopeId, PR_METRIC_IDS, days)
       const output = metricBundle(scopeId, days, metrics, staleness)
       return {
         content: [{ type: 'text', text: JSON.stringify(output) }],
@@ -882,6 +942,8 @@ function registerGetCodeMetricsTool(server, ctx) {
         'HALOC, rework/churn, work-type split, complexity deltas, Nagappan-Ball, code-change impact.',
       inputSchema: z.object({
         scope: z.string().optional().describe('Scope identifier (default: "team").'),
+        scope_type: SCOPE_TYPE_PARAM,
+        person_id: PERSON_ID_PARAM,
         window_days: z
           .number()
           .int()
@@ -892,12 +954,13 @@ function registerGetCodeMetricsTool(server, ctx) {
       }),
       outputSchema: metricBundleOutputSchema,
     },
-    async ({ scope, window_days }) => {
-      const scopeId = scope ?? 'team'
+    async ({ scope, scope_type, person_id, window_days }) => {
+      const { scopeType, scopeId, error } = resolveScopeArgs({ scope, scope_type, person_id })
+      if (error) return inputError(error)
       const days = window_days ?? 30
       const staleness = await stalenessCheck(ctx)
 
-      const metrics = await computeRows(ctx, scopeId, CODE_METRIC_IDS, days)
+      const metrics = await computeRows(ctx, scopeType, scopeId, CODE_METRIC_IDS, days)
       const output = metricBundle(scopeId, days, metrics, staleness)
       return {
         content: [{ type: 'text', text: JSON.stringify(output) }],
@@ -919,6 +982,8 @@ function registerGetAgileMetricsTool(server, ctx) {
       description: 'Sprint velocity, say/do, predictability, estimation accuracy.',
       inputSchema: z.object({
         scope: z.string().optional().describe('Scope identifier (default: "team").'),
+        scope_type: SCOPE_TYPE_PARAM,
+        person_id: PERSON_ID_PARAM,
         window_days: z
           .number()
           .int()
@@ -929,12 +994,13 @@ function registerGetAgileMetricsTool(server, ctx) {
       }),
       outputSchema: metricBundleOutputSchema,
     },
-    async ({ scope, window_days }) => {
-      const scopeId = scope ?? 'team'
+    async ({ scope, scope_type, person_id, window_days }) => {
+      const { scopeType, scopeId, error } = resolveScopeArgs({ scope, scope_type, person_id })
+      if (error) return inputError(error)
       const days = window_days ?? 90
       const staleness = await stalenessCheck(ctx)
 
-      const metrics = await computeRows(ctx, scopeId, AGILE_METRIC_IDS, days)
+      const metrics = await computeRows(ctx, scopeType, scopeId, AGILE_METRIC_IDS, days)
       const output = metricBundle(scopeId, days, metrics, staleness)
       return {
         content: [{ type: 'text', text: JSON.stringify(output) }],
@@ -1763,6 +1829,180 @@ function registerSchemaResource(server, ctx) {
   )
 }
 
+// ---------------------------------------------------------------------------
+// Tool: get_person_report — the per-person insight suite (cohort + trend)
+// ---------------------------------------------------------------------------
+
+function registerGetPersonReportTool(server, ctx) {
+  server.registerTool(
+    'get_person_report',
+    {
+      title: 'Get Per-Person Insight Report',
+      description:
+        'A coaching report for one person: every per-person metric placed against the human ' +
+        'cohort (robust-z + percentile, suppressed below 8 peers) plus a self-baseline trend. ' +
+        'Compares to the person’s OWN team distribution and OWN history — never a rank.',
+      inputSchema: z.object({
+        person_id: z.string().describe('Person id (persons.id — find it via query_db).'),
+        window_days: z
+          .number()
+          .int()
+          .min(7)
+          .max(3650)
+          .optional()
+          .describe('Lookback window in days (default: 90).'),
+      }),
+    },
+    async ({ person_id, window_days }) => {
+      const report = await computePersonReportLive(ctx.store, person_id, {
+        windowDays: window_days ?? 90,
+      })
+      return {
+        content: [{ type: 'text', text: JSON.stringify(report) }],
+        structuredContent: report,
+      }
+    },
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Tools: in-session-Claude verdict pipeline (NO external API)
+// ---------------------------------------------------------------------------
+
+function registerListPendingVerdictsTool(server, ctx) {
+  server.registerTool(
+    'list_pending_verdicts',
+    {
+      title: 'List Pending AI Verdicts',
+      description:
+        'Return the artifacts (PR title/body/files, review-comment bodies, review bodies) for a ' +
+        'person that still need a structured verdict for a probabilistic metric. The CURRENT ' +
+        'Claude session reads these and calls record_verdict — no external model API is used. ' +
+        `Verdict metrics: ${VERDICT_METRICS.join(', ')}.`,
+      inputSchema: z.object({
+        metric: z
+          .enum(VERDICT_METRICS)
+          .describe('Which probabilistic metric to gather artifacts for.'),
+        person_id: z.string().describe('Person id (persons.id).'),
+        limit: z.number().int().min(1).max(100).optional().describe('Max artifacts (default 25).'),
+      }),
+    },
+    async ({ metric, person_id, limit }) => {
+      const out = await listPendingVerdicts(ctx.store, metric, person_id, limit ?? 25)
+      return { content: [{ type: 'text', text: JSON.stringify(out) }], structuredContent: out }
+    },
+  )
+}
+
+function registerRecordVerdictTool(server, ctx) {
+  server.registerTool(
+    'record_verdict',
+    {
+      title: 'Record an AI Verdict',
+      description:
+        'Persist a verdict the CURRENT Claude session produced by reading an artifact (no API). ' +
+        'Idempotent per (subject, metric). The `verdict` object shape depends on the metric — ' +
+        `see: ${JSON.stringify(VERDICT_SHAPE)}.`,
+      inputSchema: z.object({
+        metric: z.enum(VERDICT_METRICS),
+        subject_id: z
+          .string()
+          .describe('The artifact id from list_pending_verdicts (PR/review/comment).'),
+        verdict: z.record(z.any()).describe('Structured verdict matching the metric’s shape.'),
+        confidence: z
+          .number()
+          .min(0)
+          .max(1)
+          .optional()
+          .describe('Verdict confidence 0..1 (default 0.7).'),
+        evidence: z
+          .array(z.string())
+          .optional()
+          .describe('Cited evidence (file:line, quotes) for audit.'),
+      }),
+    },
+    async ({ metric, subject_id, verdict, confidence, evidence }) => {
+      const now = new Date().toISOString()
+      const id = `${metric}:${subject_id}:${now}`
+      const res = await recordVerdict(
+        ctx.store,
+        { metric, subjectId: subject_id, verdict, confidence, evidence },
+        { id, now },
+      )
+      return { content: [{ type: 'text', text: JSON.stringify(res) }], structuredContent: res }
+    },
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Tool: backfill_pr_patches — GraphQL-only diff synthesis for pr_files.patch
+// ---------------------------------------------------------------------------
+
+function registerBackfillPrPatchesTool(server, ctx) {
+  server.registerTool(
+    'backfill_pr_patches',
+    {
+      title: 'Backfill PR File Patches',
+      description:
+        'Populate pr_files.patch by fetching base+head file blobs over GraphQL (NO REST) and ' +
+        'synthesising the unified diff locally — unblocking exact HALOC and diff-level verdicts. ' +
+        'Idempotent and incremental: only files missing a patch are processed; re-run to continue.',
+      inputSchema: z.object({
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(5000)
+          .optional()
+          .describe('Max files to process this call (bounds blob volume; default 500).'),
+      }),
+    },
+    async ({ limit }) => {
+      if (!ctx.githubClient) {
+        return inputError('GitHub client not configured — LAZYFLOW_GITHUB_TOKEN required.')
+      }
+      const cap = limit ?? 500
+      // Distinct repos that still have patch-less files.
+      const repoIds = [
+        ...new Set(
+          (await ctx.store.getAllPrFiles())
+            .filter((f) => f.patch === null || f.patch === undefined)
+            .map((f) => f.repoId),
+        ),
+      ]
+      const perRepo = []
+      let backfilled = 0
+      let skipped = 0
+      let remaining = 0
+      for (const repoId of repoIds) {
+        if (backfilled >= cap) {
+          remaining += (await ctx.store.getAllPrFiles()).filter(
+            (f) => f.repoId === repoId && (f.patch === null || f.patch === undefined),
+          ).length
+          continue
+        }
+        const repo = await ctx.store.getRepository(repoId)
+        if (!repo) continue
+        const res = await backfillPrPatches(ctx.store, ctx.githubClient, {
+          owner: repo.owner,
+          name: repo.name,
+          repoId,
+          limit: cap - backfilled,
+        })
+        backfilled += res.backfilled
+        skipped += res.skipped
+        remaining += res.remaining
+        perRepo.push({ repo: `${repo.owner}/${repo.name}`, ...res })
+      }
+      const output = { backfilled, skipped, remaining, repos: perRepo }
+      return {
+        content: [{ type: 'text', text: JSON.stringify(output) }],
+        structuredContent: output,
+      }
+    },
+  )
+}
+
 export function createServer(ctx) {
   const server = new McpServer({
     name: SERVER_NAME,
@@ -1781,6 +2021,12 @@ export function createServer(ctx) {
   registerExplainMetricTool(server, ctx)
   registerExportTool(server, ctx)
   registerQueryDbTool(server, ctx)
+
+  // Tools — per-person insight suite + in-session-Claude verdict pipeline
+  registerGetPersonReportTool(server, ctx)
+  registerListPendingVerdictsTool(server, ctx)
+  registerRecordVerdictTool(server, ctx)
+  registerBackfillPrPatchesTool(server, ctx)
 
   // Tools — reporting
   registerGenerateReportTool(server, ctx)

@@ -69,6 +69,7 @@ describe('MCP server — bootstrap', () => {
     const names = tools.map((t) => t.name).sort()
 
     const expected = [
+      'backfill_pr_patches',
       'doctor',
       'explain_metric',
       'export',
@@ -77,9 +78,12 @@ describe('MCP server — bootstrap', () => {
       'get_code_metrics',
       'get_dora',
       'get_flow',
+      'get_person_report',
       'get_pr_metrics',
+      'list_pending_verdicts',
       'list_report_presets',
       'query_db',
+      'record_verdict',
       'run_sync',
       'sync_status',
     ].sort()
