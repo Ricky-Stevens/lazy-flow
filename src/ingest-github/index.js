@@ -5,6 +5,6 @@
  */
 
 export { DEFAULT_AI_MARKERS, ingestRepoAiSignals } from './aiSignals.js'
-export { backfillPrPatches } from './backfillPatches.js'
+export { backfillAllPatches, backfillPrPatches } from './backfillPatches.js'
 export { GitHubClient } from './client.js'
 export { syncGitHub } from './sync.js'

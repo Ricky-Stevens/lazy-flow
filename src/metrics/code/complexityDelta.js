@@ -8,7 +8,7 @@ const FORMULA_DOC =
   'removed functions are tallied separately (functionsAdded/Removed, newFunction*) ' +
   'so adding code is not reported as increased complexity of existing code. ' +
   'Inputs: pre-computed FileComplexity from analyzeComplexity (tree-sitter). ' +
-  'Descriptive only — do not rank individuals.'
+  'Descriptive — compare with language and PR-count context, not raw.'
 
 // ---------------------------------------------------------------------------
 // Delta computation from two FileComplexity objects

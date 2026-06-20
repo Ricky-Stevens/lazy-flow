@@ -310,7 +310,7 @@ export function invalidateLookupsCache(store) {
  * Window applies to PRs (createdAt), deploys (createdAt), commits (authoredAt),
  * check runs (completedAt/startedAt). Issues + transitions are loaded whole.
  */
-async function loadScopeData(store, windowFrom, windowTo) {
+export async function loadScopeData(store, windowFrom, windowTo) {
   // Single code path for on-demand (get_* tools) AND backfill: bulk-load the whole
   // dataset once, then slice the window in memory. The backfill passes the loaded
   // full dataset across all days/metrics via computeMetric's `preloaded` arg, so it
@@ -1380,7 +1380,12 @@ function noDataResult(metricId, scope, asOf, formulaDocOverride) {
     dataQuality: 'no_data',
     engineVersion: ENGINE_VERSION,
     asOf,
-    formulaDoc: formulaDocOverride ?? mod?.formulaDoc ?? `Metric ${metricId} is not wired.`,
+    formulaDoc:
+      formulaDocOverride ??
+      mod?.formulaDoc ??
+      `Metric ${metricId} is not available at this scope. Code/quality and other ` +
+        'per-person signals are computed by get_person_report, not the team metric ' +
+        'tools; team-scoped metrics return no_data when requested for a person.',
   }
 }
 
@@ -1970,13 +1975,23 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
       const changes = buildCodeChanges(data)
       const result = halocAggregate.compute({ changes }, now)
       // GraphQL ingestion stores per-file HALOC in the denormalised column but
-      // leaves pr_files.patch NULL, so the diff-recompute above sums to 0 while
-      // real churn exists — a confident-but-wrong 0 at ok quality. When that
-      // happens, fall back to the denormalised column (the SAME source
-      // code.nagappan_ball already trusts) so the metric reflects real churn.
-      // `halocSource` records which path the value came from for transparency.
+      // leaves pr_files.patch NULL, so the diff-recompute above only sees the
+      // files whose patch has been backfilled. The denormalised column is the
+      // authoritative, ALWAYS-complete source (set for every file at ingest, and
+      // upgraded to the patch-derived value when a file is later backfilled), so
+      // the recompute total can never legitimately EXCEED it — it equals the
+      // denorm total only once every file in the window has a patch.
+      //
+      // Therefore: whenever the recompute is incomplete (totalHaloc < denorm),
+      // use the complete denorm total. This covers BOTH the 0%-backfilled case
+      // (recompute 0) AND — critically — the PARTIALLY-backfilled case the
+      // post-sync auto-backfill creates, where a non-zero-but-undercounted
+      // recompute would otherwise be reported at "ok" quality (a silent
+      // undercount). The precise per-hunk recompute is only trusted when it has
+      // seen the whole window (totalHaloc === denorm). `halocSource` records the
+      // path for transparency.
       const denormHaloc = totalWindowHaloc(data)
-      if (result.totalHaloc === 0 && denormHaloc > 0) {
+      if (denormHaloc > 0 && result.totalHaloc < denormHaloc) {
         return {
           ...result,
           value: denormHaloc,

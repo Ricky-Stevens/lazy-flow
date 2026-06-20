@@ -57,6 +57,16 @@ async function personIdentityIds(store, personId) {
   return new Set((await store.getIdentitiesByPerson(personId)).map((i) => i.id))
 }
 
+/** Per-file diff cap so a fat PR's artifact stays a bounded payload for the judge. */
+const MAX_PATCH_CHARS = 4000
+
+/** Truncate a synthesised unified diff to a bounded size, flagging elision. */
+function truncatePatch(patch) {
+  if (typeof patch !== 'string' || patch.length === 0) return null
+  if (patch.length <= MAX_PATCH_CHARS) return patch
+  return `${patch.slice(0, MAX_PATCH_CHARS)}\n… [diff truncated: ${patch.length - MAX_PATCH_CHARS} more chars]`
+}
+
 /**
  * List artifacts that still need a verdict for `metric`, scoped to `personId`.
  * Returns { metric, subjectType, verdictShape, pending: [{ subjectId, context }] }.
@@ -94,11 +104,16 @@ export async function listPendingVerdicts(store, metric, personId, limit = 25) {
           number: pr.number,
           title: t.title,
           body: t.body,
-          files: fs
-            .slice(0, 60)
-            .map((f) => ({ path: f.path, additions: f.additions, deletions: f.deletions })),
+          files: fs.slice(0, 60).map((f) => ({
+            path: f.path,
+            additions: f.additions,
+            deletions: f.deletions,
+            patch: truncatePatch(f.patch),
+          })),
           fileCount: fs.length,
-          note: 'pr_files.patch is not ingested — judge from title/body/file list; lower confidence if the diff would be decisive.',
+          note: fs.some((f) => typeof f.patch === 'string' && f.patch.length > 0)
+            ? 'Synthesised diffs are included per file where available (truncated to a budget). Judge from title/body/diffs.'
+            : 'No diffs backfilled yet — judge from title/body/file list; run backfill_pr_patches first for diff-level confidence.',
         },
       })
     }

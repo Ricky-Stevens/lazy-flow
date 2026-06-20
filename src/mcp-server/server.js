@@ -19,13 +19,14 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 
 import { ENGINE_VERSION } from '../core/index.js'
-import { backfillPrPatches } from '../ingest-github/index.js'
+import { backfillAllPatches } from '../ingest-github/index.js'
 import {
   backfillSnapshots,
   COMPUTE_METRIC_IDS,
   computeMetric,
   computePersonReportLive,
   invalidateLookupsCache,
+  loadScopeData,
   metricFormulaDoc,
   rederiveStaleEngineSnapshots,
 } from '../metrics/index.js'
@@ -182,7 +183,7 @@ function registerDoctorTool(server, ctx) {
     {
       title: 'Doctor — health diagnostics',
       description:
-        'Auth validity, rate-limit headroom, sync freshness, DB integrity, Bun runtime preflight, config sanity.',
+        'Config & connectivity preflight: token/email/base-URL presence, repos & Jira projects configured, sync freshness, DB integrity, Bun runtime. (Checks config presence, not live token validity — run run_sync to confirm a token works and a wildcard resolves.)',
       inputSchema: z.object({}),
       outputSchema,
     },
@@ -217,28 +218,48 @@ function registerDoctorTool(server, ctx) {
           : 'LAZYFLOW_GITHUB_TOKEN not set — GitHub sync unavailable',
       })
 
-      // 3. Jira token presence (+ Basic-auth email pairing). An API token against
-      //    a Jira Cloud site URL needs LAZYFLOW_JIRA_EMAIL for Basic auth — without
-      //    it the client falls back to Bearer and every call 403s.
+      // 3. Jira config. A Jira Cloud API token needs BOTH the account email
+      //    (LAZYFLOW_JIRA_EMAIL, for Basic auth — else every call 403s) AND the
+      //    site base URL (LAZYFLOW_JIRA_BASE_URL — else the client is never built
+      //    and run_sync silently skips Jira). Flag whichever is missing by name.
+      const jiraMissing = []
+      if (ctx.config.jiraToken && !ctx.config.jiraEmail) jiraMissing.push('LAZYFLOW_JIRA_EMAIL')
+      if (ctx.config.jiraToken && !ctx.config.jiraBaseUrl)
+        jiraMissing.push('LAZYFLOW_JIRA_BASE_URL')
       checks.push({
-        name: 'jira_token',
-        status: ctx.config.jiraToken && ctx.config.jiraEmail ? 'ok' : 'warn',
+        name: 'jira_config',
+        status: !ctx.config.jiraToken ? 'warn' : jiraMissing.length > 0 ? 'error' : 'ok',
         message: !ctx.config.jiraToken
           ? 'LAZYFLOW_JIRA_TOKEN not set — Jira sync unavailable'
-          : ctx.config.jiraEmail
-            ? 'Jira token + email configured (Basic auth)'
-            : 'LAZYFLOW_JIRA_TOKEN set but LAZYFLOW_JIRA_EMAIL missing — API tokens need email for Basic auth (will 403)',
+          : jiraMissing.length > 0
+            ? `LAZYFLOW_JIRA_TOKEN set but ${jiraMissing.join(' + ')} missing — Jira sync will be skipped/403 until set`
+            : 'Jira token + email + base URL configured (Basic auth)',
       })
 
-      // 4. Repos / Jira projects configured
+      // 4. Repos configured. NOTE: this checks config PRESENCE, not live
+      //    resolution — a wildcard (ORG/*) restricted by SSO can still resolve to
+      //    0 repos at sync time (run_sync surfaces that warning).
       checks.push({
         name: 'repos_configured',
         status: ctx.config.repos.length > 0 ? 'ok' : 'warn',
         message:
           ctx.config.repos.length > 0
-            ? `${ctx.config.repos.length} repo(s) configured`
+            ? `${ctx.config.repos.length} repo pattern(s) configured (run run_sync to verify they resolve)`
             : 'LAZYFLOW_REPOS not set — no repos to sync',
       })
+
+      // 5. Jira projects configured — without this, Jira sync succeeds with 0
+      //    issues and no explanation (the project loop never runs).
+      if (ctx.config.jiraToken) {
+        checks.push({
+          name: 'jira_projects_configured',
+          status: ctx.config.jiraProjects.length > 0 ? 'ok' : 'warn',
+          message:
+            ctx.config.jiraProjects.length > 0
+              ? `${ctx.config.jiraProjects.length} Jira project(s) configured`
+              : 'LAZYFLOW_JIRA_PROJECTS not set — Jira sync will ingest 0 issues',
+        })
+      }
 
       // 6. DB path
       checks.push({
@@ -429,12 +450,20 @@ function registerRunSyncTool(server, ctx) {
     skipped: z.boolean(),
     skip_reason: z.string().optional(),
     snapshots_written: z.number().optional(),
+    patch_backfill: z
+      .object({
+        backfilled: z.number(),
+        skipped: z.number(),
+        remaining: z.number(),
+      })
+      .nullish(),
     timings_ms: z
       .object({
         sync_total: z.number(),
         github: z.number(),
         jira: z.number(),
         snapshot_backfill: z.number(),
+        patch_backfill: z.number().optional(),
       })
       .optional(),
   })
@@ -499,9 +528,12 @@ function registerRunSyncTool(server, ctx) {
           },
           identity: { identities_upserted: 0, persons_created: 0, auto_merged: 0, queued: 0 },
           linking: { links_upserted: 0, false_positives_dropped: 0 },
-          errors: ['Jira client not configured — LAZYFLOW_JIRA_TOKEN required'],
+          errors: [
+            'Jira client not configured — set LAZYFLOW_JIRA_TOKEN, LAZYFLOW_JIRA_EMAIL and LAZYFLOW_JIRA_BASE_URL (run doctor to see which is missing)',
+          ],
           skipped: true,
-          skip_reason: 'LAZYFLOW_JIRA_TOKEN not set',
+          skip_reason:
+            'Jira not fully configured — needs LAZYFLOW_JIRA_TOKEN + LAZYFLOW_JIRA_EMAIL + LAZYFLOW_JIRA_BASE_URL',
         }
         return {
           content: [{ type: 'text', text: JSON.stringify(output) }],
@@ -592,11 +624,19 @@ function registerRunSyncTool(server, ctx) {
         ...provenance('n/a'),
         synced_at: result.syncedAt,
         snapshots_written: snapshotsWritten,
+        patch_backfill: result.patchBackfill
+          ? {
+              backfilled: result.patchBackfill.backfilled,
+              skipped: result.patchBackfill.skipped,
+              remaining: result.patchBackfill.remaining,
+            }
+          : null,
         timings_ms: {
           sync_total: syncMs,
           github: result.timings?.githubMs ?? 0,
           jira: result.timings?.jiraMs ?? 0,
           snapshot_backfill: backfillMs,
+          patch_backfill: result.timings?.backfillMs ?? 0,
         },
         github: {
           org: result.github.org,
@@ -809,9 +849,23 @@ async function computeRows(ctx, scopeType, scopeId, metricIds, windowDays) {
   const fromDay = new Date(Date.parse(toDay) - (windowDays - 1) * 86_400_000)
     .toISOString()
     .slice(0, 10)
+  // Load the scope dataset ONCE and share it across every metric in the bundle.
+  // Without this, computeMetric re-runs a full-table load per metric (13× for
+  // get_pr_metrics), which on a large install freezes the single-threaded server
+  // for seconds and spikes memory N×. Mirrors backfillSnapshots / personReport.
+  const preloaded = await loadScopeData(ctx.store, fromDay, toDay)
   const rows = []
   for (const metricId of metricIds) {
-    const r = await computeMetric(ctx.store, scopeType, scopeId, metricId, fromDay, toDay, now)
+    const r = await computeMetric(
+      ctx.store,
+      scopeType,
+      scopeId,
+      metricId,
+      fromDay,
+      toDay,
+      now,
+      preloaded,
+    )
     rows.push({
       metric: metricId,
       value: r.value,
@@ -1234,7 +1288,10 @@ async function runQueryInSubprocess(ctx, { sql, params, maxRows }) {
   )
   proc.stdin.end()
 
-  const stdout = await proc.stdout.text()
+  // Drain stdout AND stderr concurrently. If stderr is left unread and the child
+  // emits a large volume (a crash dump / native assertion), its OS pipe buffer can
+  // fill and deadlock the child — turning a fast error into a full timeout stall.
+  const [stdout, stderr] = await Promise.all([proc.stdout.text(), proc.stderr.text()])
   await proc.exited
 
   // Bun sets signalCode when it kills the child on timeout (killSignal above).
@@ -1252,8 +1309,9 @@ async function runQueryInSubprocess(ctx, { sql, params, maxRows }) {
   try {
     parsed = JSON.parse(stdout)
   } catch {
+    const detail = stderr?.trim() ? ` (${stderr.trim().slice(0, 300)})` : ''
     throw new QueryDbError(
-      'query runner returned no parseable output (the query may have crashed).',
+      `query runner returned no parseable output (the query may have crashed)${detail}.`,
     )
   }
   if (!parsed.ok) {
@@ -2046,8 +2104,12 @@ function registerBackfillPrPatchesTool(server, ctx) {
       title: 'Backfill PR File Patches',
       description:
         'Populate pr_files.patch by fetching base+head file blobs over GraphQL (NO REST) and ' +
-        'synthesising the unified diff locally — unblocking exact HALOC and diff-level verdicts. ' +
-        'Idempotent and incremental: only files missing a patch are processed; re-run to continue.',
+        'synthesising the unified diff locally — unblocking diff-level verdicts. Idempotent and ' +
+        'incremental: only files missing a patch are processed; re-run to continue. Pass drain:true ' +
+        'to process EVERY remaining file to completion in one call (use before a verdict pass so ' +
+        'diff-level metrics see the full diff set); otherwise `limit` bounds one chunk. NOTE: ' +
+        'code.haloc_aggregate does NOT need this — it always uses the complete denormalised HALOC ' +
+        'column; backfill is only required for the diff-level verdict layer.',
       inputSchema: z.object({
         limit: z
           .number()
@@ -2055,47 +2117,34 @@ function registerBackfillPrPatchesTool(server, ctx) {
           .min(1)
           .max(5000)
           .optional()
-          .describe('Max files to process this call (bounds blob volume; default 500).'),
+          .describe(
+            'Max files to process this call (bounds blob volume; default 500). Ignored when drain=true.',
+          ),
+        drain: z
+          .boolean()
+          .optional()
+          .describe(
+            'Process every remaining patch-less file to completion (looping in bounded chunks). ' +
+              'Slower, but leaves the diff set complete; the residual `remaining` is the genuinely ' +
+              'unfetchable count (e.g. blobs removed from history).',
+          ),
       }),
     },
-    async ({ limit }) => {
+    async ({ limit, drain }) => {
       if (!ctx.githubClient) {
         return inputError('GitHub client not configured — LAZYFLOW_GITHUB_TOKEN required.')
       }
       const cap = limit ?? 500
-      // Distinct repos that still have patch-less files.
-      const repoIds = [
-        ...new Set(
-          (await ctx.store.getAllPrFiles())
-            .filter((f) => f.patch === null || f.patch === undefined)
-            .map((f) => f.repoId),
-        ),
-      ]
-      const perRepo = []
-      let backfilled = 0
-      let skipped = 0
-      let remaining = 0
-      for (const repoId of repoIds) {
-        if (backfilled >= cap) {
-          remaining += (await ctx.store.getAllPrFiles()).filter(
-            (f) => f.repoId === repoId && (f.patch === null || f.patch === undefined),
-          ).length
-          continue
-        }
-        const repo = await ctx.store.getRepository(repoId)
-        if (!repo) continue
-        const res = await backfillPrPatches(ctx.store, ctx.githubClient, {
-          owner: repo.owner,
-          name: repo.name,
-          repoId,
-          limit: cap - backfilled,
-        })
-        backfilled += res.backfilled
-        skipped += res.skipped
-        remaining += res.remaining
-        perRepo.push({ repo: `${repo.owner}/${repo.name}`, ...res })
+      const res = drain
+        ? await backfillAllPatches(ctx.store, ctx.githubClient, { drain: true })
+        : await backfillAllPatches(ctx.store, ctx.githubClient, { maxFiles: cap })
+      const output = {
+        backfilled: res.backfilled,
+        skipped: res.skipped,
+        remaining: res.remaining,
+        drained: res.drained ?? false,
+        repos: res.repos,
       }
-      const output = { backfilled, skipped, remaining, repos: perRepo }
       return {
         content: [{ type: 'text', text: JSON.stringify(output) }],
         structuredContent: output,

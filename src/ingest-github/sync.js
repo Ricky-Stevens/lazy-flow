@@ -89,14 +89,50 @@ export async function syncGitHub(
   let filteredRaw
   if (scope.repos && scope.repos.length > 0) {
     filteredRaw = []
+    // Dedup across explicit entries AND wildcard expansions (a repo named in
+    // both `owner/repo` and `owner/*` must be synced once). Keyed on the
+    // case-folded full name.
+    const seen = new Set()
+    const add = (repo) => {
+      const key = repo.full_name.toLowerCase()
+      if (seen.has(key)) return
+      seen.add(key)
+      filteredRaw.push(repo)
+    }
     for (const full of scope.repos) {
       const [owner, name] = full.split('/')
       if (!owner || !name) {
-        warnings.push(`skipped malformed repo "${full}" (expected "owner/name")`)
+        warnings.push(`skipped malformed repo "${full}" (expected "owner/name" or "owner/*")`)
+        continue
+      }
+      if (name === '*') {
+        // Wildcard: expand to every repo the credential can see in the org,
+        // EXCLUDING archived repos and forks (dead/derived repos bloat the DB and
+        // skew metrics). Uses the org-repos listing — note this can return empty
+        // for an SSO/OAuth-restricted token even when direct repo reads succeed,
+        // so a zero result is surfaced as a warning, never a silent no-op.
+        let discovered
+        try {
+          discovered = await client.listOrgRepos(owner)
+        } catch (err) {
+          warnings.push(
+            `could not list org ${owner}/*: ${err instanceof Error ? err.message : String(err)}`,
+          )
+          continue
+        }
+        const live = discovered.filter((r) => !r.archived && !r.fork)
+        if (live.length === 0) {
+          warnings.push(
+            `"${owner}/*" resolved to 0 repos — check the token has org read access ` +
+              '(SSO authorization for private repos) and that the org has non-archived, ' +
+              'non-fork repositories visible to it',
+          )
+        }
+        for (const r of live) add(r)
         continue
       }
       try {
-        filteredRaw.push(await client.getRepo(owner, name))
+        add(await client.getRepo(owner, name))
       } catch (err) {
         warnings.push(
           `could not resolve repo ${full}: ${err instanceof Error ? err.message : String(err)}`,
@@ -140,11 +176,29 @@ export async function syncGitHub(
     // then next chunk. This keeps memory bounded to N payloads, not |repos|.
     for (let i = 0; i < repos.length; i += repoFetchConcurrency) {
       const chunk = repos.slice(i, i + repoFetchConcurrency)
-      const payloads = await mapWithConcurrency(chunk, repoFetchConcurrency, (repo) =>
-        fetchRepoPayload(store, client, repo, mode, now),
-      )
+      // Per-repo isolation: mapWithConcurrency has Promise.all semantics, so one
+      // repo that throws (malformed payload, transient network error) would abort
+      // the WHOLE sync and lose every other repo. Catch per repo and continue,
+      // surfacing the failure as a warning — mirrors the Jira per-issue pattern.
+      const payloads = await mapWithConcurrency(chunk, repoFetchConcurrency, async (repo) => {
+        try {
+          return await fetchRepoPayload(store, client, repo, mode, now)
+        } catch (err) {
+          warnings.push(
+            `failed to fetch ${repo.owner}/${repo.name}: ${err instanceof Error ? err.message : String(err)}`,
+          )
+          return null
+        }
+      })
       for (let j = 0; j < chunk.length; j++) {
-        await writeRepoPayload(store, chunk[j], payloads[j], now)
+        if (payloads[j] == null) continue
+        try {
+          await writeRepoPayload(store, chunk[j], payloads[j], now)
+        } catch (err) {
+          warnings.push(
+            `failed to write ${chunk[j].owner}/${chunk[j].name}: ${err instanceof Error ? err.message : String(err)}`,
+          )
+        }
       }
     }
   }

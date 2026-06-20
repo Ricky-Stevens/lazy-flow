@@ -177,6 +177,11 @@ export async function computePersonReport(store, personId, opts, deps) {
       value: personResult.value,
       dataQuality: personResult.dataQuality,
       descriptive: polarity === 0,
+      // Promote heuristic-vs-verified provenance to the top-level row so a
+      // label-inferred value (e.g. bugfix_share computed from a 'proxy' source)
+      // is visibly distinguished from a content-verified one — otherwise it's
+      // buried in `detail` and an evaluator can mistake a guess for a fact.
+      dataSource: personResult.dataSource ?? null,
       comparison,
       detail: personResult,
     })
@@ -213,9 +218,10 @@ export async function computePersonReport(store, personId, opts, deps) {
     metrics,
     trend,
     contract:
-      'Coaching signal, not a scorecard. Compared to this person’s own team distribution and ' +
-      'their own history — never a rank. Descriptive metrics carry no better/worse orientation. ' +
-      `Peer comparison is suppressed below a cohort of ${MIN_COHORT} human peers.`,
+      'Evaluation, with confidence attached. Compared to this person’s own history and the team ' +
+      'distribution; every comparative claim carries its sample size and confidence, and a ' +
+      `comparison below a cohort of ${MIN_COHORT} human peers is suppressed (read the ` +
+      'self-baseline trend instead). Interpret descriptive metrics in context rather than as raw scores.',
   }
 }
 

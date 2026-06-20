@@ -101,6 +101,45 @@ describe('verdicts pipeline (in-session, no API)', () => {
     expect(r.pending[0].context.body).toContain('backoff')
   })
 
+  it('surfaces the synthesised diff to the judge when a patch is present', async () => {
+    await store.upsertPrFile({
+      prId: 'pr-1',
+      repoId: 'repo-1',
+      path: 'src/retry.ts',
+      additions: 3,
+      deletions: 1,
+      haloc: 3,
+      status: 'modified',
+      patch: '@@ -1,1 +1,3 @@\n-old\n+new line a\n+new line b\n',
+      isGenerated: false,
+      createdAt: NOW,
+      updatedAt: NOW,
+    })
+    const r = await listPendingVerdicts(store, 'person.design_bearing_ratio', 'p-1')
+    const file = r.pending[0].context.files.find((f) => f.path === 'src/retry.ts')
+    expect(file.patch).toContain('+new line a')
+    expect(r.pending[0].context.note).toMatch(/diffs are included/i)
+  })
+
+  it('flags missing diffs (patch NULL) so the judge lowers confidence', async () => {
+    await store.upsertPrFile({
+      prId: 'pr-1',
+      repoId: 'repo-1',
+      path: 'src/no-diff.ts',
+      additions: 1,
+      deletions: 0,
+      haloc: 1,
+      status: 'added',
+      patch: null,
+      isGenerated: false,
+      createdAt: NOW,
+      updatedAt: NOW,
+    })
+    const r = await listPendingVerdicts(store, 'person.design_bearing_ratio', 'p-1')
+    expect(r.pending[0].context.files[0].patch).toBeNull()
+    expect(r.pending[0].context.note).toMatch(/no diffs backfilled/i)
+  })
+
   it('records a verdict (idempotent) and then excludes it from pending', async () => {
     await recordVerdict(
       store,

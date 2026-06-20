@@ -7,7 +7,7 @@ const DOC =
   'from small-but-subtle work (high band). Read it PAIRED with PR size: high difficulty ' +
   'at low size is a positive signal — genuinely hard work that line counts would miss. ' +
   'High difficulty is not "better" and low difficulty is not "worse" — both are normal ' +
-  'depending on what the work demanded; treat this as a coaching signal, not a ranking.'
+  'depending on what the work demanded; treat this as an evaluative signal, read with confidence.'
 
 const SAMPLE_FLOOR = 8
 

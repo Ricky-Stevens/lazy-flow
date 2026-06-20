@@ -11,7 +11,7 @@ const DOC =
   'it never says someone is above or below the team, only whether their recent change ' +
   "is out-pacing, tracking, or lagging the team's recent change. interpretation bands " +
   'the value: outpacing team (>0.5), lagging team (<-0.5), tracking team otherwise. ' +
-  'A coaching signal about relative trajectory — being "in step with the team" is a ' +
+  'An evaluative signal about relative trajectory — being "in step with the team" is a ' +
   'healthy, normal reading, not a deficiency.'
 
 /**

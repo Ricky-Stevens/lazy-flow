@@ -176,7 +176,10 @@ export const estimationAccuracy = {
         scope: 'team',
         value: null,
         unit: 'correlation',
-        dataQuality: 'ok',
+        // A null value is never 'ok' — a non-significant correlation is no usable
+        // measurement, so flag it insufficient_sample (matches the other null
+        // branches) rather than implying a valid result to programmatic consumers.
+        dataQuality: 'insufficient_sample',
         engineVersion: ENGINE_VERSION,
         asOf,
         formulaDoc: FORMULA_DOC,

@@ -44,7 +44,7 @@
       "default": ""
     },
     "repos": {
-      "description": "Comma-separated list of GitHub repositories to track, e.g. ORG/app,ORG/api",
+      "description": "Comma-separated list of GitHub repositories to track, e.g. ORG/app,ORG/api. Use ORG/* to track every repo in an organisation (excludes archived repos and forks); wildcards and explicit entries can be mixed, e.g. ORG/*,OTHER/special.",
       "sensitive": false,
       "required": false,
       "default": ""

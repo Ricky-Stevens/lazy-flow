@@ -50,6 +50,7 @@ export {
   computePersonReportLive,
   invalidateLookupsCache,
   knownMetricIds,
+  loadScopeData,
   metricFormulaDoc,
 } from './compute/index.js'
 // Group A — DORA

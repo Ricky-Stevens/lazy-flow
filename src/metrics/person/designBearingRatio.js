@@ -6,10 +6,10 @@ const DOC =
   '(0..1). Verdicts below minConfidence (default 0.5) are dropped. value = difficulty-weighted ' +
   'share of design-bearing work = sum(difficulty over kept design-bearing verdicts) / ' +
   'sum(difficulty over all kept verdicts). Only an LLM reading the real diff can tell ' +
-  'designed-a-cache from bumped-a-version, so this is a probabilistic coaching signal, not a ' +
-  'score. A lower ratio is NOT worse — boilerplate, version bumps and config are necessary ' +
+  'designed-a-cache from bumped-a-version, so this is a probabilistic evaluative signal. ' +
+  'A lower ratio is NOT worse — boilerplate, version bumps and config are necessary ' +
   'work; the fair reading is the mix over time, always shown with the underlying evidence and ' +
-  'never used to rank people.'
+  'its confidence.'
 
 const DEFAULT_MIN_CONFIDENCE = 0.5
 const SAMPLE_FLOOR = 5

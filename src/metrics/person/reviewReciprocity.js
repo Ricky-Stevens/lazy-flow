@@ -4,7 +4,7 @@ const RECIPROCITY_DOC =
   'Review Reciprocity (person scope): reviews the person GIVES to others vs ' +
   'reviews their own authored PRs RECEIVE. reciprocity = reviewsGiven / (reviewsReceived + 1). ' +
   '>1 = net reviewer (carries review load); <1 = net receiver. Counts non-author, non-bot ' +
-  'reviews only. A collaboration-health signal compared to a peer cohort — never a rank, and ' +
+  'reviews only. A collaboration-health signal compared to a peer cohort — and ' +
   'low reciprocity is not "bad" (juniors receive more than they give by design). ' +
   'Below SAMPLE_FLOOR total review interactions the ratio is reported but flagged ' +
   'insufficient_sample — a value from one or two reviews is noise, not a balance.'

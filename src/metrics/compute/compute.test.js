@@ -757,6 +757,33 @@ describe('computeMetric', () => {
     expect(r.halocSource).toBe('denormalized_prfile_column')
   })
 
+  it('code.haloc_aggregate → uses the complete denorm total when patches are only PARTIALLY backfilled (no silent undercount)', async () => {
+    // Regression: the post-sync auto-backfill populates patches incrementally, so
+    // the steady state is PARTIAL — some files have a patch, some are still NULL.
+    // The diff-recompute then sums ONLY the backfilled files: a confident
+    // undercount at "ok" quality. Null the patch on ONE file (gadget.go, denorm
+    // HALOC 11), leaving pr-1's two files patched (recompute 8). The denorm total
+    // stays 19, so the metric must report 19 — not the partial 8.
+    const partial = baseOrg.prFiles.find((f) => f.path.endsWith('gadget.go'))
+    await store.upsertPrFile({
+      prId: partial.prId,
+      repoId: partial.repoId,
+      path: partial.path,
+      additions: partial.additions,
+      deletions: partial.deletions,
+      haloc: partial.haloc,
+      status: partial.status,
+      patch: null,
+      createdAt: '2024-01-01T00:00:00Z',
+      updatedAt: '2024-01-01T00:00:00Z',
+    })
+    const r = await compute('code.haloc_aggregate')
+    expect(r.dataQuality).toBe('ok')
+    expect(r.value).toBe(19) // complete, NOT the partial recompute of 8
+    expect(r.totalHaloc).toBe(19)
+    expect(r.halocSource).toBe('denormalized_prfile_column')
+  })
+
   it('code.nagappan_ball → ok with a REAL relative-churn M1 from window HALOC', async () => {
     // No pr_files before the window, so priorHaloc = 0 → M1 = haloc/(0+haloc) = 1.
     const r = await compute('code.nagappan_ball')

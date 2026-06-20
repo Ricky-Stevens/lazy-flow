@@ -1,7 +1,7 @@
 /**
  * Code metrics — Group D (SPEC §8.4)
  *
- * Descriptive-only — flag, never rank individuals.
+ * Descriptive — compare with language/role context.
  */
 
 export { codeChangeImpact } from './codeChangeImpact.js'

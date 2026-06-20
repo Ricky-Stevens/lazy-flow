@@ -13,8 +13,8 @@ const BYPASS_DOC =
   'value = bypassedPrs / totalPrs. This contextualises a deceptively-low ' +
   'changes-requested rate: a clean review record can simply mean reviews were ' +
   'skipped. A high rate is not inherently bad — some teams legitimately ' +
-  'self-merge docs/config or trivial changes — so read it as a coaching signal ' +
-  'about review coverage, not a verdict on the person.'
+  'self-merge docs/config or trivial changes — so read it as an evaluative signal ' +
+  'about review coverage, in context.'
 
 /**
  * Person-scope review-bypass rate. Inputs:

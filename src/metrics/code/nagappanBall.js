@@ -5,7 +5,7 @@ const FORMULA_DOC =
   'M1 = haloc / (priorHaloc + haloc) — relative churn [0,1]. ' +
   'M2 = haloc / windowDays — churn rate (haloc/day). ' +
   'M3 = reworkLines / (totalLines + 1) — rework density (null when blame unavailable). ' +
-  'Descriptive-only; do not rank individuals. ' +
+  'Descriptive; compare with language/context, not raw. ' +
   'Zero-denominator → null (SPEC §8.6).'
 
 export const nagappanBall = {

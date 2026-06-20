@@ -125,6 +125,12 @@ export async function syncJira(store, client, scope, mode, now = new Date().toIS
   // in-scope projects.
   const projectKeyToId = new Map()
 
+  if (scope.projectKeys.length === 0) {
+    result.warnings.push(
+      'no Jira projects configured (LAZYFLOW_JIRA_PROJECTS is empty) — 0 issues will be ingested',
+    )
+  }
+
   for (const projectKey of scope.projectKeys) {
     try {
       // Resolve project key to project record

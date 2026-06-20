@@ -10,7 +10,7 @@ const DOC =
   'is not penalised. ALWAYS read this beside PR size: a large-but-atomic PR (one coherent ' +
   'concern, many lines) is healthy, whereas a large-and-sprawling PR (many unrelated ' +
   'concerns) is the thing this signal flags. sprawlingShare = fraction of PRs the prior ' +
-  'marked as sprawling. This is a coaching signal about change shape, not a productivity ' +
+  'marked as sprawling. This is an evaluative signal about change shape, not a raw productivity ' +
   'or volume measure — a lower median is not inherently "bad" (some work is irreducibly ' +
   'cross-cutting). Below 8 PRs the median is reported but flagged insufficient_sample.'
 

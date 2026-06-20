@@ -795,3 +795,139 @@ describe('repo parallelism — concurrent fetch ≡ serial run (store-state equa
     expect(afterBackfill.prCount).toBeGreaterThan(0)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Org wildcard: "owner/*" expands to every visible non-archived, non-fork repo
+// ---------------------------------------------------------------------------
+
+describe('org wildcard (owner/*)', () => {
+  // A minimal stub client — syncGitHub only needs these methods in backfill mode
+  // with empty per-repo payloads, so we can drive the repo-discovery branch in
+  // isolation without the full MSW dataset.
+  // Ensure each raw repo carries a unique github node id (real adaptRepoNode
+  // always does; our literals would otherwise all map to "undefined" and collide
+  // on the repositories.github_node_id unique index).
+  const withNode = (r) => ({ node_id: r.full_name, ...r })
+  function stubClient({ orgRepos = {}, repoMap = {}, listThrows = {} }) {
+    return {
+      listOrgRepos: async (org) => {
+        if (listThrows[org]) throw new Error(listThrows[org])
+        return (orgRepos[org] ?? []).map(withNode)
+      },
+      getRepo: async (owner, name) => {
+        const r = repoMap[`${owner}/${name}`]
+        if (!r) throw new Error(`not found: ${owner}/${name}`)
+        return withNode(r)
+      },
+      fetchCommitHistory: async () => [],
+      fetchPullRequests: async () => [],
+      fetchDeployments: async () => [],
+      listReleases: async () => [],
+    }
+  }
+
+  it('expands the wildcard, excludes archived + forks, and dedups explicit entries', async () => {
+    const store = makeStore()
+    const client = stubClient({
+      orgRepos: {
+        'octo-acme': [
+          { full_name: 'octo-acme/a' },
+          { full_name: 'octo-acme/b', archived: true },
+          { full_name: 'octo-acme/c', fork: true },
+          { full_name: 'octo-acme/d' },
+        ],
+      },
+      repoMap: { 'octo-acme/d': { full_name: 'octo-acme/d' } },
+    })
+
+    // Wildcard + an explicit entry that the wildcard also covers → synced once.
+    const res = await syncGitHub(
+      store,
+      client,
+      { org: 'octo-acme', repos: ['octo-acme/*', 'octo-acme/d'] },
+      'backfill',
+    )
+
+    const synced = (await store.getRepositoriesByOrg('org-octo-acme')).map((r) => r.id).sort()
+    expect(synced).toEqual(['octo-acme-a', 'octo-acme-d']) // b (archived) + c (fork) excluded
+    expect(res.repos.sort()).toEqual(['octo-acme/a', 'octo-acme/d'])
+    expect(new Set(res.repos).size).toBe(res.repos.length) // no duplicate from the explicit entry
+  })
+
+  it('warns (never silently no-ops) when the wildcard resolves to 0 repos', async () => {
+    const store = makeStore()
+    const client = stubClient({ orgRepos: { 'empty-org': [] } })
+
+    const res = await syncGitHub(
+      store,
+      client,
+      { org: 'empty-org', repos: ['empty-org/*'] },
+      'backfill',
+    )
+
+    expect(res.repos).toEqual([])
+    expect(res.warnings.some((w) => /resolved to 0 repos/.test(w))).toBe(true)
+  })
+
+  it('warns when the org listing call fails, without aborting the sync', async () => {
+    const store = makeStore()
+    const client = stubClient({
+      listThrows: { 'octo-acme': 'SSO required' },
+      repoMap: { 'octo-acme/keep': { full_name: 'octo-acme/keep' } },
+    })
+
+    const res = await syncGitHub(
+      store,
+      client,
+      { org: 'octo-acme', repos: ['octo-acme/*', 'octo-acme/keep'] },
+      'backfill',
+    )
+
+    // The explicit repo still syncs; the failed wildcard is surfaced as a warning.
+    expect(res.repos).toEqual(['octo-acme/keep'])
+    expect(res.warnings.some((w) => /could not list org octo-acme\/\*/.test(w))).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Per-repo isolation: one repo whose fetch/write throws must NOT abort the sync
+// ---------------------------------------------------------------------------
+
+describe('per-repo isolation', () => {
+  const withNode = (r) => ({ node_id: r.full_name, ...r })
+  // Full fetch surface; fetchPullRequests throws for ONE repo to simulate a
+  // malformed payload / transient error mid-fetch.
+  function isolationClient(throwForFullName) {
+    return {
+      getRepo: async (owner, name) => withNode({ full_name: `${owner}/${name}` }),
+      fetchCommitHistory: async () => [],
+      fetchPullRequests: async (owner, name) => {
+        if (`${owner}/${name}` === throwForFullName) throw new Error('boom: malformed PR payload')
+        return []
+      },
+      fetchDeployments: async () => [],
+      listReleases: async () => [],
+    }
+  }
+
+  it('a repo whose fetch throws is isolated: other repos still sync, failure surfaced as a warning', async () => {
+    const store = makeStore()
+    const client = isolationClient('octo-acme/bad')
+
+    // Must not throw — mapWithConcurrency is Promise.all, so without per-repo
+    // isolation one bad repo would abort the entire (unattended) sync.
+    const res = await syncGitHub(
+      store,
+      client,
+      { org: 'octo-acme', repos: ['octo-acme/good', 'octo-acme/bad'] },
+      'backfill',
+    )
+
+    // Both repos were discovered/upserted; the sync completed.
+    const synced = (await store.getRepositoriesByOrg('org-octo-acme')).map((r) => r.id).sort()
+    expect(synced).toEqual(['octo-acme-bad', 'octo-acme-good'])
+    // The bad repo's failure is surfaced (not swallowed, not fatal); the good one is clean.
+    expect(res.warnings.some((w) => /failed to fetch octo-acme\/bad/.test(w))).toBe(true)
+    expect(res.warnings.some((w) => /failed to fetch octo-acme\/good/.test(w))).toBe(false)
+  })
+})

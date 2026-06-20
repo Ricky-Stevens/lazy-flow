@@ -811,3 +811,44 @@ describe('MCP server — tool: query_db (on-disk, isolated)', () => {
     }
   }, 15000)
 })
+
+describe('MCP server — metric bundles load the dataset once (perf regression guard)', () => {
+  // Wrap the store in a counting proxy so we can assert the full-table load runs
+  // ONCE per bundle, not once per metric. Before the load-once fix, computeRows
+  // ran a fresh loadScopeData per metric (~13× for get_pr_metrics), freezing the
+  // single-threaded server and spiking memory N× on a large install.
+  function countingCtx() {
+    const config = { ...loadConfig(), dbPath: ':memory:' }
+    const store = new BunSqliteStore(':memory:')
+    migrate(store.db)
+    const counts = {}
+    const proxy = new Proxy(store, {
+      get(target, prop, receiver) {
+        const val = Reflect.get(target, prop, receiver)
+        if (typeof val !== 'function') return val
+        return (...args) => {
+          counts[prop] = (counts[prop] ?? 0) + 1
+          return val.apply(target, args)
+        }
+      },
+    })
+    return { ctx: { config, store: proxy, githubClient: null, jiraClient: null }, counts }
+  }
+
+  it('get_pr_metrics calls getAllPullRequests at most once for the whole bundle', async () => {
+    const { ctx, counts } = countingCtx()
+    const server = createServer(ctx)
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+    await server.connect(serverTransport)
+    const client = new Client({ name: 'test-client', version: '0.0.0' })
+    await client.connect(clientTransport)
+
+    const result = await client.callTool({
+      name: 'get_pr_metrics',
+      arguments: { window_days: 30 },
+    })
+    expect(result.isError).toBeFalsy()
+    // One shared load for the bundle — NOT once per metric.
+    expect(counts.getAllPullRequests ?? 0).toBeLessThanOrEqual(1)
+  })
+})

@@ -8,7 +8,7 @@ const DRIFT_DOC =
   'outlier windows do not distort the signal. driftStatus bands the magnitude: stable ' +
   '(|z|<1), shifting (|z|<2), regime_change (|z|>=2). Until the baseline has enough ' +
   'history (baselineN < minN) it is still establishing and no drift is asserted. ' +
-  'This is a coaching signal about change against oneself — a large drift is not ' +
+  'This is an evaluative signal about change against oneself — a large drift is not ' +
   'inherently good or bad, just worth a conversation. Team trend is reference only.'
 
 const MIN_N = 5

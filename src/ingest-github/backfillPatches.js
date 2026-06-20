@@ -5,10 +5,12 @@
  * we fetch the base+head blob text and synthesise the unified diff locally
  * (synthesizeUnifiedDiff), then re-store the patch + an exact per-hunk HALOC.
  *
- * This unblocks diff-level signals (exact code.haloc_aggregate + the in-session
- * verdict layer's ability to read real diffs) without re-introducing the REST
- * path the ingestion deliberately removed. Idempotent: already-patched files are
- * skipped, so it can run incrementally and be re-run safely.
+ * This unblocks the diff-level verdict layer (the in-session judge reading real
+ * diffs) and adds per-hunk HALOC precision, without re-introducing the REST path
+ * the ingestion deliberately removed. NOTE: code.haloc_aggregate does NOT depend
+ * on this — it always reads the complete denormalised HALOC column, so it is
+ * correct with zero, partial, or full backfill. Idempotent: already-patched files
+ * are skipped, so it can run incrementally and be re-run safely.
  */
 
 import { computeHaloc, synthesizeUnifiedDiff } from '../code-analysis/index.js'
@@ -89,7 +91,7 @@ export async function backfillPrPatches(store, client, opts) {
       // ingest mapper already classified, so re-derive (instead of trusting an
       // older row that predates the column) and round-trip it through the
       // upsert. Otherwise a backfill would silently flip is_generated back to 0.
-      isGenerated: f.isGenerated === true ? true : false,
+      isGenerated: f.isGenerated === true,
       createdAt: f.createdAt,
       updatedAt: now,
     })
@@ -103,4 +105,119 @@ export async function backfillPrPatches(store, client, opts) {
     skipped,
     remaining: pending.length - backfilled,
   }
+}
+
+/**
+ * Repo-iterating backfill: process patch-less files across EVERY repo that still
+ * has them, up to `maxFiles` total. Shared by the `backfill_pr_patches` MCP tool
+ * and the post-sync auto-backfill hook so the iteration logic lives in one place.
+ * Best-effort per repo: a repo whose blob fetch fails is recorded and skipped,
+ * never aborting the others.
+ *
+ * @returns { backfilled, skipped, remaining, repos: [{ repo, ...res }], errors }
+ */
+export async function backfillAllPatches(store, client, opts = {}) {
+  // Drain mode: process EVERY patch-less file across all repos to completion,
+  // looping in bounded chunks. Used by the explicit `backfill_pr_patches` tool
+  // (drain:true) before a verdict pass — the per-sync auto-backfill stays
+  // bounded by `maxFiles` for speed. Stops a repo when it reports no remaining
+  // files OR when a pass makes zero progress (the residual is genuinely
+  // unfetchable — e.g. blobs deleted from history — so looping further is
+  // pointless and would never terminate). The returned `remaining` is that
+  // honest, irreducible residual.
+  if (opts.drain) {
+    const chunk = opts.chunkSize ?? 1000
+    const MAX_PASSES_PER_REPO = 10_000 // safety backstop against a stuck loop
+    const repoIds = [
+      ...new Set(
+        (await store.getAllPrFiles())
+          .filter((f) => f.patch === null || f.patch === undefined)
+          .map((f) => f.repoId),
+      ),
+    ]
+    const repos = []
+    const errors = []
+    let backfilled = 0
+    let skipped = 0
+    let remaining = 0
+    for (const repoId of repoIds) {
+      const repo = await store.getRepository(repoId)
+      if (!repo) continue
+      let repoBackfilled = 0
+      let repoSkipped = 0
+      let repoRemaining = 0
+      let passes = 0
+      while (passes++ < MAX_PASSES_PER_REPO) {
+        let res
+        try {
+          res = await backfillPrPatches(store, client, {
+            owner: repo.owner,
+            name: repo.name,
+            repoId,
+            limit: chunk,
+          })
+        } catch (err) {
+          errors.push(
+            `${repo.owner}/${repo.name}: ${err instanceof Error ? err.message : String(err)}`,
+          )
+          break
+        }
+        repoBackfilled += res.backfilled
+        repoSkipped += res.skipped
+        repoRemaining = res.remaining
+        // Done, or no further progress possible (remaining files are unfetchable).
+        if (res.remaining === 0 || res.backfilled === 0) break
+      }
+      backfilled += repoBackfilled
+      skipped += repoSkipped
+      remaining += repoRemaining
+      repos.push({
+        repo: `${repo.owner}/${repo.name}`,
+        backfilled: repoBackfilled,
+        skipped: repoSkipped,
+        remaining: repoRemaining,
+      })
+    }
+    return { backfilled, skipped, remaining, repos, errors, drained: true }
+  }
+
+  const maxFiles = opts.maxFiles ?? 500
+  const repoIds = [
+    ...new Set(
+      (await store.getAllPrFiles())
+        .filter((f) => f.patch === null || f.patch === undefined)
+        .map((f) => f.repoId),
+    ),
+  ]
+  const repos = []
+  const errors = []
+  let backfilled = 0
+  let skipped = 0
+  let remaining = 0
+  for (const repoId of repoIds) {
+    // Once the budget is spent, just tally what is still outstanding.
+    if (backfilled >= maxFiles) {
+      remaining += (await store.getAllPrFiles()).filter(
+        (f) => f.repoId === repoId && (f.patch === null || f.patch === undefined),
+      ).length
+      continue
+    }
+    const repo = await store.getRepository(repoId)
+    if (!repo) continue
+    try {
+      const res = await backfillPrPatches(store, client, {
+        owner: repo.owner,
+        name: repo.name,
+        repoId,
+        limit: maxFiles - backfilled,
+      })
+      backfilled += res.backfilled
+      skipped += res.skipped
+      remaining += res.remaining
+      repos.push({ repo: `${repo.owner}/${repo.name}`, ...res })
+    } catch (err) {
+      errors.push(`${repo.owner}/${repo.name}: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+  return { backfilled, skipped, remaining, repos, errors }
 }

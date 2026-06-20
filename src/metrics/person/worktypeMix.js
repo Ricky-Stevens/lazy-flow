@@ -6,7 +6,7 @@ const WORKTYPE_MIX_DOC =
   'than the Jira label alone. Each unit of work is bucketed into one of ' +
   'feature, bug, debt, refactor, test, docs, other. value = the share (0..1) ' +
   "of the DOMINANT bucket; distribution gives every bucket's share. A mix " +
-  'signal for coaching and context, never a target — a high feature share is ' +
+  'signal for evaluation and context — a high feature share is ' +
   'not "better" than a high debt or test share; the healthy reading depends ' +
   'on the role, the team, and the phase of work.'
 

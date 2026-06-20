@@ -92,7 +92,7 @@ describe('computePersonReportLive', () => {
     expect(rep.displayName).toBe('Dev One')
     expect(Array.isArray(rep.metrics)).toBe(true)
     expect(rep.metrics.length).toBeGreaterThan(10)
-    expect(rep.contract).toContain('not a scorecard')
+    expect(rep.contract).toContain('confidence')
     // Single human → peer comparison is suppressed (no misleading band on n<8).
     const reviewBypass = rep.metrics.find((m) => m.metric === 'pr.review_bypass_rate_received')
     expect(reviewBypass.comparison.band).toBe('insufficient_cohort')

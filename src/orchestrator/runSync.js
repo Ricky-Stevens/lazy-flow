@@ -7,7 +7,7 @@ import {
   stitchPersons,
 } from '../core/index.js'
 
-import { ingestRepoAiSignals, syncGitHub } from '../ingest-github/index.js'
+import { backfillAllPatches, ingestRepoAiSignals, syncGitHub } from '../ingest-github/index.js'
 
 import { syncJira } from '../ingest-jira/index.js'
 
@@ -66,6 +66,29 @@ export async function runSync(
   if (ghResult.warnings && ghResult.warnings.length > 0) {
     errors.push(...ghResult.warnings.map((w) => `github: ${w}`))
   }
+
+  // -------------------------------------------------------------------------
+  // 1b. Auto-backfill PR file patches (GraphQL blobs → synthesised diffs).
+  // Diffs unblock exact HALOC and the diff-level verdict layer. Bounded per run
+  // (options.backfillPatchLimit, default 1500 files) so it makes incremental
+  // progress without ballooning sync time; best-effort — a failure here never
+  // fails the sync. Disable with options.backfillPatches === false.
+  // -------------------------------------------------------------------------
+  let patchBackfill = null
+  const tBackfill = Date.now()
+  if (githubClient && options.backfillPatches !== false) {
+    try {
+      patchBackfill = await backfillAllPatches(store, githubClient, {
+        maxFiles: options.backfillPatchLimit ?? 1500,
+      })
+      if (patchBackfill.errors.length > 0) {
+        errors.push(...patchBackfill.errors.map((e) => `backfill_patches: ${e}`))
+      }
+    } catch (err) {
+      errors.push(`backfill_patches: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+  const backfillMs = Date.now() - tBackfill
 
   // -------------------------------------------------------------------------
   // 2. Jira sync
@@ -219,7 +242,8 @@ export async function runSync(
       deployIncidentLinks: deployIncidentLinks.linksUpserted,
     },
     rederive,
+    patchBackfill,
     errors,
-    timings: { githubMs, jiraMs },
+    timings: { githubMs, jiraMs, backfillMs },
   }
 }

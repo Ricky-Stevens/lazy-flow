@@ -6,8 +6,8 @@ const CI_GREEN_DOC =
   'noCiShare (PRs with no checks at all) so "no CI configured" is never mis-scored as ' +
   'indiscipline — a low rate driven by missing pipelines is a tooling gap, not a person signal. ' +
   'postMergeCiShare flags checked PRs whose checks only completed AFTER merge (a race/config ' +
-  "smell, not necessarily the author's fault). A coaching signal compared to a cohort, never a " +
-  'rank; "more green" is not automatically "better".'
+  "smell, not necessarily the author's fault). An evaluative signal compared to a cohort, " +
+  'read with confidence; "more green" is not automatically "better".'
 
 /**
  * Person-scope CI discipline. Inputs are pre-shaped by the caller:

@@ -5,7 +5,7 @@ const SURFACE_DOC =
   "a person's PRs. value = median(prSurfaces); p75 shows the heavier tail. Surface is " +
   'complexity-weighted, not line-counted, so 30 lines threaded through 8 hard functions ' +
   'outweighs a 400-line fixture/boilerplate PR. Read it PAIRED with PR size: low size + ' +
-  'high surface = harder-than-it-looks work that deserves credit, not a productivity score. ' +
+  'high surface = harder-than-it-looks work that deserves credit. ' +
   'High surface is not "better" and low surface is not "worse" — both are normal depending ' +
   'on what the work demanded.'
 

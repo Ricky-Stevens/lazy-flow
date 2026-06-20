@@ -46,38 +46,69 @@ build step and the test suite uses Bun's native test runner.
   "pluginConfigs": {
     "lazy-flow": {
       "options": {
-        "repos": ["ORG/app", "ORG/api"],
-        "jira_projects": ["ENG"]
+        "repos": "ORG/app,ORG/api",
+        "jira_projects": "ENG",
+        "jira_email": "you@acme.com",
+        "jira_base_url": "https://acme.atlassian.net"
       }
     }
   }
 }
 ```
 
-3. **On first launch**, Claude Code prompts each team member once to set secrets (stored in the OS keychain):
-   - `github_token` — GitHub PAT or App installation token
-   - `jira_oauth_token` — Jira Cloud OAuth 2.0 token (optional)
+> `repos` and `jira_projects` are **comma-separated strings** (not JSON arrays).
+> `jira_email` and `jira_base_url` are required for any Jira sync (see step 3).
+
+> **Whole-org tracking:** instead of listing each repo, use the wildcard
+> `"repos": ["ORG/*"]` to track every repository in an organisation. It excludes
+> archived repos and forks, and can be mixed with explicit entries
+> (`["ORG/*", "OTHER/special"]`). Note: org enumeration uses GitHub's org-repos
+> listing, which can return nothing for an SSO/OAuth-restricted token even when
+> that token can read individual repos — if a wildcard resolves to 0 repos the
+> sync surfaces a warning rather than failing silently.
+
+3. **On first launch**, Claude Code prompts each team member once to set the secret tokens (stored in the OS keychain):
+   - `github_token` — GitHub PAT or App installation token (**required**)
+   - `jira_oauth_token` — Jira Cloud **API token** (create at id.atlassian.com → API tokens); required only if you want Jira sync
+
+   Jira sync also needs two **non-secret** values, set in `options` above: `jira_email` (your Atlassian account email — required for Basic auth, otherwise every Jira call returns 403) and `jira_base_url` (e.g. `https://acme.atlassian.net`). Run the `doctor` tool after setup — it reports exactly which of these is missing.
 
 4. **The MCP server starts automatically** next session. No build/install step required — Bun runs the server straight from source at `src/mcp-server/index.js`. Once data is synced, Claude can query the local SQLite database directly via the `query_db` tool (see the `lazy-flow://schema` resource).
 
-### Available slash commands
+### Skills (question-shaped workflows)
 
-| Command | Description |
+The raw metrics are MCP tools Claude calls directly (`get_dora`, `get_flow`,
+`get_pr_metrics`, `get_code_metrics`, `get_agile_metrics`, `data_overview`,
+`query_db`, `explain_metric`, `run_sync`, …). The **skills** package the
+multi-step *management* workflows on top of those tools — they chain the calls,
+interpret the results, and produce manager-facing evaluations (ranking and
+recommendations), each verdict carrying its confidence basis.
+
+| Skill | Answers |
 |---|---|
-| `/lazy-flow:sync` | Trigger GitHub + Jira sync, show freshness |
-| `/lazy-flow:dora` | DORA metrics with band classification |
-| `/lazy-flow:flow` | Cycle time, flow efficiency, WIP, CFD |
-| `/lazy-flow:pr` | PR review health, 4-phase cycle time |
-| `/lazy-flow:code` | HALOC, rework/churn, complexity deltas |
-| `/lazy-flow:agile` | Velocity, say/do, sprint predictability |
-| `/lazy-flow:forecast` | Monte Carlo delivery forecast |
-| `/lazy-flow:me` | Personal metrics (self scope) |
-| `/lazy-flow:team` | Team-level cross-dimension view |
-| `/lazy-flow:org` | Org-level aggregate view |
-| `/lazy-flow:explain` | Formula + methodology for any metric |
-| `/lazy-flow:report` | Generate an exportable HTML/MD/CSV/JSON report |
-| `/lazy-flow:config` | Health check + configuration guide |
-| `/lazy-flow:identities` | Review/confirm fuzzy identity matches |
+| `/lazy-flow:squad-review` | "Review the squad" — team metrics + per-person map + risks |
+| `/lazy-flow:person-profile` | "How is X doing?" — one engineer's evaluation profile |
+| `/lazy-flow:bus-factor` | "Where's our key-person risk?" — ownership/bus-factor map |
+| `/lazy-flow:onboarding-health` | "How are newer contributors ramping?" |
+| `/lazy-flow:verdicts` | Run the in-session LLM verdict pipeline (qualitative metrics) |
+
+### Agents (dispatchable subagents)
+
+| Agent | Role |
+|---|---|
+| `flow-analyst` | Narrates team delivery metrics; never computes, only reports tool values |
+| `squad-reviewer` | Runs the end-to-end squad review workflow |
+| `person-reviewer` | Builds one engineer's evaluation profile |
+| `verdict-runner` | Drives the verdict pipeline (backfill diffs → judge → record) |
+| `anomaly-scout` | Scans for regressions, drift, data-quality gaps, team risks |
+
+All skills and agents produce **manager-facing evaluations** — they rank, name
+top performers and development needs, and recommend actions. The one guard kept:
+no verdict is asserted without its basis — sample size, cohort coverage, and
+confidence travel with every comparative claim, and a comparison below the cohort
+floor (< 8 peers) is marked provisional rather than presented as firm. It's open
+data (GitHub + Jira); the tooling informs the manager's decision, it doesn't
+gatekeep it.
 
 ### Runs from source under Bun
 

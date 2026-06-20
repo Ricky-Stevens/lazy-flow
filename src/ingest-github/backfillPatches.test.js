@@ -2,7 +2,7 @@ import { Database } from 'bun:sqlite'
 import { beforeEach, describe, expect, it } from 'bun:test'
 
 import { BunSqliteStore, migrate } from '../core/index.js'
-import { backfillPrPatches } from './backfillPatches.js'
+import { backfillAllPatches, backfillPrPatches } from './backfillPatches.js'
 
 const NOW = '2024-06-01T00:00:00.000Z'
 
@@ -161,5 +161,53 @@ describe('backfillPrPatches (GraphQL blob-diff, no REST)', () => {
     const second = await backfillPrPatches(store, client, { owner: 'acme', name: 'app' })
     expect(second.eligible).toBe(0)
     expect(second.backfilled).toBe(0)
+  })
+})
+
+describe('backfillAllPatches drain mode', () => {
+  let store
+  beforeEach(async () => {
+    store = freshStore()
+    await seed(store)
+    // Two more files on the same PR: y.ts is fetchable, z.ts is not (no blobs).
+    for (const path of ['src/y.ts', 'src/z.ts']) {
+      await store.upsertPrFile({
+        prId: 'pr-1',
+        repoId: 'repo-1',
+        path,
+        additions: 1,
+        deletions: 1,
+        haloc: 1,
+        status: 'modified',
+        patch: null,
+        createdAt: NOW,
+        updatedAt: NOW,
+      })
+    }
+  })
+
+  it('drains every fetchable file to completion across bounded passes, leaving only the unfetchable residual', async () => {
+    const client = stubClient(
+      new Map([
+        ['base1:src/x.ts', 'a\nb\n'],
+        ['head1:src/x.ts', 'a\nB\n'],
+        ['base1:src/y.ts', 'a\nb\n'],
+        ['head1:src/y.ts', 'a\nB\n'],
+        // src/z.ts intentionally absent → permanently unfetchable.
+      ]),
+    )
+    // chunkSize:1 forces multiple passes; the loop must still terminate (no
+    // infinite loop on the unfetchable residual) thanks to the no-progress break.
+    const res = await backfillAllPatches(store, client, { drain: true, chunkSize: 1 })
+
+    expect(res.drained).toBe(true)
+    expect(res.backfilled).toBe(2) // x + y
+    expect(res.remaining).toBe(1) // z is unfetchable — honest residual
+    expect(res.errors).toEqual([])
+
+    const files = await store.getAllPrFiles()
+    expect(files.find((f) => f.path === 'src/x.ts').patch).toBeTruthy()
+    expect(files.find((f) => f.path === 'src/y.ts').patch).toBeTruthy()
+    expect(files.find((f) => f.path === 'src/z.ts').patch).toBeNull()
   })
 })

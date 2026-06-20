@@ -8,7 +8,7 @@ const DOC =
   'security and test_coverage; cosmetic_nit and rubber_stamp are not. ' +
   'value = (sum of complexityWeight over substantive threads) / (sum of ' +
   'complexityWeight over all threads), so deep, teaching reviews on hard code ' +
-  'count for more than rubber-stamps. This is a coaching signal, never a target: ' +
+  'count for more than rubber-stamps. This is an evaluative signal, read with confidence: ' +
   'a higher substantive share is not automatically "better" — a senior reviewing ' +
   'simple PRs or a reviewer on a mature codebase will legitimately log many ' +
   'small nits. Read it segmented by role and by the complexity of work reviewed.'
