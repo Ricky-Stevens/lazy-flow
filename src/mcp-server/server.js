@@ -68,7 +68,7 @@ import {
 // ---------------------------------------------------------------------------
 
 const SERVER_NAME = 'lazy-flow'
-const SERVER_VERSION = '0.1.4'
+const SERVER_VERSION = '0.1.5'
 
 // Stale threshold: warn at 4h, refuse at 24h (SPEC §7.5)
 const STALE_WARN_MS = 4 * 60 * 60 * 1000
@@ -620,7 +620,11 @@ function registerRunSyncTool(server, ctx) {
       const result = await runSync(
         ctx.store,
         ghClient,
-        { org, repos: repos.length > 0 ? repos : undefined },
+        {
+          org,
+          repos: repos.length > 0 ? repos : undefined,
+          maxIdleDays: ctx.config.repoMaxIdleDays,
+        },
         ghMode,
         jrClient,
         {

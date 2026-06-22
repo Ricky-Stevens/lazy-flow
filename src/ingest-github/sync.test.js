@@ -935,6 +935,84 @@ describe('org wildcard (owner/*)', () => {
     expect(new Set(res.repos).size).toBe(res.repos.length) // no duplicate from the explicit entry
   })
 
+  it('idle filter: skips ORG/* repos with no recent push (explicit entries always sync)', async () => {
+    const store = makeStore()
+    const NOW = '2024-06-01T00:00:00.000Z'
+    const client = stubClient({
+      orgRepos: {
+        'octo-acme': [
+          { full_name: 'octo-acme/active', pushed_at: '2024-05-20T00:00:00Z' }, // 12d → kept
+          { full_name: 'octo-acme/stale', pushed_at: '2024-01-01T00:00:00Z' }, // ~152d → idle
+          { full_name: 'octo-acme/nopush' }, // no pushed_at → treated idle
+        ],
+      },
+      // The same stale repo is ALSO listed explicitly — must still sync.
+      repoMap: {
+        'octo-acme/stale': { full_name: 'octo-acme/stale', pushed_at: '2024-01-01T00:00:00Z' },
+      },
+    })
+
+    const res = await syncGitHub(
+      store,
+      client,
+      { org: 'octo-acme', repos: ['octo-acme/*', 'octo-acme/stale'], maxIdleDays: 90 },
+      'backfill',
+      NOW,
+    )
+
+    const synced = (await store.getRepositoriesByOrg('org-octo-acme')).map((r) => r.id).sort()
+    // active (recent push) + stale (explicitly listed) sync; nopush is idle-only → skipped.
+    expect(synced).toEqual(['octo-acme-active', 'octo-acme-stale'])
+    expect(res.warnings.some((w) => /skipped 2 repo\(s\) with no push in 90d/.test(w))).toBe(true)
+  })
+
+  it('idle filter is OFF by default (maxIdleDays unset → every non-dead repo synced)', async () => {
+    const store = makeStore()
+    const client = stubClient({
+      orgRepos: {
+        'octo-acme': [
+          { full_name: 'octo-acme/a', pushed_at: '2020-01-01T00:00:00Z' }, // ancient but kept
+          { full_name: 'octo-acme/b' },
+        ],
+      },
+    })
+    const res = await syncGitHub(
+      store,
+      client,
+      { org: 'octo-acme', repos: ['octo-acme/*'] },
+      'backfill',
+    )
+    expect(res.repos.sort()).toEqual(['octo-acme/a', 'octo-acme/b'])
+    expect(res.warnings.some((w) => /skipped .* with no push/.test(w))).toBe(false)
+  })
+
+  it('graceful stop: pauses (warns, no repo failures) when the GraphQL budget is low', async () => {
+    const store = makeStore()
+    let fetchCalls = 0
+    const client = stubClient({
+      orgRepos: { 'octo-acme': [{ full_name: 'octo-acme/a' }, { full_name: 'octo-acme/b' }] },
+    })
+    client.fetchCommitHistory = async () => {
+      fetchCalls++
+      return []
+    }
+    client.rateLimitRemaining = 100 // below RATE_LIMIT_STOP_BELOW (500)
+    client.rateLimitResetAt = '2024-06-01T01:00:00Z'
+
+    const res = await syncGitHub(
+      store,
+      client,
+      { org: 'octo-acme', repos: ['octo-acme/*'] },
+      'backfill',
+    )
+
+    // Stopped before fetching any repo content — and said so, with a resume hint.
+    expect(fetchCalls).toBe(0)
+    expect(res.warnings.some((w) => /paused: GitHub GraphQL budget low/.test(w))).toBe(true)
+    expect(res.warnings.some((w) => /2 repo\(s\) not yet synced/.test(w))).toBe(true)
+    expect(res.warnings.some((w) => /resets at 2024-06-01T01:00:00Z/.test(w))).toBe(true)
+  })
+
   it('warns (never silently no-ops) when the wildcard resolves to 0 repos', async () => {
     const store = makeStore()
     const client = stubClient({ orgRepos: { 'empty-org': [] } })

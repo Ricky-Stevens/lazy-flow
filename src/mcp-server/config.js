@@ -45,6 +45,16 @@ function parseList(raw) {
     .filter(Boolean)
 }
 
+/**
+ * Parse a non-negative integer from an env string. Empty/invalid/negative → 0,
+ * which callers treat as "disabled" (e.g. the org-wildcard idle filter).
+ */
+function parseNonNegInt(raw) {
+  if (!raw || String(raw).trim() === '') return 0
+  const n = Number.parseInt(String(raw).trim(), 10)
+  return Number.isFinite(n) && n > 0 ? n : 0
+}
+
 /** First env var in `keys` with a non-empty, trimmed value; else null. */
 function firstNonEmptyEnv(env, keys) {
   for (const key of keys) {
@@ -108,6 +118,8 @@ export function loadConfig() {
   const env = process.env
   return {
     repos: parseList(env.LAZYFLOW_REPOS),
+    // Org-wildcard idle filter: skip ORG/* repos with no push in N days. 0 = off.
+    repoMaxIdleDays: parseNonNegInt(env.LAZYFLOW_REPO_MAX_IDLE_DAYS),
     jiraProjects: parseList(env.LAZYFLOW_JIRA_PROJECTS),
     jiraBaseUrl: env.LAZYFLOW_JIRA_BASE_URL ?? '',
     // Atlassian account email — REQUIRED for an API token (Basic auth) against a

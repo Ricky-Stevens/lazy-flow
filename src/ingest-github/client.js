@@ -137,9 +137,15 @@ const COMMIT_HISTORY_QUERY = /* graphql */ `
                 deletions
                 message
                 author { name email user { login } }
-                checkSuites(first: 10) {
+                # GraphQL bills by requested node count: history(100) × suites ×
+                # runs is the largest point sink in the whole sync. 6 suites × 30
+                # runs = 180 checks/commit is far above typical CI fan-out while
+                # cutting the per-page check cost ~5×. (These inline connections
+                # have no overflow paginator, so the cap is a hard ceiling — kept
+                # generous deliberately.)
+                checkSuites(first: 6) {
                   nodes {
-                    checkRuns(first: 100) {
+                    checkRuns(first: 30) {
                       nodes { databaseId name status conclusion startedAt completedAt }
                     }
                   }
@@ -186,19 +192,27 @@ const REPO_PULL_REQUESTS_QUERY = /* graphql */ `
           firstCommit: commits(first: 1) {
             nodes { commit { authoredDate } }
           }
-          reviews(first: 100) {
+          # Inline page sizes are cost-tuned to typical PRs, NOT worst case:
+          # GraphQL bills the requested node count, so first:100 everywhere paid
+          # ~20× for headroom rarely used. reviews/reviewThreads/files each carry a
+          # pageInfo and an overflow paginator (fetchPrConnectionsFull), so a PR
+          # that exceeds these caps is transparently topped up — the reduction is
+          # lossless, just cheaper for the common case.
+          reviews(first: 30) {
             pageInfo { hasNextPage endCursor }
             nodes { databaseId state submittedAt author { login __typename } }
           }
-          reviewThreads(first: 100) {
+          reviewThreads(first: 30) {
             pageInfo { hasNextPage endCursor }
             nodes {
+              # comments has NO per-thread overflow path, so keep it generous (a
+              # single thread with >50 comments is vanishingly rare).
               comments(first: 50) {
                 nodes { databaseId createdAt updatedAt path author { login __typename } replyTo { databaseId } }
               }
             }
           }
-          files(first: 100) {
+          files(first: 50) {
             pageInfo { hasNextPage endCursor }
             nodes { path additions deletions }
           }
@@ -206,9 +220,9 @@ const REPO_PULL_REQUESTS_QUERY = /* graphql */ `
             nodes {
               commit {
                 oid
-                checkSuites(first: 10) {
+                checkSuites(first: 6) {
                   nodes {
-                    checkRuns(first: 100) {
+                    checkRuns(first: 30) {
                       nodes { databaseId name status conclusion startedAt completedAt }
                     }
                   }
@@ -233,6 +247,7 @@ const REPO_META_FIELDS = /* graphql */ `
   isFork
   createdAt
   updatedAt
+  pushedAt
 `
 const REPO_META_QUERY = /* graphql */ `
   query RepoMeta($owner: String!, $name: String!) {
@@ -314,6 +329,9 @@ function adaptRepoNode(node) {
     fork: node.isFork ?? false,
     created_at: node.createdAt ?? null,
     updated_at: node.updatedAt ?? null,
+    // Last push to ANY branch — the activity signal the org-wildcard idle filter
+    // keys off (covers commits + PR-branch pushes; cheap, returned inline).
+    pushed_at: node.pushedAt ?? null,
   }
 }
 
@@ -460,6 +478,8 @@ export class GitHubClient {
    * Updated after every REST response and after each GraphQL page.
    */
   rateLimitRemaining = 5000
+  /** ISO timestamp when the GraphQL point budget next resets (from rateLimit.resetAt). */
+  rateLimitResetAt = null
 
   /**
    * Repos visible to this credential — populated by `listOrgRepos()`.
@@ -886,6 +906,9 @@ export class GitHubClient {
       if (typeof rateLimit.remaining === 'number') {
         this.rateLimitRemaining = rateLimit.remaining
       }
+      // Track the reset time so a budget-aware caller can report when the window
+      // reopens (used by the sync's graceful-stop warning).
+      if (rateLimit.resetAt) this.rateLimitResetAt = rateLimit.resetAt
       return { data, rateLimit }
     }
   }

@@ -86,6 +86,10 @@ export async function syncGitHub(
   // cheaper. A repo that cannot be resolved is recorded as a warning so the
   // failure is visible instead of masquerading as success.
   const warnings = []
+  // Org-wildcard idle filter: drop ORG/* repos with no push in maxIdleDays. 0/off
+  // by default; the cutoff is computed once off the coherent `now` stamp.
+  const maxIdleDays = Math.max(0, scope.maxIdleDays ?? 0)
+  const idleCutoffMs = maxIdleDays > 0 ? Date.parse(now) - maxIdleDays * 86_400_000 : null
   let filteredRaw
   if (scope.repos && scope.repos.length > 0) {
     filteredRaw = []
@@ -120,13 +124,33 @@ export async function syncGitHub(
           )
           continue
         }
-        const live = discovered.filter((r) => !r.archived && !r.fork)
-        if (live.length === 0) {
+        const nonDead = discovered.filter((r) => !r.archived && !r.fork)
+        if (nonDead.length === 0) {
           warnings.push(
             `"${owner}/*" resolved to 0 repos — check the token has org read access ` +
               '(SSO authorization for private repos) and that the org has non-archived, ' +
               'non-fork repositories visible to it',
           )
+        }
+        // Idle filter (wildcards only): drop repos with no push in maxIdleDays so
+        // abandoned repos don't burn API budget or dilute team metrics. 0 = off.
+        // Missing pushed_at (never pushed) counts as idle. Explicit owner/name
+        // entries below are NEVER idle-filtered — the user named them on purpose.
+        let live = nonDead
+        if (idleCutoffMs !== null && nonDead.length > 0) {
+          live = nonDead.filter((r) => {
+            const pushed = r.pushed_at ? Date.parse(r.pushed_at) : null
+            return pushed !== null && pushed >= idleCutoffMs
+          })
+          const skipped = nonDead.length - live.length
+          if (skipped > 0) {
+            warnings.push(
+              `"${owner}/*": skipped ${skipped} repo(s) with no push in ${maxIdleDays}d` +
+                (live.length === 0
+                  ? ' — ALL repos were idle; lower repo_max_idle_days or list active repos explicitly'
+                  : ''),
+            )
+          }
         }
         for (const r of live) add(r)
         continue
@@ -175,6 +199,22 @@ export async function syncGitHub(
     // CHUNKS of concurrency size: fetch up to N, write all N serially, release,
     // then next chunk. This keeps memory bounded to N payloads, not |repos|.
     for (let i = 0; i < repos.length; i += repoFetchConcurrency) {
+      // Budget-aware graceful stop: if the GraphQL point budget is nearly spent,
+      // stop STARTING new repos rather than failing them mid-fetch on a hard wall.
+      // Un-synced repos wrote no watermark, so the next run (after the reset)
+      // backfills them — a clean multi-window drain instead of repo failures.
+      if (
+        typeof client.rateLimitRemaining === 'number' &&
+        client.rateLimitRemaining < RATE_LIMIT_STOP_BELOW
+      ) {
+        const remainingRepos = repos.length - i
+        const resetNote = client.rateLimitResetAt ? ` resets at ${client.rateLimitResetAt}` : ''
+        warnings.push(
+          `paused: GitHub GraphQL budget low (${client.rateLimitRemaining} points left${resetNote}); ` +
+            `${remainingRepos} repo(s) not yet synced — re-run run_sync after the reset to continue`,
+        )
+        break
+      }
       const chunk = repos.slice(i, i + repoFetchConcurrency)
       // Per-repo isolation: mapWithConcurrency has Promise.all semantics, so one
       // repo that throws (malformed payload, transient network error) would abort
@@ -218,6 +258,16 @@ export async function syncGitHub(
  * `since`/`updated` filter, so commits/PRs that were created or backdated during
  * the previous sync's run window are re-captured (re-fetches are idempotent).
  */
+/**
+ * GraphQL point-budget floor: stop STARTING new repos once the client reports
+ * fewer than this many points remaining, so a large multi-repo backfill drains
+ * cleanly across reset windows instead of failing repos on a hard wall. Best
+ * effort — a single very large repo already in flight can still exhaust the
+ * budget; that repo just fails+retries next window. The activity filter +
+ * right-sized queries are the primary defences; this is the backstop.
+ */
+const RATE_LIMIT_STOP_BELOW = 500
+
 const INCREMENTAL_OVERLAP_MINUTES = 10
 
 /**

@@ -1,7 +1,7 @@
 {
   "name": "lazy-flow",
   "displayName": "Lazy Flow",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Open-source DORA + Flow + PR + Code + Agile metrics platform for Claude Code. Fuses GitHub and Jira into a local-first, fully-transparent delivery intelligence layer that Claude can query directly over SQL.",
   "author": {
     "name": "Ricky Stevens"
@@ -18,6 +18,7 @@
         "LAZYFLOW_JIRA_EMAIL": "${user_config.jira_email}",
         "LAZYFLOW_JIRA_BASE_URL": "${user_config.jira_base_url}",
         "LAZYFLOW_REPOS": "${user_config.repos}",
+        "LAZYFLOW_REPO_MAX_IDLE_DAYS": "${user_config.repo_max_idle_days}",
         "LAZYFLOW_JIRA_PROJECTS": "${user_config.jira_projects}",
         "LAZYFLOW_DB_PATH": "${CLAUDE_PLUGIN_DATA}/lazy-flow.db"
       }
@@ -58,6 +59,14 @@
       "type": "string",
       "title": "GitHub Repositories",
       "description": "Comma-separated list of GitHub repositories to track, e.g. ORG/app,ORG/api. Use ORG/* to track every repo in an organisation (excludes archived repos and forks); wildcards and explicit entries can be mixed, e.g. ORG/*,OTHER/special.",
+      "sensitive": false,
+      "required": false,
+      "default": ""
+    },
+    "repo_max_idle_days": {
+      "type": "number",
+      "title": "Skip Repos Idle For (days)",
+      "description": "For ORG/* wildcards only: skip repos with no push (commit or PR-branch activity) in the last N days, so abandoned repos don't burn API budget or dilute team metrics. Leave blank or 0 to track every repo. Explicitly-listed ORG/name repos are always tracked regardless. Example: 90.",
       "sensitive": false,
       "required": false,
       "default": ""
