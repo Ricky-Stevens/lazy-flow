@@ -169,7 +169,14 @@ describe('marketplace.json', () => {
       expect(typeof lazyFlowPlugin.displayName).toBe('string')
       expect(typeof lazyFlowPlugin.description).toBe('string')
       expect(lazyFlowPlugin.license).toBe('MIT')
-      expect(typeof lazyFlowPlugin.source).toBe('object')
+      // `source` may be a relative-path/URL STRING (canonical for a plugin
+      // co-located in the marketplace repo, e.g. "./") OR an object form
+      // (github/url/npm/git-subdir). Both are valid per the marketplace schema;
+      // assert it's present and well-formed without forcing the object shape.
+      const src = lazyFlowPlugin.source
+      const validSource =
+        (typeof src === 'string' && src.length > 0) || (typeof src === 'object' && src !== null)
+      expect(validSource).toBe(true)
     }
   })
 })

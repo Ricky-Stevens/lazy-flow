@@ -41,7 +41,12 @@ function makeStore() {
 }
 
 function makeClient() {
-  return new GitHubClient({ token: 'test-token', baseUrl: 'https://api.github.com' })
+  // retryBackoffMs: 1 keeps transient-failure retries effectively instant in tests.
+  return new GitHubClient({
+    token: 'test-token',
+    baseUrl: 'https://api.github.com',
+    retryBackoffMs: 1,
+  })
 }
 
 const scope = { org: 'octo-acme' }
@@ -1005,5 +1010,95 @@ describe('per-repo isolation', () => {
     // The bad repo's failure is surfaced (not swallowed, not fatal); the good one is clean.
     expect(res.warnings.some((w) => /failed to fetch octo-acme\/bad/.test(w))).toBe(true)
     expect(res.warnings.some((w) => /failed to fetch octo-acme\/good/.test(w))).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// graphqlRequest — transient-failure auto-retry (transient 5xx + network).
+// Regression: a transient GitHub 502/504 failed a repo's fetch mid-backfill,
+// forcing a manual second run_sync (which is what exposed the identity-graph
+// idempotency bug). Transient failures must now retry in-place.
+// ---------------------------------------------------------------------------
+
+describe('graphqlRequest — transient-failure auto-retry', () => {
+  it('retries a transient 502 then succeeds — no manual re-sync needed', async () => {
+    let calls = 0
+    server.use(
+      graphql.query('RepoDeployments', () => {
+        calls++
+        if (calls < 3) return new HttpResponse(null, { status: 502 })
+        return HttpResponse.json({
+          data: {
+            repository: {
+              deployments: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] },
+            },
+            rateLimit: { cost: 1, remaining: 5000, resetAt: new Date().toISOString() },
+          },
+        })
+      }),
+    )
+    const deploys = await makeClient().fetchDeployments('octo-acme', 'alpha-service')
+    expect(calls).toBe(3) // two 502s retried, third call succeeded
+    expect(deploys).toEqual([])
+  })
+
+  it('retries a transient network error then succeeds', async () => {
+    let calls = 0
+    server.use(
+      graphql.query('RepoDeployments', () => {
+        calls++
+        if (calls < 2) return HttpResponse.error() // simulated network failure → fetch rejects
+        return HttpResponse.json({
+          data: {
+            repository: {
+              deployments: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] },
+            },
+            rateLimit: { cost: 1, remaining: 5000, resetAt: new Date().toISOString() },
+          },
+        })
+      }),
+    )
+    const deploys = await makeClient().fetchDeployments('octo-acme', 'alpha-service')
+    expect(calls).toBe(2)
+    expect(deploys).toEqual([])
+  })
+
+  it('gives up after exhausting retries on a persistent 5xx', async () => {
+    let calls = 0
+    server.use(
+      graphql.query('RepoDeployments', () => {
+        calls++
+        return new HttpResponse(null, { status: 503 })
+      }),
+    )
+    await expect(makeClient().fetchDeployments('octo-acme', 'alpha-service')).rejects.toThrow(
+      /HTTP 503/,
+    )
+    expect(calls).toBe(5) // initial attempt + maxRetries (4)
+  })
+
+  it('does NOT retry a non-serializable request body — throws immediately', async () => {
+    // Regression: body serialization was inside the retry try/catch, so a
+    // programming error (circular variables) was retried as a "network failure"
+    // and obscured. It must surface immediately as itself.
+    const circular = {}
+    circular.self = circular
+    await expect(
+      makeClient().graphqlRequest('query Q { __typename }', 'Q', { bad: circular }),
+    ).rejects.toThrow(/circular|JSON/i)
+  })
+
+  it('does NOT retry a non-transient 4xx (e.g. 404)', async () => {
+    let calls = 0
+    server.use(
+      graphql.query('RepoDeployments', () => {
+        calls++
+        return new HttpResponse(null, { status: 404 })
+      }),
+    )
+    await expect(makeClient().fetchDeployments('octo-acme', 'alpha-service')).rejects.toThrow(
+      /HTTP 404/,
+    )
+    expect(calls).toBe(1) // surfaced immediately, no retry
   })
 })

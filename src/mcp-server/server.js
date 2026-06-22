@@ -21,7 +21,7 @@ import {
   listPendingAuthorshipVerdicts,
   recordAuthorshipVerdict,
 } from '../core/ai/authorshipVerdicts.js'
-import { ENGINE_VERSION } from '../core/index.js'
+import { BunSqliteStore, ENGINE_VERSION } from '../core/index.js'
 import { backfillAllPatches } from '../ingest-github/index.js'
 import {
   backfillSnapshots,
@@ -68,7 +68,7 @@ import {
 // ---------------------------------------------------------------------------
 
 const SERVER_NAME = 'lazy-flow'
-const SERVER_VERSION = '0.1.2'
+const SERVER_VERSION = '0.1.3'
 
 // Stale threshold: warn at 4h, refuse at 24h (SPEC §7.5)
 const STALE_WARN_MS = 4 * 60 * 60 * 1000
@@ -162,23 +162,41 @@ function makeComputeDayFn(ctx, now) {
  * silently mixing formula versions.
  */
 async function rederiveOnEngineBump(ctx, now, signal) {
-  // Runs after ingestion (inside runSync) and at startup; drop any stale lookup
-  // memo so the recompute reads post-write pr_refs / file_complexity / statuses.
-  invalidateLookupsCache(ctx.store)
-  const today = now.slice(0, 10)
-  const fromDay = new Date(Date.parse(today) - SNAPSHOT_HISTORY_DAYS * 86_400_000)
-    .toISOString()
-    .slice(0, 10)
-  return rederiveStaleEngineSnapshots({
-    store: ctx.store,
-    scopes: SNAPSHOT_SCOPES,
-    metricIds: COMPUTE_METRIC_IDS,
-    fromDay,
-    toDay: today,
-    computeDay: makeComputeDayFn(ctx, now),
-    now,
-    signal,
-  })
+  // Run on a DEDICATED connection so the re-derive's writes can NEVER interleave
+  // into a tool call's open transaction on the shared connection. bun:sqlite is a
+  // single connection: two logical transactions multiplexed over one connection
+  // corrupt each other (a bare write lands inside an open BEGIN; an unrelated
+  // ROLLBACK then discards it). The background startup re-derive runs concurrently
+  // with tool calls (run_sync) after connect, so it MUST use its own connection;
+  // WAL + busy_timeout (set by the BunSqliteStore constructor) then let the two
+  // connections serialize writes safely at the SQLite file-lock level. :memory:
+  // can't be shared across connections, so fall back to the shared store there
+  // (ephemeral/test only — no real concurrency).
+  const dbPath = ctx.config.dbPath
+  const useDedicated = dbPath && dbPath !== ':memory:'
+  const store = useDedicated ? new BunSqliteStore(dbPath) : ctx.store
+  const localCtx = useDedicated ? { ...ctx, store } : ctx
+  try {
+    // Drop any stale lookup memo so the recompute reads post-write pr_refs /
+    // file_complexity / statuses. (Dedicated store starts with a fresh memo.)
+    invalidateLookupsCache(store)
+    const today = now.slice(0, 10)
+    const fromDay = new Date(Date.parse(today) - SNAPSHOT_HISTORY_DAYS * 86_400_000)
+      .toISOString()
+      .slice(0, 10)
+    return await rederiveStaleEngineSnapshots({
+      store,
+      scopes: SNAPSHOT_SCOPES,
+      metricIds: COMPUTE_METRIC_IDS,
+      fromDay,
+      toDay: today,
+      computeDay: makeComputeDayFn(localCtx, now),
+      now,
+      signal,
+    })
+  } finally {
+    if (useDedicated) store.close()
+  }
 }
 
 // ---------------------------------------------------------------------------

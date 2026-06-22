@@ -197,7 +197,13 @@ export class BunSqliteStore {
       INSERT INTO identities (id, person_id, kind, external_id, is_bot, confidence, raw, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
-        person_id   = CASE WHEN excluded.updated_at >= identities.updated_at THEN excluded.person_id   ELSE identities.person_id   END,
+        -- person_id is OWNED EXCLUSIVELY by the stitch/queue layer via
+        -- setIdentityPerson — identity INGESTION never writes it on conflict.
+        -- Ingestion re-upserts identities with person_id=NULL every run; touching
+        -- it here would detach every identity and make the next stitch pass re-mint
+        -- orphaned persons (the run_sync re-run corruption). The existing
+        -- assignment is therefore ALWAYS preserved on conflict; person_id is only
+        -- set on the initial INSERT (NULL for ingested rows). Single writer.
         kind        = CASE WHEN excluded.updated_at >= identities.updated_at THEN excluded.kind        ELSE identities.kind        END,
         external_id = CASE WHEN excluded.updated_at >= identities.updated_at THEN excluded.external_id ELSE identities.external_id END,
         is_bot      = CASE WHEN excluded.updated_at >= identities.updated_at THEN excluded.is_bot      ELSE identities.is_bot      END,
@@ -214,6 +220,45 @@ export class BunSqliteStore {
       identity.raw,
       identity.updatedAt,
     )
+  }
+
+  /**
+   * Explicitly set (or clear, with personId=null) an identity's person link.
+   * This is the ONLY sanctioned way to change person_id — the stitch layer uses
+   * it to assign, unmergeIdentities uses it with null to detach. Keeping person
+   * ownership out of upsertIdentity is what makes re-running resolution idempotent.
+   */
+  async setIdentityPerson(identityId, personId, updatedAt) {
+    const res = this.stmt(`UPDATE identities SET person_id = ?, updated_at = ? WHERE id = ?`).run(
+      personId,
+      updatedAt,
+      identityId,
+    )
+    // Fail loudly on a stale/unknown id rather than silently no-op'ing a person
+    // assignment or detach (the caller's contract is that the link IS changed).
+    if ((res.changes ?? 0) === 0) {
+      throw new Error(`setIdentityPerson: identity not found: ${identityId}`)
+    }
+  }
+
+  /**
+   * Delete person rows that have no identities pointing at them. Defensive GC for
+   * the resolution pass: with the idempotency fix no new orphans are minted, but
+   * this cleans up any pre-existing orphans (e.g. from a DB corrupted before the
+   * fix) so the roster never carries empty shells. Returns the number removed.
+   */
+  async deleteOrphanPersons() {
+    // Exclude persons still referenced by team_membership (NOT NULL FK to
+    // persons(id), no ON DELETE CASCADE) — deleting one would raise a FK
+    // violation. A person on a team is legitimately retained even during a
+    // transient identity gap. team_membership.person_id is NOT NULL so the
+    // subquery carries no NULLs (safe for NOT IN).
+    const res = this.stmt(
+      `DELETE FROM persons
+       WHERE id NOT IN (SELECT person_id FROM identities WHERE person_id IS NOT NULL)
+         AND id NOT IN (SELECT person_id FROM team_membership)`,
+    ).run()
+    return res.changes ?? 0
   }
 
   async getIdentitiesByPerson(personId) {

@@ -37,6 +37,18 @@ function newId() {
 }
 
 /**
+ * Deterministic person id derived from the cluster's STABLE account anchor
+ * (`primaryAccountRef`, e.g. `gh:<numericId>` / `jira:<accountId>`). Re-deriving
+ * the same cluster always yields the SAME person id, so resolution is idempotent
+ * BY CONSTRUCTION and the id is stable across any future detach/re-stitch —
+ * rather than a fresh random UUID that would orphan the prior person and dangle
+ * anything pinned to its id (e.g. person-scoped snapshots) on re-creation.
+ */
+function personIdForAnchor(accountRef) {
+  return `person:${accountRef}`
+}
+
+/**
  * Extract the email field from a github_login identity's raw payload.
  * GitHub's Users API can return a verified email; noreply addresses are excluded.
  */
@@ -57,6 +69,24 @@ function localPart(email) {
   const idx = email.indexOf('@')
   if (idx <= 0) return null
   return email.slice(0, idx).toLowerCase()
+}
+
+/**
+ * Generic no-reply / automated-sender local parts. Two unrelated services both
+ * sending from `noreply@…` must NOT be stitched into one person on the strength
+ * of a shared `noreply` local part — that is a machine address, not an identity.
+ */
+const NO_REPLY_LOCAL_PARTS = new Set([
+  'noreply',
+  'no-reply',
+  'no.reply',
+  'donotreply',
+  'do-not-reply',
+])
+function isNoReplyLocalPart(lp) {
+  if (!lp) return true
+  const l = lp.toLowerCase()
+  return NO_REPLY_LOCAL_PARTS.has(l) || l.startsWith('noreply') || l.startsWith('no-reply')
 }
 
 /**
@@ -157,7 +187,7 @@ export async function stitchPersons(store, options = {}) {
       if (!accountRef) continue // commit_email — handled in Pass 2
 
       const person = {
-        id: newId(),
+        id: personIdForAnchor(accountRef),
         displayName: identity.externalId, // will be refined by later data
         primaryAccountRef: accountRef,
         updatedAt: now,
@@ -165,7 +195,9 @@ export async function stitchPersons(store, options = {}) {
       await store.upsertPerson(person)
       personsCreated++
 
-      await store.upsertIdentity({ ...identity, personId: person.id, updatedAt: now })
+      // person_id is written ONLY via setIdentityPerson (single-writer invariant);
+      // upsertIdentity no longer touches person_id on conflict.
+      await store.setIdentityPerson(identity.id, person.id, now)
       personIdOf.set(identity.id, person.id)
       // NOT an auto-merge: this is the initial creation+linking of a person for
       // an account-anchored identity. autoMerged counts only Pass 2/3 merges of a
@@ -207,7 +239,9 @@ export async function stitchPersons(store, options = {}) {
       }
       if (id.kind === 'commit_email') {
         const lp = localPart(id.externalId.toLowerCase())
-        if (lp) {
+        // Never index no-reply addresses — two unrelated noreply@ senders must
+        // not become local-part stitch candidates (see isNoReplyLocalPart).
+        if (lp && !isNoReplyLocalPart(lp)) {
           const list = commitEmailsByLocalPart.get(lp)
           if (list) list.push(id)
           else commitEmailsByLocalPart.set(lp, [id])
@@ -237,7 +271,7 @@ export async function stitchPersons(store, options = {}) {
       // Tier 1b: GitHub-verified email↔login.
       const verifiedPersonId = verifiedEmailToPersonId.get(email)
       if (verifiedPersonId) {
-        await store.upsertIdentity({ ...identity, personId: verifiedPersonId, updatedAt: now })
+        await store.setIdentityPerson(identity.id, verifiedPersonId, now)
         autoMerged++
         continue
       }
@@ -245,15 +279,16 @@ export async function stitchPersons(store, options = {}) {
       // Tier 1a: Jira account whose emailAddress matches this commit email.
       const jiraPersonId = jiraEmailToPersonId.get(email)
       if (jiraPersonId) {
-        await store.upsertIdentity({ ...identity, personId: jiraPersonId, updatedAt: now })
+        await store.setIdentityPerson(identity.id, jiraPersonId, now)
         autoMerged++
         continue
       }
 
       // Tier 2c: same local-part, different domain → human-confirm queue.
+      // Skip no-reply addresses — they are machine senders, not people.
       const lp = localPart(email)
       let queued2c = false
-      if (lp) {
+      if (lp && !isNoReplyLocalPart(lp)) {
         for (const other of commitEmailsByLocalPart.get(lp) ?? []) {
           if (other.id === identity.id) continue
           if (other.externalId.toLowerCase() === email) continue

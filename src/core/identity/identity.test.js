@@ -437,6 +437,78 @@ describe('stitchPersons — bot exclusion', () => {
 })
 
 // ---------------------------------------------------------------------------
+// stitchPersons — idempotency across re-runs (run_sync re-run regression)
+// ---------------------------------------------------------------------------
+
+describe('resolve + stitch — idempotent across re-runs', () => {
+  it('re-running resolution does NOT detach identities or re-mint persons', async () => {
+    // Regression: a second run_sync re-ran resolveIdentities (which re-upserts
+    // every identity with person_id=null + a newer timestamp). The old upsert
+    // clobbered person_id with that null, detaching every identity; stitchPersons
+    // then re-minted fresh persons, orphaning the originals and dropping the
+    // confirmed cross-source merges. Resolution must be idempotent across runs.
+    const store = freshStore()
+    await seedStore(store)
+
+    await resolveIdentities(store, { now: NOW })
+    await stitchPersons(store, { now: NOW })
+
+    const persons1 = await store.listPersons()
+    const ids1 = await store.listAllIdentities()
+    const assigned1 = ids1.filter((i) => i.personId !== null).length
+    const personOf1 = new Map(ids1.map((i) => [i.id, i.personId]))
+    expect(persons1.length).toBeGreaterThan(0)
+    expect(assigned1).toBeGreaterThan(0)
+
+    // Run 2 — exactly what a second run_sync does (newer `now`).
+    const LATER = '2024-12-31T00:00:00.000Z'
+    await resolveIdentities(store, { now: LATER })
+    await stitchPersons(store, { now: LATER })
+
+    const persons2 = await store.listPersons()
+    const ids2 = await store.listAllIdentities()
+
+    // Person roster stable (not re-minted), no identity detached, every
+    // assignment preserved, and no orphan persons left behind.
+    expect(persons2.length).toBe(persons1.length)
+    expect(ids2.filter((i) => i.personId !== null).length).toBe(assigned1)
+    for (const id of ids2) {
+      expect(id.personId).toBe(personOf1.get(id.id) ?? null)
+    }
+    const linkedPersonIds = new Set(ids2.map((i) => i.personId).filter(Boolean))
+    for (const p of persons2) {
+      expect(linkedPersonIds.has(p.id)).toBe(true)
+    }
+  })
+
+  it('person ids are deterministic — identical seeds yield identical person ids', async () => {
+    // Structural idempotency: person ids derive from the cluster's stable anchor,
+    // so the same input always produces the same ids (random UUIDs would differ
+    // between the two stores). This is what keeps re-derivation stable by
+    // construction rather than relying only on the preserve-on-upsert guard.
+    const storeA = freshStore()
+    await seedStore(storeA)
+    await resolveIdentities(storeA, { now: NOW })
+    await stitchPersons(storeA, { now: NOW })
+
+    const storeB = freshStore()
+    await seedStore(storeB)
+    await resolveIdentities(storeB, { now: NOW })
+    await stitchPersons(storeB, { now: NOW })
+
+    const idsA = (await storeA.listPersons()).map((p) => p.id).sort()
+    const idsB = (await storeB.listPersons()).map((p) => p.id).sort()
+    expect(idsA.length).toBeGreaterThan(0)
+    // The real proof: identical seeds yield identical ids (random UUIDs would
+    // differ between the two stores for every stitch-created person).
+    expect(idsA).toEqual(idsB)
+    // At least the stitch-created (anchor-derived) persons carry the deterministic
+    // prefix — fixture-seeded persons keep their own ids.
+    expect(idsA.some((id) => id.startsWith('person:'))).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // 5. stitchPersons — distinct humans with same name do NOT auto-merge
 // ---------------------------------------------------------------------------
 

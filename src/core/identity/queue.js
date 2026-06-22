@@ -82,5 +82,8 @@ export async function unmergeIdentities(store, matchId, now) {
   }
   // If equal strength, keep default (identityB).
 
-  await store.upsertIdentity({ ...toDelink, personId: null, updatedAt })
+  // Detach via the explicit setter — upsertIdentity now PRESERVES an existing
+  // person_id when handed null (so ingestion re-upserts can't clobber it), so a
+  // deliberate un-merge must go through setIdentityPerson.
+  await store.setIdentityPerson(toDelink.id, null, updatedAt)
 }

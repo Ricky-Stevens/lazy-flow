@@ -479,6 +479,12 @@ export class GitHubClient {
     this.baseOrigin = url.origin
     this.baseUrl = (opts.baseUrl ?? 'https://api.github.com').replace(/\/$/, '')
     this.timeoutMs = opts.timeoutMs ?? 30_000
+    // Transient-failure retry budget (see graphqlRequest). `retryBackoffMs` is the
+    // exponential-backoff base; tests pass a small value to keep retries instant.
+    this.maxRetries = opts.maxRetries ?? 4
+    this.retryBackoffMs = opts.retryBackoffMs ?? 500
+    // Overall wall-clock cap across all retry attempts for one request.
+    this.retryDeadlineMs = opts.retryDeadlineMs ?? 90_000
   }
 
   // -------------------------------------------------------------------------
@@ -777,20 +783,43 @@ export class GitHubClient {
     // via either HTTP 429/403 or a 200 body carrying a `RATE_LIMITED` error. A
     // backfill that exhausts the budget must back off and retry, not crash the
     // whole sync. Mirror the REST retry policy.
-    const maxAttempts = 4
+    const maxAttempts = this.maxRetries
+    // Serialise the body ONCE, OUTSIDE the retry loop. A non-serialisable
+    // `variables` (circular ref / BigInt) is a PROGRAMMING error, not a transient
+    // failure — it must throw immediately here, never be caught below and retried
+    // (which would burn the retry budget and obscure the real cause).
+    const body = JSON.stringify({ query, operationName, variables })
+    // Overall wall-clock budget across all attempts — bounds the worst case
+    // (maxAttempts × per-attempt timeout + backoff) on a persistently-failing host.
+    const retryDeadline = Date.now() + this.retryDeadlineMs
     for (let attempt = 0; ; attempt++) {
-      const response = await fetch(`${this.baseUrl}/graphql`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${this.token}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ query, operationName, variables }),
-        signal: AbortSignal.timeout(this.timeoutMs),
-        // Do not auto-follow a server-controlled redirect with the bearer token
-        // attached; the GraphQL endpoint never legitimately 30x's.
-        redirect: 'manual',
-      })
+      let response
+      try {
+        response = await fetch(`${this.baseUrl}/graphql`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${this.token}`,
+            'Content-Type': 'application/json',
+          },
+          body,
+          signal: AbortSignal.timeout(this.timeoutMs),
+          // Do not auto-follow a server-controlled redirect with the bearer token
+          // attached; the GraphQL endpoint never legitimately 30x's.
+          redirect: 'manual',
+        })
+      } catch (err) {
+        // fetch() rejects ONLY on network failure / abort / timeout — all
+        // transient and safe to retry (every GraphQL call here is a READ).
+        if (attempt < maxAttempts && Date.now() < retryDeadline) {
+          await sleep(backoffMs(attempt, this.retryBackoffMs))
+          continue
+        }
+        throw new Error(
+          `GitHub GraphQL request failed after ${attempt + 1} attempts: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        )
+      }
 
       if (response.status >= 300 && response.status < 400) {
         throw new Error(`GitHub GraphQL unexpected redirect (${response.status})`)
@@ -804,6 +833,20 @@ export class GitHubClient {
           continue
         }
       }
+
+      // Transient server/gateway errors (500/502/503/504): GitHub returns these
+      // under load or during brief outages. Back off and retry rather than failing
+      // the repo — this is exactly what forced a manual second run_sync before
+      // (and that re-run is what exposed the identity-graph idempotency bug).
+      if (
+        TRANSIENT_HTTP_STATUSES.has(response.status) &&
+        attempt < maxAttempts &&
+        Date.now() < retryDeadline
+      ) {
+        await sleep(backoffMs(attempt, this.retryBackoffMs))
+        continue
+      }
+
       if (!response.ok) {
         throw new Error(`GitHub GraphQL HTTP ${response.status}`)
       }
@@ -1006,6 +1049,22 @@ export class GitHubClient {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * Transient server/gateway statuses GitHub returns under load or during brief
+ * outages — safe to retry (every GraphQL call in this client is a read).
+ */
+const TRANSIENT_HTTP_STATUSES = new Set([500, 502, 503, 504])
+
+/**
+ * Exponential backoff with full jitter, capped at 30s. Jitter de-synchronises
+ * retries across the repos being fetched concurrently so they don't thunder back
+ * at GitHub in lockstep.
+ */
+function backoffMs(attempt, baseMs) {
+  const capped = Math.min(baseMs * 2 ** attempt, 30_000)
+  return Math.round(capped / 2 + Math.random() * (capped / 2))
 }
 
 /**

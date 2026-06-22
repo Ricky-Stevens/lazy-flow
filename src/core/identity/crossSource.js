@@ -313,7 +313,7 @@ export async function stitchCrossSource(store, options = {}) {
         if (jid === d.jp.jiraAnchorId) continue
         const ident = await store.findIdentityById(jid)
         if (ident && ident.personId !== g.id) {
-          await store.upsertIdentity({ ...ident, personId: g.id, updatedAt: now })
+          await store.setIdentityPerson(ident.id, g.id, now)
         }
       }
 

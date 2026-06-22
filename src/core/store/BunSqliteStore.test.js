@@ -213,6 +213,123 @@ async function seedJiraProject(store, id = 'proj-1') {
 }
 
 // ---------------------------------------------------------------------------
+// Identities — person_id ownership / idempotency (run_sync re-run regression)
+// ---------------------------------------------------------------------------
+
+describe('identities — person_id ownership', () => {
+  it('re-upserting an identity with a NULL person_id does NOT clobber the assignment', async () => {
+    // Regression: ingestion (resolveIdentities) re-upserts every identity with
+    // person_id=null and a fresh updated_at on each sync. The old conflict clause
+    // overwrote person_id with that null, detaching every identity from its person
+    // and making the next stitch pass re-mint orphaned persons — the run_sync
+    // re-run identity-graph corruption.
+    const { store } = migratedStore()
+    await store.upsertPerson({
+      id: 'person-1',
+      displayName: 'Alice',
+      primaryAccountRef: 'gh:alice',
+      updatedAt: T1,
+    })
+    await store.upsertIdentity({
+      id: 'ident-1',
+      personId: null,
+      kind: 'github_login',
+      externalId: 'alice',
+      isBot: false,
+      confidence: 1,
+      raw: '{}',
+      updatedAt: T1,
+    })
+    // Stitch assigns the person.
+    await store.setIdentityPerson('ident-1', 'person-1', T2)
+
+    // Ingestion re-upserts the SAME identity with person_id null + a NEWER ts.
+    await store.upsertIdentity({
+      id: 'ident-1',
+      personId: null,
+      kind: 'github_login',
+      externalId: 'alice',
+      isBot: false,
+      confidence: 1,
+      raw: '{"refreshed":true}',
+      updatedAt: T3,
+    })
+
+    const assigned = await store.getIdentitiesByPerson('person-1')
+    expect(assigned).toHaveLength(1)
+    expect(assigned[0]?.id).toBe('ident-1')
+    // The newer non-person fields still refreshed (raw updated) — only person_id
+    // is preserved.
+    expect(assigned[0]?.raw).toContain('refreshed')
+  })
+
+  it('setIdentityPerson can both assign and detach (null) a person link', async () => {
+    const { store } = migratedStore()
+    await store.upsertPerson({
+      id: 'person-1',
+      displayName: 'Alice',
+      primaryAccountRef: 'gh:alice',
+      updatedAt: T1,
+    })
+    await seedIdentity(store)
+    await store.setIdentityPerson('ident-1', 'person-1', T2)
+    expect(await store.getIdentitiesByPerson('person-1')).toHaveLength(1)
+    // Detach (the unmerge path).
+    await store.setIdentityPerson('ident-1', null, T3)
+    expect(await store.getIdentitiesByPerson('person-1')).toHaveLength(0)
+  })
+
+  it('deleteOrphanPersons removes only persons with zero identities', async () => {
+    const { store } = migratedStore()
+    await store.upsertPerson({
+      id: 'p-live',
+      displayName: 'Live',
+      primaryAccountRef: 'gh:a',
+      updatedAt: T1,
+    })
+    await store.upsertPerson({
+      id: 'p-orphan',
+      displayName: 'Orphan',
+      primaryAccountRef: 'gh:b',
+      updatedAt: T1,
+    })
+    await seedIdentity(store)
+    await store.setIdentityPerson('ident-1', 'p-live', T2)
+
+    const removed = await store.deleteOrphanPersons()
+    expect(removed).toBe(1)
+    expect(await store.getPerson('p-live')).not.toBeNull()
+    expect(await store.getPerson('p-orphan')).toBeNull()
+  })
+
+  it('deleteOrphanPersons does NOT delete (or FK-violate on) a team-referenced person', async () => {
+    // team_membership.person_id is a NOT NULL FK to persons(id) with no cascade.
+    // A zero-identity person still on a team must be retained, not deleted (which
+    // would raise a FK violation and abort the GC).
+    const { store } = migratedStore()
+    await seedOrg(store)
+    await store.upsertTeam({ id: 'team-1', name: 'Squad', orgId: 'org-1', updatedAt: T1 })
+    await store.upsertPerson({
+      id: 'p-team',
+      displayName: 'On A Team',
+      primaryAccountRef: 'gh:c',
+      updatedAt: T1,
+    })
+    await store.upsertTeamMembership({
+      teamId: 'team-1',
+      personId: 'p-team',
+      validFrom: T1,
+      validTo: null,
+    })
+
+    // Zero-identity but team-referenced → must survive, and the GC must not throw.
+    const removed = await store.deleteOrphanPersons()
+    expect(removed).toBe(0)
+    expect(await store.getPerson('p-team')).not.toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Commits (composite PK)
 // ---------------------------------------------------------------------------
 

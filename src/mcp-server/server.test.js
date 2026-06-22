@@ -176,6 +176,34 @@ describe('MCP server — bootstrap', () => {
     await server.close()
   })
 
+  it('runs the background re-derive on a DEDICATED connection for an on-disk DB', async () => {
+    // The real rederive (not injected) opens its OWN BunSqliteStore on the dbPath
+    // so its writes can never interleave into a tool transaction on the shared
+    // connection. Verify that path opens/closes cleanly, doesn't block startup,
+    // and doesn't throw "database is locked" against the concurrently-open store.
+    const dbPath = join(tmpdir(), `lazyflow-rederive-${process.pid}-${crypto.randomUUID()}.db`)
+    const store = new BunSqliteStore(dbPath)
+    migrate(store.db)
+    const config = { ...loadConfig(), dbPath }
+    const ctx = { config, store, githubClient: null, jiraClient: null }
+
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+    const { server, rederivePromise } = await startServer(ctx, { transport: serverTransport })
+
+    const client = new Client({ name: 'test-client', version: '0.0.0' })
+    await client.connect(clientTransport)
+    const { tools } = await client.listTools()
+    expect(tools.length).toBeGreaterThan(0)
+
+    // Background re-derive on its own connection completes cleanly (no throw / lock).
+    await expect(rederivePromise).resolves.toBeUndefined()
+
+    await client.close()
+    await server.close()
+    store.db.close()
+    for (const suffix of ['', '-wal', '-shm']) rmSync(`${dbPath}${suffix}`, { force: true })
+  })
+
   it('get_schema returns the schema guide + live DDL (tool mirror of the resource)', async () => {
     const { client } = await makeConnectedPair()
 

@@ -137,6 +137,17 @@ export async function runSync(
     errors.push(`cross-source stitch: ${err instanceof Error ? err.message : String(err)}`)
   }
 
+  // 5a-ii. GC any person rows left with zero identities. Defensive: the identity
+  // upsert now preserves person_id across re-syncs (so no new orphans are minted),
+  // but this sweeps up any orphans created before that fix so the roster never
+  // carries empty shells. Best-effort.
+  let orphanPersonsRemoved = 0
+  try {
+    orphanPersonsRemoved = await store.deleteOrphanPersons()
+  } catch (err) {
+    errors.push(`orphan-person GC: ${err instanceof Error ? err.message : String(err)}`)
+  }
+
   // -------------------------------------------------------------------------
   // 5b. AI-authorship detection (tool-agnostic; em-dash + markers + agent
   //     author). Incremental — only new commits/PRs are scored. Best-effort.
@@ -233,6 +244,7 @@ export async function runSync(
       queued: stitchResult.queued + crossSource.queued,
       crossSourceAutoMerged: crossSource.autoMerged,
       crossSourceQueued: crossSource.queued,
+      orphanPersonsRemoved,
       aiAuthorshipScored: aiAuthorship.scored,
       repoAiSignalsWritten: repoAiSignals.signalsWritten,
     },
