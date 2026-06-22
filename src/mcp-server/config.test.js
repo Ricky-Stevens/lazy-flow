@@ -10,7 +10,12 @@
  */
 
 import { describe, expect, it } from 'bun:test'
-import { githubTokenFromEnv, githubTokenFromGhCli, parseBool } from './config.js'
+import {
+  githubTokenFromEnv,
+  githubTokenFromGhCli,
+  parseBool,
+  parseDaysWithDefault,
+} from './config.js'
 
 describe('githubTokenFromEnv', () => {
   it('prefers LAZYFLOW_GITHUB_TOKEN over the conventional env vars', () => {
@@ -79,5 +84,22 @@ describe('parseBool', () => {
     expect(parseBool('true', false)).toBe(true)
     expect(parseBool('1', false)).toBe(true)
     expect(parseBool('yes', false)).toBe(true)
+  })
+})
+
+describe('parseDaysWithDefault', () => {
+  it('uses the fallback for unset/empty (the plugin injects "")', () => {
+    expect(parseDaysWithDefault(undefined, 180)).toBe(180)
+    expect(parseDaysWithDefault('', 180)).toBe(180)
+    expect(parseDaysWithDefault('   ', 180)).toBe(180)
+  })
+
+  it('honours an EXPLICIT 0 as all-time/disabled (distinct from unset)', () => {
+    expect(parseDaysWithDefault('0', 180)).toBe(0)
+  })
+
+  it('parses an explicit positive day count', () => {
+    expect(parseDaysWithDefault('365', 180)).toBe(365)
+    expect(parseDaysWithDefault(' 90 ', 180)).toBe(90)
   })
 })

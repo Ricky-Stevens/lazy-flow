@@ -126,6 +126,8 @@ describe('MCP server — bootstrap', () => {
       'record_verdict',
       'resolve_identity_match',
       'run_sync',
+      'set_identity_bot',
+      'set_person_display_name',
       'sync_status',
       'unmerge_identity_match',
     ].sort()
@@ -1268,5 +1270,125 @@ describe('identity stitching tools', () => {
     })
     expect(res.structuredContent.unmerged).toBe(true)
     expect((await ctx.store.findIdentityById('email:legacy'))?.personId).toBeNull()
+  })
+
+  it('set_person_display_name relabels a person by person_id (and audits it)', async () => {
+    const { client, ctx } = await makeConnectedPair()
+    await seedIdentityGraph(ctx)
+
+    const res = await client.callTool({
+      name: 'set_person_display_name',
+      arguments: { person_id: 'person-phil', display_name: 'Phil Higgins (CTO)' },
+    })
+    expect(res.structuredContent.oldName).toBe('Phil Higgins')
+    expect(res.structuredContent.newName).toBe('Phil Higgins (CTO)')
+    expect((await ctx.store.getPerson('person-phil'))?.displayName).toBe('Phil Higgins (CTO)')
+
+    // Audited as a 'rename' row.
+    const audit = ctx.store.db
+      .prepare(`SELECT action, to_person_id, note FROM identity_audit WHERE action = 'rename'`)
+      .get()
+    expect(audit.action).toBe('rename')
+    expect(audit.to_person_id).toBe('person-phil')
+  })
+
+  it('set_person_display_name resolves the person via an identity_id', async () => {
+    const { client, ctx } = await makeConnectedPair()
+    await seedIdentityGraph(ctx)
+
+    // gh:phil belongs to person-phil — relabel via the identity.
+    const res = await client.callTool({
+      name: 'set_person_display_name',
+      arguments: { identity_id: 'gh:phil', display_name: 'Philip Higgins' },
+    })
+    expect(res.structuredContent.personId).toBe('person-phil')
+    expect((await ctx.store.getPerson('person-phil'))?.displayName).toBe('Philip Higgins')
+  })
+
+  it('set_person_display_name dry_run previews without writing', async () => {
+    const { client, ctx } = await makeConnectedPair()
+    await seedIdentityGraph(ctx)
+
+    const res = await client.callTool({
+      name: 'set_person_display_name',
+      arguments: { person_id: 'person-phil', display_name: 'Should Not Persist', dry_run: true },
+    })
+    expect(res.structuredContent.dryRun).toBe(true)
+    expect(res.structuredContent.newName).toBe('Should Not Persist')
+    // Unchanged on disk.
+    expect((await ctx.store.getPerson('person-phil'))?.displayName).toBe('Phil Higgins')
+  })
+
+  it('set_person_display_name errors on an orphan identity and an unknown person', async () => {
+    const { client, ctx } = await makeConnectedPair()
+    await seedIdentityGraph(ctx)
+
+    // email:legacy has no person yet.
+    const orphan = await client.callTool({
+      name: 'set_person_display_name',
+      arguments: { identity_id: 'email:legacy', display_name: 'X' },
+    })
+    expect(orphan.structuredContent.error).toMatch(/has no person/)
+
+    const missing = await client.callTool({
+      name: 'set_person_display_name',
+      arguments: { person_id: 'person-nope', display_name: 'X' },
+    })
+    expect(missing.structuredContent.error).toMatch(/person not found/)
+
+    const empty = await client.callTool({
+      name: 'set_person_display_name',
+      arguments: { person_id: 'person-phil', display_name: '   ' },
+    })
+    expect(empty.structuredContent.error).toMatch(/non-empty/)
+  })
+
+  it('set_identity_bot marks an identity as a bot, detaches it, and audits it', async () => {
+    const { client, ctx } = await makeConnectedPair()
+    await seedIdentityGraph(ctx)
+    // gh:phil is linked to person-phil; reclassifying it as a bot must detach it.
+
+    const res = await client.callTool({
+      name: 'set_identity_bot',
+      arguments: { identity_id: 'gh:phil', is_bot: true },
+    })
+    expect(res.structuredContent.isBot).toBe(true)
+    expect(res.structuredContent.detachedFromPersonId).toBe('person-phil')
+
+    const after = await ctx.store.findIdentityById('gh:phil')
+    expect(after?.isBot).toBe(true)
+    expect(after?.personId).toBeNull()
+
+    const audit = ctx.store.db
+      .prepare(`SELECT action, identity_id FROM identity_audit WHERE action = 'reclassify_bot'`)
+      .get()
+    expect(audit.action).toBe('reclassify_bot')
+    expect(audit.identity_id).toBe('gh:phil')
+  })
+
+  it('set_identity_bot dry_run previews without writing', async () => {
+    const { client, ctx } = await makeConnectedPair()
+    await seedIdentityGraph(ctx)
+
+    const res = await client.callTool({
+      name: 'set_identity_bot',
+      arguments: { identity_id: 'gh:phil', is_bot: true, dry_run: true },
+    })
+    expect(res.structuredContent.dryRun).toBe(true)
+    expect(res.structuredContent.willDetachFromPersonId).toBe('person-phil')
+    // Unchanged on disk.
+    const after = await ctx.store.findIdentityById('gh:phil')
+    expect(after?.isBot).toBe(false)
+    expect(after?.personId).toBe('person-phil')
+  })
+
+  it('set_identity_bot errors on an unknown identity', async () => {
+    const { client, ctx } = await makeConnectedPair()
+    await seedIdentityGraph(ctx)
+    const res = await client.callTool({
+      name: 'set_identity_bot',
+      arguments: { identity_id: 'nope', is_bot: true },
+    })
+    expect(res.structuredContent.error).toMatch(/identity not found/)
   })
 })

@@ -1013,6 +1013,63 @@ describe('org wildcard (owner/*)', () => {
     expect(res.warnings.some((w) => /resets at 2024-06-01T01:00:00Z/.test(w))).toBe(true)
   })
 
+  it('backfill windows commits + PRs to historyDays (since floor), not all-time', async () => {
+    // Regression: a full backfill passed since=null, pulling a repo's ENTIRE (possibly
+    // 15-year) history. With historyDays set, both commits and PRs must be floored to
+    // now - historyDays so we only pull the relevant window.
+    const store = makeStore()
+    const NOW = '2024-06-01T00:00:00.000Z'
+    let commitSince
+    let prSince
+    const client = stubClient({ repoMap: { 'octo-acme/app': { full_name: 'octo-acme/app' } } })
+    client.fetchCommitHistory = async (_o, _n, since) => {
+      commitSince = since
+      return []
+    }
+    client.fetchPullRequests = async (_o, _n, since) => {
+      prSince = since
+      return []
+    }
+
+    await syncGitHub(
+      store,
+      client,
+      { org: 'octo-acme', repos: ['octo-acme/app'], historyDays: 180 },
+      'backfill',
+      NOW,
+    )
+
+    const expected = new Date(Date.parse(NOW) - 180 * 86_400_000).toISOString()
+    expect(commitSince).toBe(expected)
+    expect(prSince).toBe(expected)
+  })
+
+  it('historyDays 0 disables the floor (all-time backfill — since undefined)', async () => {
+    const store = makeStore()
+    let commitSince = 'SENTINEL'
+    let prSince = 'SENTINEL'
+    const client = stubClient({ repoMap: { 'octo-acme/app': { full_name: 'octo-acme/app' } } })
+    client.fetchCommitHistory = async (_o, _n, since) => {
+      commitSince = since
+      return []
+    }
+    client.fetchPullRequests = async (_o, _n, since) => {
+      prSince = since
+      return []
+    }
+
+    await syncGitHub(
+      store,
+      client,
+      { org: 'octo-acme', repos: ['octo-acme/app'], historyDays: 0 },
+      'backfill',
+      '2024-06-01T00:00:00.000Z',
+    )
+
+    expect(commitSince).toBeUndefined()
+    expect(prSince).toBeUndefined()
+  })
+
   it('warns (never silently no-ops) when the wildcard resolves to 0 repos', async () => {
     const store = makeStore()
     const client = stubClient({ orgRepos: { 'empty-org': [] } })

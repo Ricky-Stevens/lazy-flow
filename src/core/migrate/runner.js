@@ -1,5 +1,6 @@
 import { MIGRATION_0001_DOWN, MIGRATION_0001_UP } from './migrations/0001_initial_schema.js'
 import { MIGRATION_0002_DOWN, MIGRATION_0002_UP } from './migrations/0002_identity_audit.js'
+import { MIGRATION_0003_DOWN, MIGRATION_0003_UP } from './migrations/0003_identity_audit_actions.js'
 
 /**
  * The ordered list of all migrations.
@@ -21,6 +22,12 @@ export const MIGRATIONS = [
     description: 'identity_audit',
     up: MIGRATION_0002_UP,
     down: MIGRATION_0002_DOWN,
+  },
+  {
+    version: 3,
+    description: 'identity_audit_actions',
+    up: MIGRATION_0003_UP,
+    down: MIGRATION_0003_DOWN,
   },
 ]
 

@@ -75,7 +75,7 @@ import {
 // ---------------------------------------------------------------------------
 
 const SERVER_NAME = 'lazy-flow'
-const SERVER_VERSION = '0.1.6'
+const SERVER_VERSION = '0.1.7'
 
 // Stale threshold: warn at 4h, refuse at 24h (SPEC §7.5)
 const STALE_WARN_MS = 4 * 60 * 60 * 1000
@@ -631,6 +631,7 @@ function registerRunSyncTool(server, ctx) {
           org,
           repos: repos.length > 0 ? repos : undefined,
           maxIdleDays: ctx.config.repoMaxIdleDays,
+          historyDays: ctx.config.repoHistoryDays,
         },
         ghMode,
         jrClient,
@@ -2431,6 +2432,147 @@ function registerUnmergeIdentityMatchTool(server, ctx) {
   )
 }
 
+function registerSetPersonDisplayNameTool(server, ctx) {
+  server.registerTool(
+    'set_person_display_name',
+    {
+      title: 'Set a Person’s Display Name',
+      description:
+        'Give a person a human-readable label — use when no Jira/real name resolved and they show ' +
+        'under a GitHub login (e.g. eingramiph) or a raw Jira account id. Identify the person by ' +
+        'person_id (a persons.id) OR by any of their identity_id (e.g. github_login:eingramiph), which ' +
+        'is resolved to its person. Pass dry_run:true to preview. Audited; survives re-syncs.',
+      inputSchema: z.object({
+        display_name: z.string().describe('The new human-readable display name.'),
+        person_id: z.string().optional().describe('Target persons.id to relabel.'),
+        identity_id: z
+          .string()
+          .optional()
+          .describe('Relabel the person that owns THIS identity (identities.id).'),
+        dry_run: z.boolean().optional().describe('Preview the effect without writing.'),
+        decided_by: z.string().optional().describe('Who decided (audit). Default "mcp-agent".'),
+      }),
+    },
+    async ({ display_name, person_id, identity_id, dry_run, decided_by }) => {
+      const now = new Date().toISOString()
+      const actor = decided_by ?? 'mcp-agent'
+      const mk = (extra) => {
+        const output = { ...provenance('n/a'), ...extra }
+        return {
+          content: [{ type: 'text', text: JSON.stringify(output) }],
+          structuredContent: output,
+        }
+      }
+
+      const name = typeof display_name === 'string' ? display_name.trim() : ''
+      if (!name) return mk({ error: 'display_name must be a non-empty string' })
+
+      // Resolve the target person from person_id, or via an identity's person.
+      let targetPersonId = person_id ?? null
+      if (!targetPersonId && identity_id) {
+        const id = await ctx.store.findIdentityById(identity_id)
+        if (!id) return mk({ error: `identity not found: ${identity_id}` })
+        if (!id.personId) {
+          return mk({
+            error: `identity ${identity_id} has no person yet — link it first, or pass person_id`,
+          })
+        }
+        targetPersonId = id.personId
+      }
+      if (!targetPersonId) {
+        return mk({ error: 'provide one of: person_id or identity_id' })
+      }
+
+      const person = await ctx.store.getPerson(targetPersonId)
+      if (!person) return mk({ error: `person not found: ${targetPersonId}` })
+
+      const oldName = person.displayName ?? null
+      if (dry_run) {
+        return mk({ dryRun: true, personId: targetPersonId, oldName, newName: name })
+      }
+
+      await ctx.store.setPersonDisplayName(targetPersonId, name, now)
+      await ctx.store.appendIdentityAudit({
+        id: crypto.randomUUID(),
+        action: 'rename',
+        toPersonId: targetPersonId,
+        decidedBy: actor,
+        note: `"${oldName ?? ''}" -> "${name}"`,
+        createdAt: now,
+      })
+      return mk({ personId: targetPersonId, oldName, newName: name })
+    },
+  )
+}
+
+function registerSetIdentityBotTool(server, ctx) {
+  server.registerTool(
+    'set_identity_bot',
+    {
+      title: 'Reclassify an Identity as Bot / Human',
+      description:
+        'Flip an identity’s is_bot flag when the heuristics misjudged it — e.g. an automation ' +
+        'account (like "Automation for Jira") minted as a person, or a human wrongly flagged. ' +
+        'Marking as a bot also DETACHES it from any person (a bot must not count toward a person’s ' +
+        'metrics); the emptied person is GC’d on the next sync. Marking as human only clears the flag. ' +
+        'Pass dry_run:true to preview. Audited; survives re-syncs.',
+      inputSchema: z.object({
+        identity_id: z.string().describe('The identity to reclassify (identities.id).'),
+        is_bot: z.boolean().describe('true = mark as a bot (and detach); false = mark as human.'),
+        dry_run: z.boolean().optional().describe('Preview the effect without writing.'),
+        decided_by: z.string().optional().describe('Who decided (audit). Default "mcp-agent".'),
+      }),
+    },
+    async ({ identity_id, is_bot, dry_run, decided_by }) => {
+      const now = new Date().toISOString()
+      const actor = decided_by ?? 'mcp-agent'
+      const mk = (extra) => {
+        const output = { ...provenance('n/a'), identity_id, ...extra }
+        return {
+          content: [{ type: 'text', text: JSON.stringify(output) }],
+          structuredContent: output,
+        }
+      }
+
+      const id = await ctx.store.findIdentityById(identity_id)
+      if (!id) return mk({ error: `identity not found: ${identity_id}` })
+
+      const wasBot = !!id.isBot
+      // Marking as a bot detaches it; warn if that empties its person (GC'd next sync).
+      let orphanWarning = null
+      if (is_bot && id.personId) {
+        const sibs = await ctx.store.getIdentitiesByPerson(id.personId)
+        if (sibs.length <= 1) {
+          orphanWarning = `person ${id.personId} will have no identities left and be removed on the next sync`
+        }
+      }
+      const willDetachFrom = is_bot ? (id.personId ?? null) : null
+
+      if (dry_run) {
+        return mk({
+          dryRun: true,
+          wasBot,
+          willBe: is_bot,
+          willDetachFromPersonId: willDetachFrom,
+          orphanWarning,
+        })
+      }
+
+      await ctx.store.setIdentityBot(identity_id, is_bot, now)
+      await ctx.store.appendIdentityAudit({
+        id: crypto.randomUUID(),
+        action: 'reclassify_bot',
+        identityId: identity_id,
+        fromPersonId: willDetachFrom,
+        decidedBy: actor,
+        note: `is_bot: ${wasBot} -> ${is_bot}`,
+        createdAt: now,
+      })
+      return mk({ isBot: is_bot, detachedFromPersonId: willDetachFrom, orphanWarning })
+    },
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Tool: get_person_report — the per-person insight suite (cohort + trend)
 // ---------------------------------------------------------------------------
@@ -2730,6 +2872,8 @@ export function createServer(ctx) {
   registerResolveIdentityMatchTool(server, ctx)
   registerLinkIdentityTool(server, ctx)
   registerUnmergeIdentityMatchTool(server, ctx)
+  registerSetPersonDisplayNameTool(server, ctx)
+  registerSetIdentityBotTool(server, ctx)
 
   // Tools — reporting
   registerGenerateReportTool(server, ctx)

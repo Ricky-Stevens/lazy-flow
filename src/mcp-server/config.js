@@ -56,6 +56,16 @@ function parseNonNegInt(raw) {
 }
 
 /**
+ * Parse a day count that has a non-zero DEFAULT when unset/empty, but allows an
+ * EXPLICIT 0 to mean "disabled / all-time". Distinguishes the unfilled config field
+ * (plugin maps it to "") from a deliberate 0, which parseNonNegInt cannot.
+ */
+export function parseDaysWithDefault(raw, fallback) {
+  if (raw === undefined || raw === null || String(raw).trim() === '') return fallback
+  return parseNonNegInt(raw)
+}
+
+/**
  * Parse a boolean from an env string with an explicit default for unset/empty
  * (the plugin maps an unfilled config field to ""). Only the explicit falsy
  * tokens turn it off; anything else with a value is true.
@@ -130,6 +140,11 @@ export function loadConfig() {
     repos: parseList(env.LAZYFLOW_REPOS),
     // Org-wildcard idle filter: skip ORG/* repos with no push in N days. 0 = off.
     repoMaxIdleDays: parseNonNegInt(env.LAZYFLOW_REPO_MAX_IDLE_DAYS),
+    // Full-backfill lookback horizon (days): only pull commits/PRs newer than this
+    // rather than a repo's entire history. Default 180 (covers the 119-day snapshot
+    // window + trailing metric windows); explicit 0 = all-time. Incremental syncs are
+    // unaffected (they window via watermark).
+    repoHistoryDays: parseDaysWithDefault(env.LAZYFLOW_REPO_HISTORY_DAYS, 180),
     // Skip the patch/blob analysis for bot-authored PRs (dependabot lockfile
     // bumps etc.) — saves blob-fetch budget + DB bloat with no analytical loss
     // (bots are excluded from verdicts/person metrics anyway). Default ON.

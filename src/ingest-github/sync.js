@@ -90,6 +90,13 @@ export async function syncGitHub(
   // by default; the cutoff is computed once off the coherent `now` stamp.
   const maxIdleDays = Math.max(0, scope.maxIdleDays ?? 0)
   const idleCutoffMs = maxIdleDays > 0 ? Date.parse(now) - maxIdleDays * 86_400_000 : null
+  // Backfill lookback floor: on a FULL backfill, only pull commits/PRs newer than
+  // this horizon rather than the repo's entire (possibly 15-year) history — which is
+  // wasteful and irrelevant to the ~119-day snapshot window. 0 = all-time. Applied as
+  // a `since` floor in fetchRepoPayload; incremental syncs already window via watermark.
+  const historyDays = Math.max(0, scope.historyDays ?? 0)
+  const historyFloorIso =
+    historyDays > 0 ? new Date(Date.parse(now) - historyDays * 86_400_000).toISOString() : null
   let filteredRaw
   if (scope.repos && scope.repos.length > 0) {
     filteredRaw = []
@@ -222,7 +229,7 @@ export async function syncGitHub(
       // surfacing the failure as a warning — mirrors the Jira per-issue pattern.
       const payloads = await mapWithConcurrency(chunk, repoFetchConcurrency, async (repo) => {
         try {
-          return await fetchRepoPayload(store, client, repo, mode, now)
+          return await fetchRepoPayload(store, client, repo, mode, now, historyFloorIso)
         } catch (err) {
           warnings.push(
             `failed to fetch ${repo.owner}/${repo.name}: ${err instanceof Error ? err.message : String(err)}`,
@@ -292,10 +299,21 @@ function subtractMinutes(iso, minutes) {
  * indexed point read; bun:sqlite is a single synchronous connection, so even
  * concurrent JS callers serialise those reads at the driver level — no race.
  */
-async function fetchRepoPayload(store, client, repo, mode, now) {
+async function fetchRepoPayload(store, client, repo, mode, now, historyFloorIso = null) {
   const owner = repo.owner
   const name = repo.name
   const repoId = repo.id
+
+  // Pick the MORE RECENT of a watermark-derived `since` and the backfill history
+  // floor. On a full backfill there's no watermark, so the floor applies and bounds
+  // the pull to the lookback horizon (instead of all-time). On an incremental sync
+  // the watermark is newer than the floor, so it wins (the floor is a no-op). null
+  // floor (history window disabled) leaves the watermark/undefined behaviour intact.
+  const applyFloor = (watermarkSince) => {
+    if (!historyFloorIso) return watermarkSince
+    if (!watermarkSince || watermarkSince < historyFloorIso) return historyFloorIso
+    return watermarkSince
+  }
 
   // Determine watermark for incremental mode. Apply an overlap margin so a
   // commit backdated into the previous run's window (rebase/cherry-pick/squash)
@@ -310,6 +328,7 @@ async function fetchRepoPayload(store, client, repo, mode, now) {
       ? subtractMinutes(cursor.watermarkAt, INCREMENTAL_OVERLAP_MINUTES)
       : undefined
   }
+  since = applyFloor(since)
 
   // ---- Commits ---- (fetch only)
   // BULK GraphQL: one paginated `history` query returns every default-branch
@@ -330,6 +349,7 @@ async function fetchRepoPayload(store, client, repo, mode, now) {
       ? subtractMinutes(prCursor.watermarkAt, INCREMENTAL_OVERLAP_MINUTES)
       : undefined
   }
+  prsSince = applyFloor(prsSince)
   const prs = await client.fetchPullRequests(owner, name, prsSince)
   // Repo-wide complexity: blobs are fetched here (network), persistence is
   // deferred to the writer. fetchPrComplexityBatch also does store.hasFileComplexity

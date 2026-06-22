@@ -327,6 +327,101 @@ describe('identities — person_id ownership', () => {
     expect(removed).toBe(0)
     expect(await store.getPerson('p-team')).not.toBeNull()
   })
+
+  it('setPersonDisplayName relabels a person and bumps updated_at', async () => {
+    const { store } = migratedStore()
+    await store.upsertPerson({
+      id: 'p-elliott',
+      displayName: 'eingramiph',
+      primaryAccountRef: 'gh:eingramiph',
+      updatedAt: T1,
+    })
+
+    await store.setPersonDisplayName('p-elliott', 'Elliott Ingram', T2)
+
+    const after = await store.getPerson('p-elliott')
+    expect(after?.displayName).toBe('Elliott Ingram')
+    expect(after?.updatedAt).toBe(T2)
+  })
+
+  it('setPersonDisplayName throws on an unknown person id (no silent no-op)', async () => {
+    const { store } = migratedStore()
+    await expect(store.setPersonDisplayName('p-nope', 'Whoever', T1)).rejects.toThrow(
+      /person not found/,
+    )
+  })
+
+  it('setIdentityBot marks a human identity as a bot AND detaches it from its person', async () => {
+    const { store } = migratedStore()
+    await store.upsertPerson({
+      id: 'p-auto',
+      displayName: 'Automation',
+      primaryAccountRef: 'jira:auto',
+      updatedAt: T1,
+    })
+    await seedIdentity(store)
+    await store.setIdentityPerson('ident-1', 'p-auto', T1)
+
+    await store.setIdentityBot('ident-1', true, T2)
+
+    const after = await store.findIdentityById('ident-1')
+    expect(after?.isBot).toBe(true)
+    expect(after?.personId).toBeNull() // detached
+    expect(after?.updatedAt).toBe(T2)
+  })
+
+  it('setIdentityBot back to human clears the flag and leaves person_id untouched', async () => {
+    const { store } = migratedStore()
+    await seedIdentity(store)
+    await store.upsertIdentity({
+      id: 'ident-1',
+      personId: null,
+      kind: 'github_login',
+      externalId: 'alice',
+      isBot: true,
+      confidence: 1,
+      raw: '{}',
+      updatedAt: T1,
+    })
+
+    await store.setIdentityBot('ident-1', false, T2)
+    expect((await store.findIdentityById('ident-1'))?.isBot).toBe(false)
+  })
+
+  it('setIdentityBot throws on an unknown identity id (no silent no-op)', async () => {
+    const { store } = migratedStore()
+    await expect(store.setIdentityBot('nope', true, T1)).rejects.toThrow(/identity not found/)
+  })
+
+  it("identity_audit accepts a 'rename' action (migration 0003 applied)", async () => {
+    // Regression: identity_audit's action CHECK only allowed the link/merge actions
+    // until 0003 widened it. A 'rename' row must now insert without a CHECK violation.
+    const { store } = migratedStore()
+    await store.upsertPerson({
+      id: 'p-x',
+      displayName: 'old',
+      primaryAccountRef: 'gh:x',
+      updatedAt: T1,
+    })
+    await store.appendIdentityAudit({
+      id: 'audit-rename-1',
+      action: 'rename',
+      toPersonId: 'p-x',
+      decidedBy: 'tester',
+      note: '"old" -> "New Name"',
+      createdAt: T1,
+    })
+    // Sanity: an invalid action is still rejected by the CHECK.
+    await expect(
+      store.appendIdentityAudit({
+        id: 'audit-bad-1',
+        action: 'not_a_real_action',
+        toPersonId: 'p-x',
+        decidedBy: 'tester',
+        createdAt: T1,
+      }),
+    ).rejects.toThrow()
+  })
 })
 
 // ---------------------------------------------------------------------------

@@ -253,6 +253,46 @@ export class BunSqliteStore {
   }
 
   /**
+   * Set a person's human-readable display name. The only sanctioned way to
+   * relabel a person — used by the set_person_display_name tool when no Jira /
+   * real name resolved (e.g. a person showing under a GitHub login or a raw Jira
+   * account id). Throws on an unknown id so a typo can't silently no-op.
+   */
+  async setPersonDisplayName(personId, displayName, updatedAt) {
+    const res = this.stmt(`UPDATE persons SET display_name = ?, updated_at = ? WHERE id = ?`).run(
+      displayName,
+      updatedAt,
+      personId,
+    )
+    if ((res.changes ?? 0) === 0) {
+      throw new Error(`setPersonDisplayName: person not found: ${personId}`)
+    }
+  }
+
+  /**
+   * Reclassify an identity as a bot (or back to human). The only sanctioned way to
+   * flip is_bot post-ingestion — used by the set_identity_bot tool for accounts the
+   * heuristics misjudged (e.g. an "Automation for Jira" account minted as a person,
+   * or a human wrongly flagged). When marking AS a bot, the identity is also detached
+   * from any person in the same statement — a bot must never belong to a person (it
+   * would pollute that person's metrics; stitchPersons excludes bots). Unmarking
+   * leaves person_id untouched (bots aren't stitched, so it is normally already null).
+   * Throws on an unknown id so a typo can't silently no-op.
+   */
+  async setIdentityBot(identityId, isBot, updatedAt) {
+    const res = this.stmt(
+      `UPDATE identities
+         SET is_bot = ?,
+             person_id = CASE WHEN ? = 1 THEN NULL ELSE person_id END,
+             updated_at = ?
+       WHERE id = ?`,
+    ).run(b(isBot), b(isBot), updatedAt, identityId)
+    if ((res.changes ?? 0) === 0) {
+      throw new Error(`setIdentityBot: identity not found: ${identityId}`)
+    }
+  }
+
+  /**
    * Append an immutable audit row for a manual identity-graph edit (link / unlink
    * / confirm / reject / unmerge). Append-only — never updated or deleted.
    */

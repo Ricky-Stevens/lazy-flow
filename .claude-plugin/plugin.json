@@ -1,7 +1,7 @@
 {
   "name": "lazy-flow",
   "displayName": "Lazy Flow",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "description": "Open-source DORA + Flow + PR + Code + Agile metrics platform for Claude Code. Fuses GitHub and Jira into a local-first, fully-transparent delivery intelligence layer that Claude can query directly over SQL.",
   "author": {
     "name": "Ricky Stevens"
@@ -19,6 +19,7 @@
         "LAZYFLOW_JIRA_BASE_URL": "${user_config.jira_base_url}",
         "LAZYFLOW_REPOS": "${user_config.repos}",
         "LAZYFLOW_REPO_MAX_IDLE_DAYS": "${user_config.repo_max_idle_days}",
+        "LAZYFLOW_REPO_HISTORY_DAYS": "${user_config.repo_history_days}",
         "LAZYFLOW_SKIP_BOT_PATCHES": "${user_config.skip_bot_patches}",
         "LAZYFLOW_JIRA_PROJECTS": "${user_config.jira_projects}",
         "LAZYFLOW_DB_PATH": "${CLAUDE_PLUGIN_DATA}/lazy-flow.db"
@@ -71,6 +72,14 @@
       "sensitive": false,
       "required": false,
       "default": ""
+    },
+    "repo_history_days": {
+      "type": "number",
+      "title": "Backfill History Window (days)",
+      "description": "On a full backfill, only pull commits and PRs from the last N days per repo, instead of a repo's entire (possibly many-year) history — which wastes API budget and database space and is irrelevant to the metrics window. Default 180. Set to 0 to pull all-time history. Incremental syncs are unaffected. Example: 180.",
+      "sensitive": false,
+      "required": false,
+      "default": 180
     },
     "skip_bot_patches": {
       "type": "boolean",
