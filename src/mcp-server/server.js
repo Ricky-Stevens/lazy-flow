@@ -68,7 +68,7 @@ import {
 // ---------------------------------------------------------------------------
 
 const SERVER_NAME = 'lazy-flow'
-const SERVER_VERSION = '0.1.3'
+const SERVER_VERSION = '0.1.4'
 
 // Stale threshold: warn at 4h, refuse at 24h (SPEC §7.5)
 const STALE_WARN_MS = 4 * 60 * 60 * 1000

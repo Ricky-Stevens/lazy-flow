@@ -68,7 +68,11 @@ describe('plugin.json', () => {
     expect(plugin.name).toBe('lazy-flow')
     expect(typeof plugin.displayName).toBe('string')
     expect(typeof plugin.description).toBe('string')
-    expect(typeof plugin.author).toBe('string')
+    // The plugin host requires `author` to be an OBJECT ({ name, email?, url? }),
+    // never a bare string — asserting string here previously masked a real install
+    // failure ("author: expected object, received string").
+    expect(typeof plugin.author).toBe('object')
+    expect(typeof plugin.author?.name).toBe('string')
     expect(plugin.license).toBe('MIT')
     expect(typeof plugin.repository).toBe('string')
     // mcpServers is declared inline (recommended for distribution), not a path.

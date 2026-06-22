@@ -1,5 +1,5 @@
 ---
-description: Build one engineer's full delivery profile — volume & cadence, collaboration, work-type mix, code footprint, knowledge ownership, and (if verdicts exist) qualitative signals — against their own history and the team distribution. An evaluative, manager-facing assessment: names strengths, gaps, trajectory, and recommended actions, with confidence on every call. Use for "how am I doing", "profile <name>", "review <person>".
+description: Build one engineer's full delivery profile — volume & cadence, collaboration, work-type mix, code footprint, knowledge ownership, and (if verdicts exist) qualitative signals — against their own history and the team distribution. An evaluative, manager-facing assessment that names strengths, gaps, trajectory, and recommended actions, with confidence on every call. Use for "how am I doing", "profile <name>", "review <person>".
 ---
 
 # /lazy-flow:person-profile
