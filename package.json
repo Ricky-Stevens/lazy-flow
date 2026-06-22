@@ -1,8 +1,33 @@
 {
   "name": "lazy-flow",
   "version": "1.0.0",
-  "private": true,
+  "description": "Open-source DORA + Flow + PR + Code + Agile metrics platform for Claude Code. Fuses GitHub and Jira into a local-first, fully-transparent delivery intelligence layer that Claude can query directly over SQL.",
   "type": "module",
+  "license": "MIT",
+  "author": {
+    "name": "Ricky Stevens",
+    "url": "https://github.com/Ricky-Stevens"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Ricky-Stevens/lazy-flow.git"
+  },
+  "homepage": "https://github.com/Ricky-Stevens/lazy-flow",
+  "bugs": {
+    "url": "https://github.com/Ricky-Stevens/lazy-flow/issues"
+  },
+  "keywords": [
+    "claude-code",
+    "claude-code-plugin",
+    "mcp",
+    "metrics",
+    "dora",
+    "flow",
+    "engineering",
+    "delivery",
+    "github",
+    "jira"
+  ],
   "main": "src/mcp-server/index.js",
   "packageManager": "bun@1.3.10",
   "engines": {

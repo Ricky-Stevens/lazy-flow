@@ -27,7 +27,32 @@ build step and the test suite uses Bun's native test runner.
 
 ## Claude Code plugin install
 
-### Team-wide install (recommended)
+### Quick install
+
+```bash
+/plugin marketplace add https://github.com/Ricky-Stevens/lazy-flow
+/plugin install lazy-flow
+```
+
+On first launch Claude Code prompts once for the tokens (see step 3 below); the MCP server then starts automatically. No build step — Bun runs it straight from source.
+
+**Note:** `/reload-plugins` can be flaky — if you hit issues, open a new session.
+
+#### Update / uninstall
+
+```bash
+/plugin uninstall lazy-flow
+```
+
+To update: open `/plugins` → **Marketplaces** → select lazy-flow → **Update marketplace**, then **Browse Plugins** → lazy-flow → **Update**, then `/reload-plugins` or restart.
+
+#### Local development
+
+```bash
+claude --plugin-dir /path/to/lazy-flow
+```
+
+### Team-wide install (config as code)
 
 1. **Host the marketplace** — this repo *is* the marketplace. No separate hosting needed; Claude Code resolves it from GitHub.
 

@@ -1,25 +1,31 @@
 {
-  "version": "1.0.0",
   "name": "lazy-flow",
   "owner": {
-    "name": "Ricky Stevens"
+    "name": "Ricky Stevens",
+    "email": ""
   },
   "plugins": [
     {
       "name": "lazy-flow",
-      "displayName": "lazy-flow — Software Delivery Intelligence",
+      "source": "./",
       "description": "Open-source DORA + Flow + PR + Code + Agile metrics platform for Claude Code. Fuses GitHub and Jira into a local-first, fully-transparent delivery intelligence layer that Claude can query directly over SQL.",
       "version": "1.0.0",
       "author": {
         "name": "Ricky Stevens"
       },
-      "license": "MIT",
+      "homepage": "https://github.com/Ricky-Stevens/lazy-flow",
       "repository": "https://github.com/Ricky-Stevens/lazy-flow",
-      "source": {
-        "source": "github",
-        "repo": "Ricky-Stevens/lazy-flow"
-      },
-      "tags": ["metrics", "dora", "flow", "engineering", "delivery", "github", "jira"]
+      "license": "MIT",
+      "keywords": [
+        "metrics",
+        "dora",
+        "flow",
+        "engineering",
+        "delivery",
+        "github",
+        "jira"
+      ],
+      "category": "metrics"
     }
   ]
 }
