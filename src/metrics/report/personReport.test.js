@@ -5,6 +5,7 @@ import { BunSqliteStore, migrate } from '../../core/index.js'
 import { computePersonReportLive } from '../compute/index.js'
 
 const NOW = '2024-06-15T00:00:00.000Z'
+const DAY_MS = 86_400_000
 
 function freshStore() {
   const db = new Database(':memory:')
@@ -302,5 +303,198 @@ describe('computePersonReportLive — query pattern (N+1 regression guard)', () 
       expect(m.comparison.robustZ).toBeNull()
       expect(m.comparison.percentile).toBeNull()
     }
+  })
+})
+
+/**
+ * Seed an org + repo + the subject person 'p-1' (no PRs yet). Caller drives PR /
+ * review seeding for whichever weeks they need so the trend has a real series.
+ */
+async function seedShell(store) {
+  await store.upsertOrganisation({
+    id: 'org-1',
+    githubLogin: 'acme',
+    jiraCloudId: null,
+    name: 'Acme',
+    createdAt: NOW,
+    updatedAt: NOW,
+  })
+  await store.upsertRepository({
+    id: 'repo-1',
+    githubNodeId: 'node-1',
+    orgId: 'org-1',
+    owner: 'acme',
+    name: 'app',
+    defaultBranch: 'main',
+    isArchived: false,
+    isFork: false,
+    deletedAt: null,
+    raw: '{}',
+    createdAt: NOW,
+    updatedAt: NOW,
+  })
+  await store.upsertPerson({
+    id: 'p-1',
+    displayName: 'Dev One',
+    primaryAccountRef: 'gh:d1',
+    updatedAt: NOW,
+  })
+  await store.upsertIdentity({
+    id: 'id-1',
+    personId: 'p-1',
+    kind: 'github_login',
+    externalId: 'd1',
+    isBot: false,
+    confidence: 1,
+    raw: '{}',
+    updatedAt: NOW,
+  })
+}
+
+/** Add `humanCount` peers, each with one identity and no PRs by default. */
+async function seedCohortShell(store, humanCount) {
+  for (let k = 1; k <= humanCount; k++) {
+    await store.upsertPerson({
+      id: `c-${k}`,
+      displayName: `Cohort ${k}`,
+      primaryAccountRef: `gh:c${k}`,
+      updatedAt: NOW,
+    })
+    await store.upsertIdentity({
+      id: `cid-${k}`,
+      personId: `c-${k}`,
+      kind: 'github_login',
+      externalId: `c${k}`,
+      isBot: false,
+      confidence: 1,
+      raw: '{}',
+      updatedAt: NOW,
+    })
+  }
+}
+
+/** Insert a merged PR `weekIdx` weeks before NOW for the given identity. */
+async function insertMergedPr(store, prId, identityId, weekIdx, withReview) {
+  // Place the PR 1 day INTO the bucket (so identical weekIdx → same week bucket
+  // for both person and team), and within the default 90-day report window.
+  const createdMs = Date.parse(NOW) - weekIdx * 7 * DAY_MS - DAY_MS
+  const created = new Date(createdMs).toISOString()
+  const merged = new Date(createdMs + 6 * 3600 * 1000).toISOString()
+  await store.upsertPullRequest({
+    id: prId,
+    repoId: 'repo-1',
+    number: Math.floor(createdMs / 1000) % 100000,
+    authorIdentityId: identityId,
+    state: 'merged',
+    headRef: `f-${prId}`,
+    baseRef: 'main',
+    isDraft: false,
+    mergedViaQueue: false,
+    createdAt: created,
+    readyAt: created,
+    firstCommitAt: created,
+    firstReviewAt: withReview ? merged : null,
+    approvedAt: withReview ? merged : null,
+    mergedAt: merged,
+    mergedByIdentityId: identityId,
+    deletedAt: null,
+    raw: '{}',
+    updatedAt: NOW,
+  })
+  if (withReview) {
+    // A non-author, non-bot review so reviewCoverage counts this PR as reviewed.
+    // The reviewer is a synthetic "reviewer-bot-ish" identity that is NOT one of
+    // the seeded people, so it never collides with the subject/cohort identities.
+    await store.upsertPerson({
+      id: 'reviewer-x',
+      displayName: 'Reviewer X',
+      primaryAccountRef: 'gh:rx',
+      updatedAt: NOW,
+    })
+    await store.upsertIdentity({
+      id: 'rid-x',
+      personId: 'reviewer-x',
+      kind: 'github_login',
+      externalId: 'rx',
+      isBot: false,
+      confidence: 1,
+      raw: '{}',
+      updatedAt: NOW,
+    })
+    await store.upsertReview({
+      nodeId: `rev-${prId}`,
+      prId,
+      reviewerIdentityId: 'rid-x',
+      state: 'approved',
+      submittedAt: merged,
+      raw: '{}',
+      updatedAt: NOW,
+    })
+  }
+}
+
+describe('computePersonReportLive — momentum_vs_team is wired into the trend', () => {
+  let store
+  beforeEach(async () => {
+    store = freshStore()
+    await seedShell(store)
+    await seedCohortShell(store, 8) // ≥ MIN_COHORT humans → team series is built
+    // Subject 'p-1': 4 merged PRs across 4 distinct weeks, NONE reviewed →
+    // pr.review_coverage = 0 in each bucket the person has data for.
+    for (let w = 0; w < 4; w++) {
+      await insertMergedPr(store, `p1-pr-${w}`, 'id-1', w, false)
+    }
+    // The 8 cohort peers: each ships a reviewed PR in each of those same 4 weeks
+    // → team-aggregate pr.review_coverage is ~1.0 every week, diverging from the
+    // subject (whose coverage is 0). The drift on a flat series of 1s is "stable"
+    // and the drift on a flat series of 0s is also "stable", but their relative
+    // POSITIONS differ — driving a real momentumVsTeam comparison through to a
+    // computed value (not no_data).
+    for (let k = 1; k <= 8; k++) {
+      for (let w = 0; w < 4; w++) {
+        await insertMergedPr(store, `c-${k}-w-${w}`, `cid-${k}`, w, true)
+      }
+    }
+  })
+
+  it('emits a momentum_vs_team entry for each trend metric with a non-degenerate series', async () => {
+    const rep = await computePersonReportLive(store, 'p-1', { windowDays: 90, now: NOW })
+    // Sanity: the cohort is viable and the trend ran at all.
+    expect(rep.cohortSuppressed).toBe(false)
+    expect(Array.isArray(rep.trend)).toBe(true)
+    expect(rep.trend.length).toBeGreaterThan(0)
+
+    // Find every momentum_vs_team row — there should be at least one per trend
+    // metric that had ≥3 weekly samples (review_coverage qualifies given the seed).
+    const momentumRows = rep.trend.filter((t) => t.kind === 'momentum_vs_team')
+    expect(momentumRows.length).toBeGreaterThan(0)
+
+    const coverageMomentum = momentumRows.find((t) => t.metric === 'pr.review_coverage')
+    expect(coverageMomentum).toBeTruthy()
+    // The seed gives the subject a flat series at 0 and the team a flat series
+    // at ~1. Both are "stable" on their own baselines (driftZ = 0 via the
+    // degenerate-dispersion branch), so momentum reports an OK 0 with
+    // 'tracking team' — the value itself is finite, not no_data.
+    expect(coverageMomentum.dataQuality).toBe('ok')
+    expect(coverageMomentum.value).not.toBeNull()
+    expect(Number.isFinite(coverageMomentum.value)).toBe(true)
+    expect(coverageMomentum.interpretation).toBeTruthy()
+    // personDriftZ / teamDriftZ are surfaced so the row is auditable.
+    expect(coverageMomentum.personDriftZ).not.toBeUndefined()
+    expect(coverageMomentum.teamDriftZ).not.toBeUndefined()
+  })
+
+  it('omits momentum_vs_team when the cohort is below the peer floor', async () => {
+    // Reset to a 1-person world (just the subject) so the cohort fails MIN_COHORT
+    // and the team-trend pass is skipped entirely.
+    store = freshStore()
+    await seedShell(store)
+    for (let w = 0; w < 4; w++) {
+      await insertMergedPr(store, `p1-pr-${w}`, 'id-1', w, false)
+    }
+    const rep = await computePersonReportLive(store, 'p-1', { windowDays: 90, now: NOW })
+    expect(rep.cohortSuppressed).toBe(true)
+    const momentumRows = (rep.trend ?? []).filter((t) => t.kind === 'momentum_vs_team')
+    expect(momentumRows.length).toBe(0)
   })
 })

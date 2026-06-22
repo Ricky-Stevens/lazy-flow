@@ -41,7 +41,7 @@ export function computeRollupDistribution(values) {
   if (clean.length === 0) {
     return { min: null, p25: null, median: null, p75: null, p90: null, max: null, count: 0 }
   }
-  const sorted = [...clean].sort((a, b) => a - b)
+  const sorted = clean.toSorted((a, b) => a - b)
 
   return {
     min: sorted[0] ?? null,
@@ -49,7 +49,7 @@ export function computeRollupDistribution(values) {
     median: percentile(sorted, 0.5),
     p75: percentile(sorted, 0.75),
     p90: percentile(sorted, 0.9),
-    max: sorted[sorted.length - 1] ?? null,
+    max: sorted.at(-1) ?? null,
     count: clean.length,
   }
 }

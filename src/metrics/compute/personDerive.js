@@ -337,6 +337,22 @@ export function buildKnowledgeOwnershipInputs(allPrs, prFilesByPr, identityIds, 
 
 // --- AI-blend vs rework coupling -------------------------------------------
 
+/**
+ * AI/human classification for a single PR. The in-session Claude verdict
+ * (llmVerdict, written via record_ai_authorship_verdict) is the authoritative
+ * call when present — it adjudicates the ambiguous band by reading the change
+ * text. Without a verdict, we fall back to thresholding the deterministic
+ * ai_score at 0.5 (the legacy behaviour). Returns `null` when neither signal
+ * is available (no ai_authorship row at all).
+ */
+function isAiAssisted(authorship) {
+  if (!authorship) return null
+  if (authorship.llmVerdict === true) return true
+  if (authorship.llmVerdict === false) return false
+  if (typeof authorship.aiScore !== 'number') return null
+  return authorship.aiScore >= 0.5
+}
+
 export function buildAiBlendInputs(
   authoredMergedPrs,
   aiByEntity,
@@ -349,8 +365,9 @@ export function buildAiBlendInputs(
   const aiHeavyRework = []
   const humanRework = []
   for (const pr of authoredMergedPrs) {
-    const score = aiByEntity.get(pr.id)?.aiScore ?? null
-    if (score === null) continue
+    const authorship = aiByEntity.get(pr.id)
+    const aiAssisted = isAiAssisted(authorship)
+    if (aiAssisted === null) continue
     const crRounds = nonAuthorHumanReviews(reviewsByPr.get(pr.id), identityIds, bots).filter(
       (r) => r.state === 'changes_requested',
     ).length
@@ -358,7 +375,7 @@ export function buildAiBlendInputs(
       (c) => !identityIds.has(c.authorIdentityId) && !bots.has(c.authorIdentityId),
     ).length
     const rework = crRounds + comments
-    if (score >= 0.5) aiHeavyRework.push(rework)
+    if (aiAssisted) aiHeavyRework.push(rework)
     else humanRework.push(rework)
   }
   return { aiScores: aiScoresForPerson, aiHeavyRework, humanRework, aiHeavyThreshold: 0.5 }

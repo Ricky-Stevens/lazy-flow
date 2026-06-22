@@ -1,3 +1,4 @@
+import { safeJsonParse } from '../json.js'
 import { buildIdentityId } from './resolve.js'
 
 // ---------------------------------------------------------------------------
@@ -124,15 +125,12 @@ export async function parseCommitAuthors(store, options = {}) {
  * The commit message lives at raw.commit.message or raw.message.
  */
 function extractMessageFromRaw(raw) {
-  try {
-    const parsed = JSON.parse(raw)
-    // REST API shape: { commit: { message: '...' } }
-    const commit = parsed.commit
-    if (typeof commit?.message === 'string') return commit.message
-    // Flat shape (used in tests): { message: '...' }
-    if (typeof parsed.message === 'string') return parsed.message
-    return null
-  } catch {
-    return null
-  }
+  const parsed = safeJsonParse(raw, null)
+  if (parsed === null) return null
+  // REST API shape: { commit: { message: '...' } }
+  const commit = parsed.commit
+  if (typeof commit?.message === 'string') return commit.message
+  // Flat shape (used in tests): { message: '...' }
+  if (typeof parsed.message === 'string') return parsed.message
+  return null
 }

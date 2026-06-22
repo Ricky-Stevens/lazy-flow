@@ -37,7 +37,7 @@ export const prSize = {
     // Median via sorting
     let medianHaloc = null
     if (halocValues.length > 0) {
-      const sorted = [...halocValues].sort((a, b) => a - b)
+      const sorted = halocValues.toSorted((a, b) => a - b)
       const mid = Math.floor(sorted.length / 2)
       if (sorted.length % 2 === 1) {
         medianHaloc = sorted[mid] ?? null

@@ -1,5 +1,6 @@
 {
   "name": "lazy-flow",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "main": "src/mcp-server/index.js",

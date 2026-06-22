@@ -17,7 +17,10 @@ import { Database } from 'bun:sqlite'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
-
+import {
+  listPendingAuthorshipVerdicts,
+  recordAuthorshipVerdict,
+} from '../core/ai/authorshipVerdicts.js'
 import { ENGINE_VERSION } from '../core/index.js'
 import { backfillAllPatches } from '../ingest-github/index.js'
 import {
@@ -28,6 +31,7 @@ import {
   invalidateLookupsCache,
   loadScopeData,
   metricFormulaDoc,
+  metricSetNeedsPatch,
   rederiveStaleEngineSnapshots,
 } from '../metrics/index.js'
 import {
@@ -794,6 +798,7 @@ const AGILE_METRIC_IDS = [
   'agile.say_do',
   'agile.sprint_predictability',
   'agile.estimation_accuracy',
+  'agile.priority_mix',
 ]
 
 /**
@@ -853,7 +858,13 @@ async function computeRows(ctx, scopeType, scopeId, metricIds, windowDays) {
   // Without this, computeMetric re-runs a full-table load per metric (13× for
   // get_pr_metrics), which on a large install freezes the single-threaded server
   // for seconds and spikes memory N×. Mirrors backfillSnapshots / personReport.
-  const preloaded = await loadScopeData(ctx.store, fromDay, toDay)
+  // Opt into the fat-patch pr_files variant ONLY when the bundle includes a
+  // metric that re-parses unified diffs (currently `code.haloc_aggregate`);
+  // every other bundle reads denormalised columns and the patch text is the
+  // single largest column in the DB.
+  const preloaded = await loadScopeData(ctx.store, fromDay, toDay, {
+    needsPatch: metricSetNeedsPatch(metricIds),
+  })
   const rows = []
   for (const metricId of metricIds) {
     const r = await computeMetric(
@@ -2094,6 +2105,94 @@ function registerRecordVerdictTool(server, ctx) {
 }
 
 // ---------------------------------------------------------------------------
+// Tools: in-session-Claude AI-authorship verdict (NO external API, NO API key)
+// ---------------------------------------------------------------------------
+
+function registerListPendingAiAuthorshipTool(server, ctx) {
+  server.registerTool(
+    'list_pending_ai_authorship',
+    {
+      title: 'List Pending AI-Authorship Verdicts',
+      description:
+        'Return ambiguous-band commits/PRs whose deterministic stylometry score is inconclusive ' +
+        '(default 0.35–0.65) and whose AI-vs-human authorship has not yet been judged. The CURRENT ' +
+        'Claude session reads each change text (commit message; PR title+body) and judges writing ' +
+        'STYLE / STRUCTURE, then calls record_ai_authorship_verdict. Nothing leaves the machine; ' +
+        'no external model API is used and no API key is required.',
+      inputSchema: z.object({
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(100)
+          .optional()
+          .describe('Max ambiguous-band entities to return (default 25).'),
+        lo_band: z
+          .number()
+          .min(0)
+          .max(1)
+          .optional()
+          .describe('Lower ai_score bound for the ambiguous band (default 0.35).'),
+        hi_band: z
+          .number()
+          .min(0)
+          .max(1)
+          .optional()
+          .describe('Upper ai_score bound for the ambiguous band (default 0.65).'),
+      }),
+    },
+    async ({ limit, lo_band, hi_band }) => {
+      const out = await listPendingAuthorshipVerdicts(ctx.store, {
+        limit,
+        loBand: lo_band,
+        hiBand: hi_band,
+      })
+      return { content: [{ type: 'text', text: JSON.stringify(out) }], structuredContent: out }
+    },
+  )
+}
+
+function registerRecordAiAuthorshipVerdictTool(server, ctx) {
+  server.registerTool(
+    'record_ai_authorship_verdict',
+    {
+      title: 'Record AI-Authorship Verdict',
+      description:
+        'Persist an AI-vs-human authorship verdict the CURRENT Claude session produced by reading ' +
+        'a commit message or PR title+body (no API key, nothing leaves the machine). Idempotent ' +
+        'per (entity_type, entity_id) — re-recording overwrites the prior verdict. The verdict ' +
+        'overrides the deterministic ai_score for downstream metrics that consume it.',
+      inputSchema: z.object({
+        entity_type: z
+          .enum(['commit', 'pull_request'])
+          .describe('Which ai_authorship row to write the verdict to.'),
+        entity_id: z
+          .string()
+          .describe('ai_authorship.entity_id (commits: "<repoId>:<sha>"; PRs: pull_request id).'),
+        ai_assisted: z.boolean().describe('True if the text was written with AI assistance.'),
+        confidence: z.number().min(0).max(1).describe('Verdict confidence, 0..1.'),
+        reasoning: z.string().describe('One or two sentences justifying the verdict.'),
+      }),
+    },
+    async ({ entity_type, entity_id, ai_assisted, confidence, reasoning }) => {
+      const now = new Date().toISOString()
+      const res = await recordAuthorshipVerdict(
+        ctx.store,
+        {
+          entityType: entity_type,
+          entityId: entity_id,
+          aiAssisted: ai_assisted,
+          confidence,
+          reasoning,
+        },
+        { now },
+      )
+      return { content: [{ type: 'text', text: JSON.stringify(res) }], structuredContent: res }
+    },
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Tool: backfill_pr_patches — GraphQL-only diff synthesis for pr_files.patch
 // ---------------------------------------------------------------------------
 
@@ -2138,6 +2237,10 @@ function registerBackfillPrPatchesTool(server, ctx) {
       const res = drain
         ? await backfillAllPatches(ctx.store, ctx.githubClient, { drain: true })
         : await backfillAllPatches(ctx.store, ctx.githubClient, { maxFiles: cap })
+      // Backfill rewrites pr_files.patch AND the denormalised pr_files.haloc, so
+      // any memoised scope data (FULL_SCOPE_MEMO) derived before the backfill will
+      // contain stale haloc values. Invalidate so the next get_* call reloads.
+      invalidateLookupsCache(ctx.store)
       const output = {
         backfilled: res.backfilled,
         skipped: res.skipped,
@@ -2177,6 +2280,8 @@ export function createServer(ctx) {
   registerGetPersonReportTool(server, ctx)
   registerListPendingVerdictsTool(server, ctx)
   registerRecordVerdictTool(server, ctx)
+  registerListPendingAiAuthorshipTool(server, ctx)
+  registerRecordAiAuthorshipVerdictTool(server, ctx)
   registerBackfillPrPatchesTool(server, ctx)
 
   // Tools — reporting

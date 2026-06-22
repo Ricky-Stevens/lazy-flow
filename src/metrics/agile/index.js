@@ -10,6 +10,8 @@ export {
 
 export { sprintPredictability } from './predictability.js'
 
+export { priorityMix } from './priorityMix.js'
+
 export { sayDo } from './sayDo.js'
 
 export { sprintVelocity } from './velocity.js'

@@ -5,6 +5,8 @@
  * issue types — no store, no I/O.
  */
 
+import { BUG_TYPES } from '../shared/bugTypes.js'
+
 const TEST_RE =
   /(^|\/)(tests?|__tests__|spec|specs|e2e)(\/|$)|\.(test|spec)\.[a-z]+$|_test\.[a-z]+$/i
 const DOCS_RE = /(^|\/)docs?(\/|$)|\.(md|mdx|rst|txt|adoc)$|(^|\/)(readme|changelog|license)/i
@@ -74,7 +76,6 @@ export function skillDomain(path) {
 // ---------------------------------------------------------------------------
 
 const FEATURE_TYPES = new Set(['story', 'feature', 'epic', 'new feature'])
-const BUG_TYPES = new Set(['bug', 'defect', 'incident', 'hotfix'])
 const DEBT_TYPES = new Set(['debt', 'tech debt', 'technical debt', 'chore', 'maintenance'])
 
 /**

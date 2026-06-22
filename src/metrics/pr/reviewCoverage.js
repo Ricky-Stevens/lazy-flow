@@ -158,7 +158,7 @@ export function giniCoefficient(counts) {
   const nonZero = counts.filter((c) => c > 0)
   if (nonZero.length < 2) return null
 
-  const sorted = [...nonZero].sort((a, b) => a - b)
+  const sorted = nonZero.toSorted((a, b) => a - b)
   const n = sorted.length
   const sum = sorted.reduce((a, b) => a + b, 0)
   if (sum === 0) return null

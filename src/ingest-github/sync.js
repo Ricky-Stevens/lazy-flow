@@ -547,7 +547,7 @@ async function writePr(store, rawPr, fetched, repoId, defaultBranch, now) {
   const authorIdentityId = await resolveLoginIdentity(store, rawPr.user?.login, now)
 
   // rawReviews / rawComments come from the prefetched bundle (see fetchPrBundle),
-  // and feed firstReviewAt, approvedAt, and firstCommitAt below.
+  // and feed firstReviewAt below.
 
   // Stage timestamps (denormalised per SPEC §6.1 pull_requests).
   const createdAt = rawPr.created_at ?? now
@@ -565,18 +565,11 @@ async function writePr(store, rawPr, fetched, repoId, defaultBranch, now) {
 
   // firstReviewAt: earliest review submission time.
   let firstReviewAt = null
-  let approvedAt = null
   for (const rev of rawReviews) {
     const submittedAt = rev.submitted_at ?? null
     if (submittedAt !== null) {
       if (!firstReviewAt || submittedAt < firstReviewAt) {
         firstReviewAt = submittedAt
-      }
-      const state = (rev.state ?? '').toUpperCase()
-      if (state === 'APPROVED') {
-        if (!approvedAt || submittedAt < approvedAt) {
-          approvedAt = submittedAt
-        }
       }
     }
   }
@@ -599,12 +592,10 @@ async function writePr(store, rawPr, fetched, repoId, defaultBranch, now) {
     headRef: rawPr.head?.ref ?? '',
     baseRef: rawPr.base?.ref ?? defaultBranch,
     isDraft,
-    mergedViaQueue: false,
     createdAt,
     readyAt,
     firstCommitAt,
     firstReviewAt,
-    approvedAt,
     mergedAt,
     mergedByIdentityId,
     deletedAt: null,
@@ -749,8 +740,6 @@ function mapCommit(raw, repoId, now, detail) {
 
   const authoredAt = authorData.date ?? raw.authored_date ?? now
 
-  const committedAt = commitData.committer?.date ?? authoredAt
-
   // Prefer the per-commit DETAIL stats/HALOC (real, from getCommitDetail). The
   // LIST payload carries no `stats`, so without the detail fetch these would be
   // 0. Fall back to any inline `stats` (some payloads carry it) then to 0.
@@ -770,7 +759,6 @@ function mapCommit(raw, repoId, now, detail) {
     sha: raw.sha,
     authorIdentityId,
     authoredAt,
-    committedAt,
     additions,
     deletions,
     haloc,
@@ -894,7 +882,6 @@ function mapPrFile(raw, prId, repoId, now) {
     additions,
     deletions,
     haloc,
-    status: raw.status ?? 'modified',
     patch: patch !== undefined && patch !== null ? scrubFreeText(patch) : null,
     // Persist the generated/vendored classification at ingest. Read-time metrics
     // filter on this column so lockfiles / .min.js / vendor/** never enter the
@@ -929,7 +916,6 @@ function mapCheckRun(raw, repoId, headSha, now) {
     conclusion: raw.conclusion ?? null,
     startedAt: raw.started_at ?? null,
     completedAt: raw.completed_at ?? null,
-    raw: JSON.stringify(raw),
     updatedAt: now,
   }
 }

@@ -1,3 +1,5 @@
+import { safeJsonParse } from '../json.js'
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -46,14 +48,10 @@ function extractBranchKeys(headRef) {
 // ---------------------------------------------------------------------------
 
 function parsePrRaw(raw) {
-  try {
-    const parsed = JSON.parse(raw)
-    return {
-      title: typeof parsed.title === 'string' ? parsed.title : '',
-      body: typeof parsed.body === 'string' ? parsed.body : '',
-    }
-  } catch {
-    return { title: '', body: '' }
+  const parsed = safeJsonParse(raw, {})
+  return {
+    title: typeof parsed.title === 'string' ? parsed.title : '',
+    body: typeof parsed.body === 'string' ? parsed.body : '',
   }
 }
 

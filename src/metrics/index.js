@@ -52,6 +52,7 @@ export {
   knownMetricIds,
   loadScopeData,
   metricFormulaDoc,
+  metricSetNeedsPatch,
 } from './compute/index.js'
 // Group A — DORA
 

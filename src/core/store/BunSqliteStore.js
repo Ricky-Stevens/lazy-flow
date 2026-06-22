@@ -348,13 +348,12 @@ export class BunSqliteStore {
 
   async upsertCommit(commit) {
     this.stmt(`
-      INSERT INTO commits (repo_id, sha, author_identity_id, authored_at, committed_at,
+      INSERT INTO commits (repo_id, sha, author_identity_id, authored_at,
         additions, deletions, haloc, raw, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(repo_id, sha) DO UPDATE SET
         author_identity_id = CASE WHEN excluded.updated_at >= commits.updated_at THEN excluded.author_identity_id ELSE commits.author_identity_id END,
         authored_at        = CASE WHEN excluded.updated_at >= commits.updated_at THEN excluded.authored_at        ELSE commits.authored_at        END,
-        committed_at       = CASE WHEN excluded.updated_at >= commits.updated_at THEN excluded.committed_at       ELSE commits.committed_at       END,
         additions          = CASE WHEN excluded.updated_at >= commits.updated_at THEN excluded.additions          ELSE commits.additions          END,
         deletions          = CASE WHEN excluded.updated_at >= commits.updated_at THEN excluded.deletions          ELSE commits.deletions          END,
         haloc              = CASE WHEN excluded.updated_at >= commits.updated_at THEN excluded.haloc              ELSE commits.haloc              END,
@@ -365,7 +364,6 @@ export class BunSqliteStore {
       commit.sha,
       commit.authorIdentityId,
       commit.authoredAt,
-      commit.committedAt,
       commit.additions,
       commit.deletions,
       commit.haloc,
@@ -383,7 +381,7 @@ export class BunSqliteStore {
 
   async getCommitsByRepo(repoId, since, until) {
     let sql =
-      `SELECT repo_id, sha, author_identity_id, authored_at, committed_at,` +
+      `SELECT repo_id, sha, author_identity_id, authored_at,` +
       ` additions, deletions, haloc, raw, created_at, updated_at` +
       ` FROM commits WHERE repo_id = ?`
     const params = [repoId]
@@ -402,7 +400,6 @@ export class BunSqliteStore {
       sha: String(r.sha),
       authorIdentityId: String(r.author_identity_id),
       authoredAt: String(r.authored_at),
-      committedAt: String(r.committed_at),
       additions: Number(r.additions),
       deletions: Number(r.deletions),
       haloc: Number(r.haloc),
@@ -445,20 +442,18 @@ export class BunSqliteStore {
   async upsertPullRequest(pr) {
     this.stmt(`
       INSERT INTO pull_requests (id, repo_id, number, author_identity_id, state,
-        head_ref, base_ref, is_draft, merged_via_queue, created_at, ready_at,
-        first_commit_at, first_review_at, approved_at, merged_at,
+        head_ref, base_ref, is_draft, created_at, ready_at,
+        first_commit_at, first_review_at, merged_at,
         merged_by_identity_id, deleted_at, raw, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         state                 = CASE WHEN excluded.updated_at >= pull_requests.updated_at THEN excluded.state                 ELSE pull_requests.state                 END,
         head_ref              = CASE WHEN excluded.updated_at >= pull_requests.updated_at THEN excluded.head_ref              ELSE pull_requests.head_ref              END,
         base_ref              = CASE WHEN excluded.updated_at >= pull_requests.updated_at THEN excluded.base_ref              ELSE pull_requests.base_ref              END,
         is_draft              = CASE WHEN excluded.updated_at >= pull_requests.updated_at THEN excluded.is_draft              ELSE pull_requests.is_draft              END,
-        merged_via_queue      = CASE WHEN excluded.updated_at >= pull_requests.updated_at THEN excluded.merged_via_queue      ELSE pull_requests.merged_via_queue      END,
         ready_at              = CASE WHEN excluded.updated_at >= pull_requests.updated_at THEN excluded.ready_at              ELSE pull_requests.ready_at              END,
         first_commit_at       = CASE WHEN excluded.updated_at >= pull_requests.updated_at THEN excluded.first_commit_at       ELSE pull_requests.first_commit_at       END,
         first_review_at       = CASE WHEN excluded.updated_at >= pull_requests.updated_at THEN excluded.first_review_at       ELSE pull_requests.first_review_at       END,
-        approved_at           = CASE WHEN excluded.updated_at >= pull_requests.updated_at THEN excluded.approved_at           ELSE pull_requests.approved_at           END,
         merged_at             = CASE WHEN excluded.updated_at >= pull_requests.updated_at THEN excluded.merged_at             ELSE pull_requests.merged_at             END,
         merged_by_identity_id = CASE WHEN excluded.updated_at >= pull_requests.updated_at THEN excluded.merged_by_identity_id ELSE pull_requests.merged_by_identity_id END,
         deleted_at            = CASE WHEN excluded.updated_at >= pull_requests.updated_at THEN excluded.deleted_at            ELSE pull_requests.deleted_at            END,
@@ -473,12 +468,10 @@ export class BunSqliteStore {
       pr.headRef,
       pr.baseRef,
       b(pr.isDraft),
-      b(pr.mergedViaQueue),
       pr.createdAt,
       pr.readyAt,
       pr.firstCommitAt,
       pr.firstReviewAt,
-      pr.approvedAt,
       pr.mergedAt,
       pr.mergedByIdentityId,
       pr.deletedAt,
@@ -490,8 +483,8 @@ export class BunSqliteStore {
   async getPullRequest(id) {
     const row = this.stmt(
       `SELECT id, repo_id, number, author_identity_id, state, head_ref, base_ref,
-              is_draft, merged_via_queue, created_at, ready_at, first_commit_at,
-              first_review_at, approved_at, merged_at, merged_by_identity_id,
+              is_draft, created_at, ready_at, first_commit_at,
+              first_review_at, merged_at, merged_by_identity_id,
               deleted_at, raw, updated_at
        FROM pull_requests WHERE id = ? AND deleted_at IS NULL`,
     ).get(id)
@@ -502,8 +495,8 @@ export class BunSqliteStore {
   async getPullRequestsByRepo(repoId, since, until) {
     let sql =
       `SELECT id, repo_id, number, author_identity_id, state, head_ref, base_ref,` +
-      ` is_draft, merged_via_queue, created_at, ready_at, first_commit_at,` +
-      ` first_review_at, approved_at, merged_at, merged_by_identity_id,` +
+      ` is_draft, created_at, ready_at, first_commit_at,` +
+      ` first_review_at, merged_at, merged_by_identity_id,` +
       ` deleted_at, raw, updated_at` +
       ` FROM pull_requests WHERE repo_id = ? AND deleted_at IS NULL`
     const params = [repoId]
@@ -533,8 +526,8 @@ export class BunSqliteStore {
   async getPullRequestsForMetrics(repoId, fromIso, toIso) {
     const sql =
       `SELECT id, repo_id, number, author_identity_id, state, head_ref, base_ref,` +
-      ` is_draft, merged_via_queue, created_at, ready_at, first_commit_at,` +
-      ` first_review_at, approved_at, merged_at, merged_by_identity_id,` +
+      ` is_draft, created_at, ready_at, first_commit_at,` +
+      ` first_review_at, merged_at, merged_by_identity_id,` +
       ` deleted_at, raw, updated_at` +
       ` FROM pull_requests WHERE repo_id = ? AND deleted_at IS NULL AND (` +
       `   (created_at >= ? AND created_at <= ?)` +
@@ -555,12 +548,10 @@ export class BunSqliteStore {
       headRef: String(r.head_ref),
       baseRef: String(r.base_ref),
       isDraft: rb(r.is_draft),
-      mergedViaQueue: rb(r.merged_via_queue),
       createdAt: String(r.created_at),
       readyAt: rstr(r.ready_at),
       firstCommitAt: rstr(r.first_commit_at),
       firstReviewAt: rstr(r.first_review_at),
-      approvedAt: rstr(r.approved_at),
       mergedAt: rstr(r.merged_at),
       mergedByIdentityId: rstr(r.merged_by_identity_id),
       deletedAt: rstr(r.deleted_at),
@@ -580,14 +571,13 @@ export class BunSqliteStore {
     // to 0 so a single rogue row cannot wedge the whole sync.
     const isGenerated = file.isGenerated === true || file.isGenerated === 1 ? 1 : 0
     this.stmt(`
-      INSERT INTO pr_files (pr_id, repo_id, path, additions, deletions, haloc, status, patch, is_generated, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO pr_files (pr_id, repo_id, path, additions, deletions, haloc, patch, is_generated, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(pr_id, path) DO UPDATE SET
         repo_id      = CASE WHEN excluded.updated_at >= pr_files.updated_at THEN excluded.repo_id      ELSE pr_files.repo_id      END,
         additions    = CASE WHEN excluded.updated_at >= pr_files.updated_at THEN excluded.additions    ELSE pr_files.additions    END,
         deletions    = CASE WHEN excluded.updated_at >= pr_files.updated_at THEN excluded.deletions    ELSE pr_files.deletions    END,
         haloc        = CASE WHEN excluded.updated_at >= pr_files.updated_at THEN excluded.haloc        ELSE pr_files.haloc        END,
-        status       = CASE WHEN excluded.updated_at >= pr_files.updated_at THEN excluded.status       ELSE pr_files.status       END,
         patch        = CASE WHEN excluded.updated_at >= pr_files.updated_at THEN excluded.patch        ELSE pr_files.patch        END,
         is_generated = CASE WHEN excluded.updated_at >= pr_files.updated_at THEN excluded.is_generated ELSE pr_files.is_generated END,
         updated_at   = CASE WHEN excluded.updated_at >= pr_files.updated_at THEN excluded.updated_at   ELSE pr_files.updated_at   END
@@ -598,7 +588,6 @@ export class BunSqliteStore {
       file.additions,
       file.deletions,
       file.haloc,
-      file.status,
       file.patch,
       isGenerated,
       file.createdAt,
@@ -608,7 +597,7 @@ export class BunSqliteStore {
 
   async getPrFilesByPullRequest(prId) {
     const rows = this.stmt(
-      `SELECT pr_id, repo_id, path, additions, deletions, haloc, status, patch, is_generated, created_at, updated_at
+      `SELECT pr_id, repo_id, path, additions, deletions, haloc, patch, is_generated, created_at, updated_at
        FROM pr_files WHERE pr_id = ? ORDER BY path ASC`,
     ).all(prId)
     return rows.map((r) => this._rowToPrFile(r))
@@ -619,7 +608,7 @@ export class BunSqliteStore {
     // exclude soft-deleted PRs (a tombstoned PR's files must not feed metrics).
     let sql =
       `SELECT f.pr_id, f.repo_id, f.path, f.additions, f.deletions, f.haloc,` +
-      ` f.status, f.patch, f.is_generated, f.created_at, f.updated_at` +
+      ` f.patch, f.is_generated, f.created_at, f.updated_at` +
       ` FROM pr_files f` +
       ` JOIN pull_requests p ON p.id = f.pr_id` +
       ` WHERE f.repo_id = ? AND p.deleted_at IS NULL`
@@ -645,7 +634,6 @@ export class BunSqliteStore {
       additions: Number(r.additions),
       deletions: Number(r.deletions),
       haloc: Number(r.haloc),
-      status: String(r.status),
       patch: rstr(r.patch),
       // Round-trip the persisted classification as a real boolean so call-site
       // filters (`!f.isGenerated`) work regardless of whether the column came
@@ -747,14 +735,13 @@ export class BunSqliteStore {
 
   async upsertCheckRun(checkRun) {
     this.stmt(`
-      INSERT INTO check_runs (node_id, repo_id, head_sha, name, status, conclusion, started_at, completed_at, raw, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO check_runs (node_id, repo_id, head_sha, name, status, conclusion, started_at, completed_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(node_id) DO UPDATE SET
         status       = CASE WHEN excluded.updated_at >= check_runs.updated_at THEN excluded.status       ELSE check_runs.status       END,
         conclusion   = CASE WHEN excluded.updated_at >= check_runs.updated_at THEN excluded.conclusion   ELSE check_runs.conclusion   END,
         started_at   = CASE WHEN excluded.updated_at >= check_runs.updated_at THEN excluded.started_at   ELSE check_runs.started_at   END,
         completed_at = CASE WHEN excluded.updated_at >= check_runs.updated_at THEN excluded.completed_at ELSE check_runs.completed_at END,
-        raw          = CASE WHEN excluded.updated_at >= check_runs.updated_at THEN excluded.raw          ELSE check_runs.raw          END,
         updated_at   = CASE WHEN excluded.updated_at >= check_runs.updated_at THEN excluded.updated_at   ELSE check_runs.updated_at   END
     `).run(
       checkRun.nodeId,
@@ -765,14 +752,13 @@ export class BunSqliteStore {
       checkRun.conclusion,
       checkRun.startedAt,
       checkRun.completedAt,
-      checkRun.raw,
       checkRun.updatedAt,
     )
   }
 
   async getCheckRunsByRepo(repoId, headSha) {
     let sql =
-      `SELECT node_id, repo_id, head_sha, name, status, conclusion, started_at, completed_at, raw, updated_at` +
+      `SELECT node_id, repo_id, head_sha, name, status, conclusion, started_at, completed_at, updated_at` +
       ` FROM check_runs WHERE repo_id = ?`
     const params = [repoId]
     if (headSha) {
@@ -789,7 +775,6 @@ export class BunSqliteStore {
       conclusion: rstr(r.conclusion),
       startedAt: rstr(r.started_at),
       completedAt: rstr(r.completed_at),
-      raw: String(r.raw),
       updatedAt: String(r.updated_at),
     }))
   }
@@ -807,12 +792,39 @@ export class BunSqliteStore {
   async getAllPullRequests() {
     const rows = this.stmt(
       `SELECT id, repo_id, number, author_identity_id, state, head_ref, base_ref,
-              is_draft, merged_via_queue, created_at, ready_at, first_commit_at,
-              first_review_at, approved_at, merged_at, merged_by_identity_id,
+              is_draft, created_at, ready_at, first_commit_at,
+              first_review_at, merged_at, merged_by_identity_id,
               deleted_at, raw, updated_at
        FROM pull_requests WHERE deleted_at IS NULL ORDER BY created_at ASC`,
     ).all()
     return rows.map((r) => this._rowToPullRequest(r))
+  }
+
+  /**
+   * Patch- and raw-less variants for the metric-compute path. The fat columns
+   * (`pr.raw` JSON, `commit.raw`, `review.raw`, `review_comment.raw`,
+   * `deployment.raw`, `pr_files.patch`) are consumed ONLY by non-metric paths
+   * (verdict pipeline, AI-authorship detection, cross-source identity stitching,
+   * issue linking). The metric formulas never read them, so loading them into
+   * `loadFullScopeData` materialised hundreds of MB of payload on every
+   * snapshot-backfill or `get_*` tool call that was immediately thrown away.
+   *
+   * Each *Meta variant SELECTs every column the metric path actually reads, and
+   * sets the omitted fat field to a stable empty default (`raw: ''`, `patch:
+   * null`) so the in-memory row shape stays compatible with any defensive call
+   * site that destructures it. The original fat getters are retained verbatim
+   * for the verdict / authorship / link callers; we only changed which getter
+   * the compute path calls.
+   */
+  async getAllPullRequestsMeta() {
+    const rows = this.stmt(
+      `SELECT id, repo_id, number, author_identity_id, state, head_ref, base_ref,
+              is_draft, created_at, ready_at, first_commit_at,
+              first_review_at, merged_at, merged_by_identity_id,
+              deleted_at, updated_at
+       FROM pull_requests WHERE deleted_at IS NULL ORDER BY created_at ASC`,
+    ).all()
+    return rows.map((r) => this._rowToPullRequest({ ...r, raw: '' }))
   }
 
   async getAllReviews() {
@@ -827,6 +839,22 @@ export class BunSqliteStore {
       state: r.state,
       submittedAt: String(r.submitted_at),
       raw: String(r.raw),
+      updatedAt: String(r.updated_at),
+    }))
+  }
+
+  async getAllReviewsMeta() {
+    const rows = this.stmt(
+      `SELECT node_id, pr_id, reviewer_identity_id, state, submitted_at, updated_at
+       FROM reviews ORDER BY submitted_at ASC`,
+    ).all()
+    return rows.map((r) => ({
+      nodeId: String(r.node_id),
+      prId: String(r.pr_id),
+      reviewerIdentityId: String(r.reviewer_identity_id),
+      state: r.state,
+      submittedAt: String(r.submitted_at),
+      raw: '',
       updatedAt: String(r.updated_at),
     }))
   }
@@ -848,17 +876,109 @@ export class BunSqliteStore {
     }))
   }
 
+  async getAllReviewCommentsMeta() {
+    const rows = this.stmt(
+      `SELECT node_id, pr_id, author_identity_id, created_at, in_reply_to, path, updated_at
+       FROM review_comments ORDER BY created_at ASC`,
+    ).all()
+    return rows.map((r) => ({
+      nodeId: String(r.node_id),
+      prId: String(r.pr_id),
+      authorIdentityId: String(r.author_identity_id),
+      createdAt: String(r.created_at),
+      inReplyTo: rstr(r.in_reply_to),
+      path: rstr(r.path),
+      raw: '',
+      updatedAt: String(r.updated_at),
+    }))
+  }
+
   async getAllPrFiles() {
     // JOIN pull_requests to exclude soft-deleted PRs' files (matches getPrFilesByRepo).
     const rows = this.stmt(
       `SELECT f.pr_id, f.repo_id, f.path, f.additions, f.deletions, f.haloc,
-              f.status, f.patch, f.is_generated, f.created_at, f.updated_at
+              f.patch, f.is_generated, f.created_at, f.updated_at
        FROM pr_files f
        JOIN pull_requests p ON p.id = f.pr_id
        WHERE p.deleted_at IS NULL
        ORDER BY f.pr_id ASC, f.path ASC`,
     ).all()
     return rows.map((r) => this._rowToPrFile(r))
+  }
+
+  /**
+   * Patch-less pr_files for the metric-compute path. Only `code.haloc_aggregate`
+   * re-parses `pr_files.patch`; every other code/PR metric reads the
+   * denormalised additions/deletions/haloc/is_generated columns. Loading the
+   * patch text — the largest column in the DB — on every `loadFullScopeData`
+   * call was the single biggest source of wasted I/O in the metric layer.
+   * `patch` is set to `null` so call sites that read it still receive a
+   * defined-but-empty value (matches the GraphQL-ingest reality where patch is
+   * `null` until backfill).
+   */
+  async getAllPrFilesMeta() {
+    const rows = this.stmt(
+      `SELECT f.pr_id, f.repo_id, f.path, f.additions, f.deletions, f.haloc,
+              f.is_generated, f.created_at, f.updated_at
+       FROM pr_files f
+       JOIN pull_requests p ON p.id = f.pr_id
+       WHERE p.deleted_at IS NULL
+       ORDER BY f.pr_id ASC, f.path ASC`,
+    ).all()
+    return rows.map((r) => this._rowToPrFile({ ...r, patch: null }))
+  }
+
+  /**
+   * pr_files rows whose `patch` is NULL, narrowed by repoId and capped at
+   * `limit`. The patch-backfill loop used to `getAllPrFiles()` (loading every
+   * row + the fat patch column) and then filter to the patch-less subset in
+   * memory, which is quadratic in the drain loop. This query returns ONLY the
+   * patch-less rows, ONLY for the requested repo, and skips the patch column
+   * entirely — turning the drain into a fixed-cost scan per chunk. Sort by
+   * pr_id/path so chunked iteration is deterministic.
+   */
+  async getPrFilesMissingPatchByRepo(repoId, limit) {
+    const cap = Math.max(1, Number(limit) || 1)
+    const rows = this.stmt(
+      `SELECT f.pr_id, f.repo_id, f.path, f.additions, f.deletions, f.haloc,
+              f.is_generated, f.created_at, f.updated_at
+       FROM pr_files f
+       JOIN pull_requests p ON p.id = f.pr_id
+       WHERE p.deleted_at IS NULL AND f.repo_id = ? AND f.patch IS NULL
+       ORDER BY f.pr_id ASC, f.path ASC
+       LIMIT ?`,
+    ).all(repoId, cap)
+    return rows.map((r) => this._rowToPrFile({ ...r, patch: null }))
+  }
+
+  /**
+   * Repo ids that still have at least one patch-less pr_files row. Used by
+   * `backfillAllPatches` to discover work without materialising the full
+   * pr_files table (the previous `getAllPrFiles().filter(...).map(repoId)`
+   * pattern loaded hundreds of MB of patch text just to extract a handful of
+   * distinct ids).
+   */
+  async getRepoIdsWithMissingPatches() {
+    const rows = this.stmt(
+      `SELECT DISTINCT f.repo_id
+       FROM pr_files f
+       JOIN pull_requests p ON p.id = f.pr_id
+       WHERE p.deleted_at IS NULL AND f.patch IS NULL`,
+    ).all()
+    return rows.map((r) => String(r.repo_id))
+  }
+
+  /** Count of patch-less pr_files rows for a repo — for the budget-spent tally
+   * in `backfillAllPatches` (avoids re-loading the whole pr_files table just to
+   * count the residual). */
+  async countPrFilesMissingPatchByRepo(repoId) {
+    const row = this.stmt(
+      `SELECT COUNT(*) AS n
+       FROM pr_files f
+       JOIN pull_requests p ON p.id = f.pr_id
+       WHERE p.deleted_at IS NULL AND f.repo_id = ? AND f.patch IS NULL`,
+    ).get(repoId)
+    return Number(row?.n ?? 0)
   }
 
   /**
@@ -875,7 +995,7 @@ export class BunSqliteStore {
       const placeholders = chunk.map(() => '?').join(', ')
       const rows = this.stmt(
         `SELECT f.pr_id, f.repo_id, f.path, f.additions, f.deletions, f.haloc,
-                f.status, f.patch, f.is_generated, f.created_at, f.updated_at
+                f.patch, f.is_generated, f.created_at, f.updated_at
          FROM pr_files f
          JOIN pull_requests p ON p.id = f.pr_id
          WHERE p.deleted_at IS NULL AND f.pr_id IN (${placeholders})
@@ -888,6 +1008,59 @@ export class BunSqliteStore {
       }
     }
     return byPr
+  }
+
+  /**
+   * Fetch (repoId, sha) → commit.raw for a bounded set of (repoId, sha) pairs.
+   * Used by the in-session AI-authorship verdict surface to pull ONLY the commit
+   * messages it intends to judge, instead of loading every commit. Returns a
+   * Map keyed by `${repoId}:${sha}` to match ai_authorship.entityId.
+   */
+  async getCommitRawByEntityIds(entityIds) {
+    const byEntity = new Map()
+    const ids = [...new Set(entityIds)]
+    if (ids.length === 0) return byEntity
+    // Each entity id is `${repoId}:${sha}` — split for the (repoId, sha) join.
+    const pairs = []
+    for (const eid of ids) {
+      const idx = eid.indexOf(':')
+      if (idx <= 0) continue
+      pairs.push({ entityId: eid, repoId: eid.slice(0, idx), sha: eid.slice(idx + 1) })
+    }
+    for (let i = 0; i < pairs.length; i += 450) {
+      const chunk = pairs.slice(i, i + 450)
+      const placeholders = chunk.map(() => '(?, ?)').join(', ')
+      const bind = []
+      for (const p of chunk) {
+        bind.push(p.repoId, p.sha)
+      }
+      const rows = this.stmt(
+        `SELECT repo_id, sha, raw FROM commits WHERE (repo_id, sha) IN (${placeholders})`,
+      ).all(...bind)
+      for (const r of rows) {
+        byEntity.set(`${String(r.repo_id)}:${String(r.sha)}`, String(r.raw))
+      }
+    }
+    return byEntity
+  }
+
+  /**
+   * Fetch id → pull_requests.raw for a bounded set of PR ids. Used by the
+   * in-session AI-authorship verdict surface (PR title+body) and any other
+   * caller that needs the fat raw payload for a specific subset.
+   */
+  async getPullRequestRawByIds(prIds) {
+    const byId = new Map()
+    const ids = [...new Set(prIds)]
+    for (let i = 0; i < ids.length; i += 900) {
+      const chunk = ids.slice(i, i + 900)
+      const placeholders = chunk.map(() => '?').join(', ')
+      const rows = this.stmt(
+        `SELECT id, raw FROM pull_requests WHERE deleted_at IS NULL AND id IN (${placeholders})`,
+      ).all(...chunk)
+      for (const r of rows) byId.set(String(r.id), String(r.raw))
+    }
+    return byId
   }
 
   async getAllDeployments() {
@@ -909,9 +1082,28 @@ export class BunSqliteStore {
     }))
   }
 
+  async getAllDeploymentsMeta() {
+    const rows = this.stmt(
+      `SELECT id, repo_id, sha, environment, status, created_at, finished_at, source, updated_at
+       FROM deployments ORDER BY created_at ASC`,
+    ).all()
+    return rows.map((r) => ({
+      id: String(r.id),
+      repoId: String(r.repo_id),
+      sha: String(r.sha),
+      environment: String(r.environment),
+      status: String(r.status),
+      createdAt: String(r.created_at),
+      finishedAt: rstr(r.finished_at),
+      source: r.source,
+      raw: '',
+      updatedAt: String(r.updated_at),
+    }))
+  }
+
   async getAllCommits() {
     const rows = this.stmt(
-      `SELECT repo_id, sha, author_identity_id, authored_at, committed_at,
+      `SELECT repo_id, sha, author_identity_id, authored_at,
               additions, deletions, haloc, raw, created_at, updated_at
        FROM commits ORDER BY authored_at ASC`,
     ).all()
@@ -920,7 +1112,6 @@ export class BunSqliteStore {
       sha: String(r.sha),
       authorIdentityId: String(r.author_identity_id),
       authoredAt: String(r.authored_at),
-      committedAt: String(r.committed_at),
       additions: Number(r.additions),
       deletions: Number(r.deletions),
       haloc: Number(r.haloc),
@@ -930,9 +1121,29 @@ export class BunSqliteStore {
     }))
   }
 
+  async getAllCommitsMeta() {
+    const rows = this.stmt(
+      `SELECT repo_id, sha, author_identity_id, authored_at,
+              additions, deletions, haloc, created_at, updated_at
+       FROM commits ORDER BY authored_at ASC`,
+    ).all()
+    return rows.map((r) => ({
+      repoId: String(r.repo_id),
+      sha: String(r.sha),
+      authorIdentityId: String(r.author_identity_id),
+      authoredAt: String(r.authored_at),
+      additions: Number(r.additions),
+      deletions: Number(r.deletions),
+      haloc: Number(r.haloc),
+      raw: '',
+      createdAt: String(r.created_at),
+      updatedAt: String(r.updated_at),
+    }))
+  }
+
   async getAllCheckRuns() {
     const rows = this.stmt(
-      `SELECT node_id, repo_id, head_sha, name, status, conclusion, started_at, completed_at, raw, updated_at
+      `SELECT node_id, repo_id, head_sha, name, status, conclusion, started_at, completed_at, updated_at
        FROM check_runs`,
     ).all()
     return rows.map((r) => ({
@@ -944,7 +1155,6 @@ export class BunSqliteStore {
       conclusion: rstr(r.conclusion),
       startedAt: rstr(r.started_at),
       completedAt: rstr(r.completed_at),
-      raw: String(r.raw),
       updatedAt: String(r.updated_at),
     }))
   }
@@ -988,10 +1198,19 @@ export class BunSqliteStore {
   // --- AI-authorship signal ------------------------------------------------
 
   async upsertAiAuthorship(row) {
+    // Stylometry re-score MUST NOT clobber a recorded session verdict. The four
+    // llm_* columns are owned by the in-session-Claude verdict path
+    // (setAiAuthorshipVerdict) — re-scoring only refreshes the deterministic
+    // ai_score/signals_json/authored_at metadata. Preserve any existing verdict
+    // by selecting the existing column when present, falling back to the new
+    // (typically NULL) row otherwise. Mirrors the COALESCE pattern used for
+    // other on-conflict-preserve columns elsewhere in this store.
     this.stmt(`
       INSERT INTO ai_authorship
-        (entity_type, entity_id, repo_id, author_identity_id, authored_at, ai_score, signals_json, computed_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        (entity_type, entity_id, repo_id, author_identity_id, authored_at,
+         ai_score, signals_json, computed_at,
+         llm_verdict, llm_confidence, llm_reasoning, verdict_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL)
       ON CONFLICT(entity_type, entity_id) DO UPDATE SET
         repo_id            = excluded.repo_id,
         author_identity_id = excluded.author_identity_id,
@@ -1011,17 +1230,79 @@ export class BunSqliteStore {
     )
   }
 
+  /**
+   * Persist an in-session-Claude AI-authorship verdict for one (entity_type,
+   * entity_id). Owned by the verdict pipeline (src/core/ai/authorshipVerdicts.js
+   * + MCP tool `record_ai_authorship_verdict`); never touched by the stylometry
+   * re-score path. Idempotent — re-recording for the same entity overwrites the
+   * prior verdict and bumps verdict_at.
+   */
+  async setAiAuthorshipVerdict({
+    entityType,
+    entityId,
+    llmVerdict,
+    llmConfidence,
+    llmReasoning,
+    verdictAt,
+  }) {
+    const result = this.stmt(`
+      UPDATE ai_authorship
+         SET llm_verdict    = ?,
+             llm_confidence = ?,
+             llm_reasoning  = ?,
+             verdict_at     = ?
+       WHERE entity_type = ? AND entity_id = ?
+    `).run(
+      llmVerdict ? 1 : 0,
+      typeof llmConfidence === 'number' ? llmConfidence : null,
+      llmReasoning ?? null,
+      verdictAt,
+      entityType,
+      entityId,
+    )
+    return result.changes
+  }
+
+  /**
+   * Ambiguous-band ai_authorship rows that still need a session verdict
+   * (verdict_at IS NULL, ai_score BETWEEN loBand AND hiBand). Returns the bare
+   * keys + score; the caller fetches text by id from commits / pull_requests
+   * separately, so no fat columns are loaded here.
+   */
+  async getPendingAiAuthorship({ loBand, hiBand, limit }) {
+    const rows = this.stmt(
+      `SELECT entity_type, entity_id, repo_id, author_identity_id, ai_score
+         FROM ai_authorship
+        WHERE verdict_at IS NULL
+          AND ai_score BETWEEN ? AND ?
+        ORDER BY ai_score DESC
+        LIMIT ?`,
+    ).all(loBand, hiBand, limit)
+    return rows.map((r) => ({
+      entityType: String(r.entity_type),
+      entityId: String(r.entity_id),
+      repoId: String(r.repo_id),
+      authorIdentityId: rstr(r.author_identity_id),
+      aiScore: Number(r.ai_score),
+    }))
+  }
+
   /** (entity_type, entity_id) of every scored row — for incremental skip. */
   async getAiAuthorshipKeys() {
     const rows = this.stmt(`SELECT entity_type, entity_id FROM ai_authorship`).all()
     return rows.map((r) => ({ entityType: String(r.entity_type), entityId: String(r.entity_id) }))
   }
 
-  /** Every AI-authorship row with author + score — for per-person AI-blend metrics. */
+  /**
+   * Every AI-authorship row with author + score + recorded verdict columns.
+   * Consumers prefer `llmVerdict` (when non-null) as the authoritative AI/human
+   * call and fall back to thresholding `aiScore` when no verdict exists.
+   */
   async getAllAiAuthorship() {
     const rows = this.stmt(
-      `SELECT entity_type, entity_id, repo_id, author_identity_id, authored_at, ai_score
-       FROM ai_authorship`,
+      `SELECT entity_type, entity_id, repo_id, author_identity_id, authored_at,
+              ai_score, llm_verdict, llm_confidence, llm_reasoning, verdict_at
+         FROM ai_authorship`,
     ).all()
     return rows.map((r) => ({
       entityType: String(r.entity_type),
@@ -1030,6 +1311,14 @@ export class BunSqliteStore {
       authorIdentityId: rstr(r.author_identity_id),
       authoredAt: rstr(r.authored_at),
       aiScore: Number(r.ai_score),
+      llmVerdict:
+        r.llm_verdict === null || r.llm_verdict === undefined ? null : Number(r.llm_verdict) === 1,
+      llmConfidence:
+        r.llm_confidence === null || r.llm_confidence === undefined
+          ? null
+          : Number(r.llm_confidence),
+      llmReasoning: rstr(r.llm_reasoning),
+      verdictAt: rstr(r.verdict_at),
     }))
   }
 
@@ -1050,16 +1339,32 @@ export class BunSqliteStore {
       `SELECT repo_id, sha, path, language, loc, total_cyclomatic, function_count, functions
        FROM file_complexity`,
     ).all()
-    return rows.map((r) => ({
-      repoId: String(r.repo_id),
-      sha: String(r.sha),
-      path: String(r.path),
-      language: String(r.language),
-      loc: Number(r.loc),
-      totalCyclomatic: Number(r.total_cyclomatic),
-      functionCount: Number(r.function_count),
-      functions: JSON.parse(String(r.functions)),
-    }))
+    // Guard the per-row JSON.parse: a single malformed functions blob (possible
+    // under the full-transparency contract where the DB is directly writable)
+    // must not throw and crash the whole complexity read. Skip the corrupt row
+    // instead — its absence degrades the metric to a smaller sample, which the
+    // sample floors already handle honestly. Matches the getAiVerdictsByMetric
+    // pattern below.
+    const out = []
+    for (const r of rows) {
+      let functions
+      try {
+        functions = JSON.parse(String(r.functions))
+      } catch {
+        continue
+      }
+      out.push({
+        repoId: String(r.repo_id),
+        sha: String(r.sha),
+        path: String(r.path),
+        language: String(r.language),
+        loc: Number(r.loc),
+        totalCyclomatic: Number(r.total_cyclomatic),
+        functionCount: Number(r.function_count),
+        functions,
+      })
+    }
+    return out
   }
 
   /** Every ai_verdict for a (subjectType, metric) — for per-person LLM-verdict metrics. */
@@ -1264,6 +1569,17 @@ export class BunSqliteStore {
        FROM file_complexity WHERE repo_id = ? AND sha = ? AND path = ?`,
     ).get(repoId, sha, path)
     if (!r) return null
+    // Guard the JSON.parse: a malformed functions blob (possible under the
+    // full-transparency contract where the DB is directly writable) must not
+    // throw and crash a single-row complexity read. Return null instead — the
+    // caller already handles the no-row case, so a corrupt row is equivalent
+    // to a missing one for downstream metrics.
+    let functions
+    try {
+      functions = JSON.parse(String(r.functions))
+    } catch {
+      return null
+    }
     return {
       repoId: String(r.repo_id),
       sha: String(r.sha),
@@ -1272,7 +1588,7 @@ export class BunSqliteStore {
       loc: Number(r.loc),
       totalCyclomatic: Number(r.total_cyclomatic),
       functionCount: Number(r.function_count),
-      functions: JSON.parse(String(r.functions)),
+      functions,
       computedAt: String(r.computed_at),
     }
   }
@@ -1352,9 +1668,9 @@ export class BunSqliteStore {
     this.stmt(`
       INSERT INTO issues (id, project_id, key, type, status_id, status_category,
         story_points, story_points_field_id, story_points_raw, parent_id, epic_key,
-        is_subtask, hierarchy_level, assignee_identity_id, created_at, resolved_at,
-        deleted_at, raw, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        is_subtask, hierarchy_level, assignee_identity_id, priority, resolution,
+        created_at, resolved_at, deleted_at, raw, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         key                    = CASE WHEN excluded.updated_at >= issues.updated_at THEN excluded.key                    ELSE issues.key                    END,
         type                   = CASE WHEN excluded.updated_at >= issues.updated_at THEN excluded.type                   ELSE issues.type                   END,
@@ -1368,6 +1684,8 @@ export class BunSqliteStore {
         is_subtask             = CASE WHEN excluded.updated_at >= issues.updated_at THEN excluded.is_subtask             ELSE issues.is_subtask             END,
         hierarchy_level        = CASE WHEN excluded.updated_at >= issues.updated_at THEN excluded.hierarchy_level        ELSE issues.hierarchy_level        END,
         assignee_identity_id   = CASE WHEN excluded.updated_at >= issues.updated_at THEN excluded.assignee_identity_id   ELSE issues.assignee_identity_id   END,
+        priority               = CASE WHEN excluded.updated_at >= issues.updated_at THEN excluded.priority               ELSE issues.priority               END,
+        resolution             = CASE WHEN excluded.updated_at >= issues.updated_at THEN excluded.resolution             ELSE issues.resolution             END,
         resolved_at            = CASE WHEN excluded.updated_at >= issues.updated_at THEN excluded.resolved_at            ELSE issues.resolved_at            END,
         deleted_at             = CASE WHEN excluded.updated_at >= issues.updated_at THEN excluded.deleted_at             ELSE issues.deleted_at             END,
         raw                    = CASE WHEN excluded.updated_at >= issues.updated_at THEN excluded.raw                    ELSE issues.raw                    END,
@@ -1387,6 +1705,8 @@ export class BunSqliteStore {
       b(issue.isSubtask),
       issue.hierarchyLevel,
       issue.assigneeIdentityId,
+      issue.priority ?? null,
+      issue.resolution ?? null,
       issue.createdAt,
       issue.resolvedAt,
       issue.deletedAt,
@@ -1399,8 +1719,8 @@ export class BunSqliteStore {
     const row = this.stmt(
       `SELECT id, project_id, key, type, status_id, status_category, story_points,
               story_points_field_id, story_points_raw, parent_id, epic_key, is_subtask,
-              hierarchy_level, assignee_identity_id, created_at, resolved_at, deleted_at,
-              raw, updated_at
+              hierarchy_level, assignee_identity_id, priority, resolution,
+              created_at, resolved_at, deleted_at, raw, updated_at
        FROM issues WHERE id = ? AND deleted_at IS NULL`,
     ).get(id)
     if (!row) return null
@@ -1422,8 +1742,8 @@ export class BunSqliteStore {
     const rows = this.stmt(
       `SELECT id, project_id, key, type, status_id, status_category, story_points,
               story_points_field_id, story_points_raw, parent_id, epic_key, is_subtask,
-              hierarchy_level, assignee_identity_id, created_at, resolved_at, deleted_at,
-              raw, updated_at
+              hierarchy_level, assignee_identity_id, priority, resolution,
+              created_at, resolved_at, deleted_at, raw, updated_at
        FROM issues WHERE project_id = ? AND deleted_at IS NULL ORDER BY key ASC`,
     ).all(projectId)
     return rows.map((r) => this._rowToIssue(r))
@@ -1434,8 +1754,8 @@ export class BunSqliteStore {
     const rows = this.stmt(
       `SELECT id, project_id, key, type, status_id, status_category, story_points,
               story_points_field_id, story_points_raw, parent_id, epic_key, is_subtask,
-              hierarchy_level, assignee_identity_id, created_at, resolved_at, deleted_at,
-              raw, updated_at
+              hierarchy_level, assignee_identity_id, priority, resolution,
+              created_at, resolved_at, deleted_at, raw, updated_at
        FROM issues WHERE lower(type) = 'incident' AND deleted_at IS NULL ORDER BY created_at ASC`,
     ).all()
     return rows.map((r) => this._rowToIssue(r))
@@ -1457,6 +1777,8 @@ export class BunSqliteStore {
       isSubtask: rb(r.is_subtask),
       hierarchyLevel: Number(r.hierarchy_level),
       assigneeIdentityId: rstr(r.assignee_identity_id),
+      priority: rstr(r.priority),
+      resolution: rstr(r.resolution),
       createdAt: String(r.created_at),
       resolvedAt: rstr(r.resolved_at),
       deletedAt: rstr(r.deleted_at),
@@ -2146,8 +2468,8 @@ export class BunSqliteStore {
       INSERT INTO ai_verdicts
         (id, subject_type, subject_id, metric, prompt_version, model_id, model_snapshot,
          request_shape, feature_vector_json, structured_verdict_json, evidence_json,
-         confidence, created_at, corrected_by, correction_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         confidence, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       verdict.id,
       verdict.subjectType,
@@ -2162,8 +2484,6 @@ export class BunSqliteStore {
       verdict.evidenceJson,
       verdict.confidence,
       verdict.createdAt,
-      verdict.correctedBy,
-      verdict.correctionJson,
     )
   }
 
@@ -2171,19 +2491,11 @@ export class BunSqliteStore {
     const row = this.stmt(
       `SELECT id, subject_type, subject_id, metric, prompt_version, model_id, model_snapshot,
               request_shape, feature_vector_json, structured_verdict_json, evidence_json,
-              confidence, created_at, corrected_by, correction_json
+              confidence, created_at
        FROM ai_verdicts WHERE id = ?`,
     ).get(id)
     if (!row) return null
     return this._rowToAiVerdict(row)
-  }
-
-  async correctAiVerdict(id, correctedBy, correctionJson) {
-    this.stmt(`UPDATE ai_verdicts SET corrected_by = ?, correction_json = ? WHERE id = ?`).run(
-      correctedBy,
-      correctionJson,
-      id,
-    )
   }
 
   /** Remove any verdicts for a (subjectType, subjectId, metric) — for idempotent re-record. */
@@ -2208,8 +2520,6 @@ export class BunSqliteStore {
       evidenceJson: String(r.evidence_json),
       confidence: Number(r.confidence),
       createdAt: String(r.created_at),
-      correctedBy: rstr(r.corrected_by),
-      correctionJson: rstr(r.correction_json),
     }
   }
 

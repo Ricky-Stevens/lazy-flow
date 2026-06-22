@@ -26,7 +26,7 @@
  * All merges are reversible (person_id is nullable, never hard-delete).
  */
 
-import crypto from 'node:crypto'
+import { safeJsonParse } from '../json.js'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -41,16 +41,12 @@ function newId() {
  * GitHub's Users API can return a verified email; noreply addresses are excluded.
  */
 function extractVerifiedEmail(raw) {
-  try {
-    const parsed = JSON.parse(raw)
-    const email = parsed.email
-    if (typeof email !== 'string' || !email.includes('@')) return null
-    // Exclude GitHub noreply addresses
-    if (email.endsWith('@users.noreply.github.com')) return null
-    return email.toLowerCase()
-  } catch {
-    return null
-  }
+  const parsed = safeJsonParse(raw, {})
+  const email = parsed.email
+  if (typeof email !== 'string' || !email.includes('@')) return null
+  // Exclude GitHub noreply addresses
+  if (email.endsWith('@users.noreply.github.com')) return null
+  return email.toLowerCase()
 }
 
 /**
@@ -103,13 +99,9 @@ function namesAreSimilar(a, b) {
  */
 function primaryAccountRef(identity) {
   if (identity.kind === 'github_login') {
-    try {
-      const parsed = JSON.parse(identity.raw)
-      const numericId = parsed.id
-      if (typeof numericId === 'number') return `gh:${numericId}`
-    } catch {
-      // fall through
-    }
+    const parsed = safeJsonParse(identity.raw, {})
+    const numericId = parsed.id
+    if (typeof numericId === 'number') return `gh:${numericId}`
     return `gh:${identity.externalId}`
   }
   if (identity.kind === 'jira_account') {
@@ -210,12 +202,8 @@ export async function stitchPersons(store, options = {}) {
         if (ve) verifiedEmailToPersonId.set(ve, pid)
       }
       if (id.kind === 'jira_account' && pid !== null) {
-        try {
-          const jiraEmail = JSON.parse(id.raw).emailAddress?.toLowerCase()
-          if (jiraEmail) jiraEmailToPersonId.set(jiraEmail, pid)
-        } catch {
-          // ignore malformed raw
-        }
+        const jiraEmail = safeJsonParse(id.raw, {}).emailAddress?.toLowerCase()
+        if (jiraEmail) jiraEmailToPersonId.set(jiraEmail, pid)
       }
       if (id.kind === 'commit_email') {
         const lp = localPart(id.externalId.toLowerCase())
@@ -314,13 +302,9 @@ export async function stitchPersons(store, options = {}) {
 // ---------------------------------------------------------------------------
 
 function nameFromIdentity(identity) {
-  try {
-    const parsed = JSON.parse(identity.raw)
-    const name = parsed.name ?? parsed.displayName ?? parsed.login
-    return name ?? null
-  } catch {
-    return null
-  }
+  const parsed = safeJsonParse(identity.raw, {})
+  const name = parsed.name ?? parsed.displayName ?? parsed.login
+  return name ?? null
 }
 
 async function appendQueueEntry(store, a, b, reason, confidence, now) {

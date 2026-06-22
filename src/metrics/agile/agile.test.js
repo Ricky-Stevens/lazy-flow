@@ -16,6 +16,7 @@ import { baseOrg, IDS } from '../../testkit/index.js'
 import {
   estimationAccuracy,
   isSpearmanSignificant,
+  priorityMix,
   sayDo,
   sprintPredictability,
   sprintVelocity,
@@ -368,5 +369,109 @@ describe('estimationAccuracy', () => {
 
   it('isSpearmanSignificant — weak correlation at small n is not significant', () => {
     expect(isSpearmanSignificant(0.2, 5)).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Priority / Resolution Mix
+// ---------------------------------------------------------------------------
+
+describe('priorityMix', () => {
+  const fromMs = new Date('2024-01-01T00:00:00Z').getTime()
+  const toMs = new Date('2024-12-31T23:59:59Z').getTime()
+
+  function makeIssue(overrides) {
+    return {
+      id: 'issue-x',
+      type: 'Story',
+      createdAt: '2024-06-01T00:00:00Z',
+      resolvedAt: null,
+      priority: null,
+      resolution: null,
+      ...overrides,
+    }
+  }
+
+  it('below the priority sample floor (n<5) → no_data', () => {
+    const issues = [
+      makeIssue({ id: 'i1', priority: 'High' }),
+      makeIssue({ id: 'i2', priority: 'High' }),
+      makeIssue({ id: 'i3', priority: 'Low' }),
+      makeIssue({ id: 'i4', priority: 'Low' }),
+    ]
+    const result = priorityMix.compute({ issues, fromMs, toMs }, AS_OF)
+    expect(result.id).toBe('agile.priority_mix')
+    expect(result.value).toBeNull()
+    expect(result.dataQuality).toBe('no_data')
+    expect(result.priorityMix).toBeNull()
+    expect(result.prioritisedCount).toBe(4)
+  })
+
+  it('mixed priorities + resolutions on bugs → correct distribution', () => {
+    const issues = [
+      // Stories (no resolution mix needed, just for priority)
+      makeIssue({ id: 'i1', type: 'Story', priority: 'High' }),
+      makeIssue({ id: 'i2', type: 'Story', priority: 'High' }),
+      makeIssue({ id: 'i3', type: 'Story', priority: 'Medium' }),
+      // Bugs — resolved in window
+      makeIssue({
+        id: 'b1',
+        type: 'Bug',
+        priority: 'High',
+        resolution: 'Done',
+        resolvedAt: '2024-06-15T00:00:00Z',
+      }),
+      makeIssue({
+        id: 'b2',
+        type: 'Bug',
+        priority: 'Low',
+        resolution: 'Done',
+        resolvedAt: '2024-06-16T00:00:00Z',
+      }),
+      makeIssue({
+        id: 'b3',
+        type: 'Bug',
+        priority: 'Low',
+        resolution: "Won't Do",
+        resolvedAt: '2024-06-17T00:00:00Z',
+      }),
+    ]
+    const result = priorityMix.compute({ issues, fromMs, toMs }, AS_OF)
+    expect(result.dataQuality).toBe('ok')
+    expect(result.totalInWindow).toBe(6)
+    expect(result.prioritisedCount).toBe(6)
+    expect(result.value).toBeCloseTo(1.0, 5) // all 6 issues have priority
+    // Priority mix: 3 High, 1 Medium, 2 Low
+    expect(result.priorityMix.High.count).toBe(3)
+    expect(result.priorityMix.High.share).toBeCloseTo(0.5, 5)
+    expect(result.priorityMix.Medium.count).toBe(1)
+    expect(result.priorityMix.Low.count).toBe(2)
+    // Bug resolution mix: 2 Done, 1 Won't Do (3 resolved bugs → above floor)
+    expect(result.resolvedBugCount).toBe(3)
+    expect(result.bugResolutionMix.Done.count).toBe(2)
+    expect(result.bugResolutionMix["Won't Do"].count).toBe(1)
+  })
+
+  it('fewer than 3 resolved bugs → bugResolutionMix null but headline still ok', () => {
+    const issues = [
+      makeIssue({ id: 'i1', priority: 'High' }),
+      makeIssue({ id: 'i2', priority: 'High' }),
+      makeIssue({ id: 'i3', priority: 'High' }),
+      makeIssue({ id: 'i4', priority: 'Medium' }),
+      makeIssue({ id: 'i5', priority: 'Low' }),
+      // Only one resolved bug — below the resolution sample floor
+      makeIssue({
+        id: 'b1',
+        type: 'Bug',
+        priority: 'High',
+        resolution: 'Done',
+        resolvedAt: '2024-06-15T00:00:00Z',
+      }),
+    ]
+    const result = priorityMix.compute({ issues, fromMs, toMs }, AS_OF)
+    expect(result.dataQuality).toBe('ok')
+    expect(result.bugResolutionMix).toBeNull()
+    expect(result.resolvedBugCount).toBe(1)
+    expect(result.priorityMix).not.toBeNull()
   })
 })

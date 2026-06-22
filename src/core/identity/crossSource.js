@@ -30,7 +30,7 @@
  * residual is a deliberate follow-up; this pass is fully deterministic.
  */
 
-import crypto from 'node:crypto'
+import { safeJsonParse } from '../json.js'
 
 // Fusion thresholds. Behavioural `share` = co-occurrences with this Jira person /
 // total co-occurrences for the GitHub person; `count` = absolute co-occurrences.
@@ -56,11 +56,7 @@ function newId() {
 }
 
 function parseRaw(raw) {
-  try {
-    return JSON.parse(raw)
-  } catch {
-    return {}
-  }
+  return safeJsonParse(raw, {})
 }
 
 /** Split a string into lowercase alphanumeric name tokens. */
@@ -239,7 +235,7 @@ export async function stitchCrossSource(store, options = {}) {
       }
     }
     const behavShare = total > 0 ? behavCount / total : 0
-    const behavIsJiraTarget = behavJp && behavJp.hasJira && !behavJp.hasGithub
+    const behavIsJiraTarget = behavJp?.hasJira && !behavJp.hasGithub
     const behavName = behavIsJiraTarget && nameMatches(g.nameTokens, [...behavJp.nameTokens])
 
     // 2. Name + corroborating behaviour → auto-merge.

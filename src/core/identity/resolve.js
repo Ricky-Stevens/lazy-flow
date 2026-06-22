@@ -1,3 +1,4 @@
+import { safeJsonParse } from '../json.js'
 import { isGitHubBot, isJiraBot } from './bot.js'
 
 // ---------------------------------------------------------------------------
@@ -14,11 +15,7 @@ export function buildIdentityId(kind, externalId) {
 // ---------------------------------------------------------------------------
 
 function parseRawJson(raw) {
-  try {
-    return JSON.parse(raw)
-  } catch {
-    return {}
-  }
+  return safeJsonParse(raw, {})
 }
 
 /** Account info extracted for a GitHub login. */
@@ -283,43 +280,40 @@ function extractActorMapFromIssueRaw(raw) {
     if (list) list.push(info)
     else map.set(at, [info])
   }
-  try {
-    const parsed = JSON.parse(raw)
+  const parsed = safeJsonParse(raw, null)
+  if (parsed === null) return map
 
-    // Prefer the clean, pre-scrub structured refs when present.
-    const actors = identityRefs(parsed)?.actors
-    if (actors && actors.length > 0) {
-      for (const a of actors) {
-        if (a.at && a.accountId) {
-          push(a.at, {
-            accountId: a.accountId,
-            displayName: a.displayName,
-            emailAddress: a.emailAddress,
-          })
-        }
+  // Prefer the clean, pre-scrub structured refs when present.
+  const actors = identityRefs(parsed)?.actors
+  if (actors && actors.length > 0) {
+    for (const a of actors) {
+      if (a.at && a.accountId) {
+        push(a.at, {
+          accountId: a.accountId,
+          displayName: a.displayName,
+          emailAddress: a.emailAddress,
+        })
       }
-      return map
     }
+    return map
+  }
 
-    const changelog = parsed.changelog
-    const histories = changelog?.histories
-    if (!histories) return map
+  const changelog = parsed.changelog
+  const histories = changelog?.histories
+  if (!histories) return map
 
-    for (const history of histories) {
-      const created = history.created
-      if (!created) continue
-      const author = history.author
-      if (!author) continue
-      const accountId = author.accountId
-      if (!accountId) continue
-      push(created, {
-        accountId,
-        displayName: author.displayName,
-        emailAddress: author.emailAddress,
-      })
-    }
-  } catch {
-    // Ignore malformed raw payloads
+  for (const history of histories) {
+    const created = history.created
+    if (!created) continue
+    const author = history.author
+    if (!author) continue
+    const accountId = author.accountId
+    if (!accountId) continue
+    push(created, {
+      accountId,
+      displayName: author.displayName,
+      emailAddress: author.emailAddress,
+    })
   }
   return map
 }

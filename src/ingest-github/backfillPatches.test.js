@@ -164,6 +164,88 @@ describe('backfillPrPatches (GraphQL blob-diff, no REST)', () => {
   })
 })
 
+describe('backfillPrPatches — no-repoId multi-repo guard', () => {
+  it('throws a clear error when patch-less files span multiple repos and repoId is omitted', async () => {
+    const store = freshStore()
+    await seed(store) // seeds repo-1 with one patch-less file
+
+    // Add a second repo with another patch-less file so the guard fires.
+    await store.upsertRepository({
+      id: 'repo-2',
+      githubNodeId: 'n2',
+      orgId: 'org-1',
+      owner: 'acme',
+      name: 'other',
+      defaultBranch: 'main',
+      isArchived: false,
+      isFork: false,
+      deletedAt: null,
+      raw: '{}',
+      createdAt: NOW,
+      updatedAt: NOW,
+    })
+    await store.upsertPullRequest({
+      id: 'pr-2',
+      repoId: 'repo-2',
+      number: 2,
+      authorIdentityId: 'id-1',
+      state: 'merged',
+      headRef: 'feat',
+      baseRef: 'main',
+      isDraft: false,
+      mergedViaQueue: false,
+      createdAt: NOW,
+      readyAt: NOW,
+      firstCommitAt: NOW,
+      firstReviewAt: null,
+      approvedAt: null,
+      mergedAt: NOW,
+      mergedByIdentityId: 'id-1',
+      deletedAt: null,
+      raw: '{}',
+      updatedAt: NOW,
+    })
+    await store.upsertPrRef({
+      prId: 'pr-2',
+      repoId: 'repo-2',
+      baseSha: 'base2',
+      headSha: 'head2',
+      updatedAt: NOW,
+    })
+    await store.upsertPrFile({
+      prId: 'pr-2',
+      repoId: 'repo-2',
+      path: 'src/y.ts',
+      additions: 1,
+      deletions: 0,
+      haloc: 1,
+      patch: null,
+      createdAt: NOW,
+      updatedAt: NOW,
+    })
+
+    const client = stubClient(new Map())
+    await expect(
+      backfillPrPatches(store, client, { owner: 'acme', name: 'app' /* no repoId */ }),
+    ).rejects.toThrow(/2 repos/)
+  })
+
+  it('succeeds when only one repo has patch-less files and repoId is omitted', async () => {
+    const store = freshStore()
+    await seed(store) // single repo, single patch-less file
+
+    const client = stubClient(
+      new Map([
+        ['base1:src/x.ts', 'a\nb\n'],
+        ['head1:src/x.ts', 'a\nB\n'],
+      ]),
+    )
+    // No repoId — single-repo path should still work.
+    const res = await backfillPrPatches(store, client, { owner: 'acme', name: 'app' })
+    expect(res.backfilled).toBe(1)
+  })
+})
+
 describe('backfillAllPatches drain mode', () => {
   let store
   beforeEach(async () => {

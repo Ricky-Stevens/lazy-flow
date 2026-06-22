@@ -142,7 +142,6 @@ describe('migrate', () => {
       'sprint_membership_events',
       'sprints',
       'status_category_history',
-      'survey_responses',
       'sync_state',
       'team_membership',
       'teams',
@@ -419,7 +418,6 @@ describe('pull_requests', () => {
     expect(got?.number).toBe(42)
     expect(got?.headRef).toBe('feature/foo')
     expect(got?.isDraft).toBe(false)
-    expect(got?.mergedViaQueue).toBe(false)
   })
 
   it('soft-delete excludes PR from reads', async () => {
@@ -549,7 +547,6 @@ describe('pr_files', () => {
     expect(f?.additions).toBe(5)
     expect(f?.deletions).toBe(2)
     expect(f?.haloc).toBe(5)
-    expect(f?.status).toBe('modified')
     expect(f?.patch).toBe('@@ -1 +1,5 @@\n+a\n+b')
   })
 
@@ -1194,7 +1191,7 @@ describe('sync_state', () => {
 // ---------------------------------------------------------------------------
 
 describe('ai_verdicts', () => {
-  it('round-trips a verdict and applies a correction', async () => {
+  it('round-trips a verdict', async () => {
     const { store } = migratedStore()
 
     await store.insertAiVerdict({
@@ -1211,19 +1208,11 @@ describe('ai_verdicts', () => {
       evidenceJson: '[]',
       confidence: 0.85,
       createdAt: T1,
-      correctedBy: null,
-      correctionJson: null,
     })
 
-    const before = await store.getAiVerdict('verdict-1')
-    expect(before?.confidence).toBe(0.85)
-    expect(before?.correctedBy).toBeNull()
-
-    await store.correctAiVerdict('verdict-1', 'human-alice', '{"ordinal": 2}')
-
-    const after = await store.getAiVerdict('verdict-1')
-    expect(after?.correctedBy).toBe('human-alice')
-    expect(after?.correctionJson).toBe('{"ordinal": 2}')
+    const got = await store.getAiVerdict('verdict-1')
+    expect(got?.confidence).toBe(0.85)
+    expect(got?.structuredVerdictJson).toBe('{"ordinal": 3}')
   })
 })
 

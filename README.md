@@ -37,7 +37,7 @@ build step and the test suite uses Bun's native test runner.
 {
   "extraKnownMarketplaces": {
     "lazy-flow": {
-      "source": { "source": "github", "repo": "ORG/lazy-flow" }
+      "source": { "source": "github", "repo": "Ricky-Stevens/lazy-flow" }
     }
   },
   "enabledPlugins": {
@@ -91,6 +91,7 @@ recommendations), each verdict carrying its confidence basis.
 | `/lazy-flow:bus-factor` | "Where's our key-person risk?" — ownership/bus-factor map |
 | `/lazy-flow:onboarding-health` | "How are newer contributors ramping?" |
 | `/lazy-flow:verdicts` | Run the in-session LLM verdict pipeline (qualitative metrics) |
+| `/lazy-flow:ai-authorship` | Adjudicate the ambiguous-band AI-vs-human authorship verdicts |
 
 ### Agents (dispatchable subagents)
 
@@ -128,7 +129,7 @@ Add to your org's managed Claude Code settings:
   "strictKnownMarketplaces": true,
   "extraKnownMarketplaces": {
     "lazy-flow": {
-      "source": { "source": "github", "repo": "ORG/lazy-flow" }
+      "source": { "source": "github", "repo": "Ricky-Stevens/lazy-flow" }
     }
   }
 }

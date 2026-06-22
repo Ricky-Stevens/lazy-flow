@@ -50,7 +50,7 @@ export const agingWip = {
 
       const currentStatusId =
         transitions.length > 0
-          ? (transitions[transitions.length - 1]?.toStatusId ?? issue.currentStatusId)
+          ? (transitions.at(-1)?.toStatusId ?? issue.currentStatusId)
           : issue.currentStatusId
 
       // Only include issues in WIP (started, not done)

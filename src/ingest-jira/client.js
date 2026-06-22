@@ -204,8 +204,6 @@ export class JiraClient {
         'resolutiondate',
         'assignee',
         'parent',
-        'labels',
-        'components',
         'priority',
         'resolution',
       ],

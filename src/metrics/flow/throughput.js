@@ -21,13 +21,12 @@ export const throughput = {
     const reopenedInWindowIds = []
 
     for (const issue of inputs.issues) {
-      const transitions = [...issue.transitions].sort(
+      const transitions = issue.transitions.toSorted(
         (a, b) => new Date(a.transitionedAt).getTime() - new Date(b.transitionedAt).getTime(),
       )
 
       // Find the FIRST Done transition within the window.
       let firstDoneInWindowAt = null
-      let completionCountInWindow = 0
       let reopenCountInWindow = 0
 
       for (const t of transitions) {
@@ -35,7 +34,6 @@ export const throughput = {
         if (tMs < windowStartMs || tMs > windowEndMs) continue
 
         if (inputs.doneStatusIds.has(t.toStatusId)) {
-          completionCountInWindow++
           if (firstDoneInWindowAt === null) {
             firstDoneInWindowAt = tMs
           }

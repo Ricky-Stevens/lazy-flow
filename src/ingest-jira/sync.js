@@ -187,8 +187,6 @@ export async function syncJira(store, client, scope, mode, now = new Date().toIS
         'resolutiondate',
         'assignee',
         'parent',
-        'labels',
-        'components',
         'priority',
         'resolution',
       ]
@@ -518,6 +516,12 @@ function mapRawIssue(raw, projectId, storyPointFieldId, epicLinkFieldId, statusC
   // when the field is absent (e.g. the test mock omits it).
   const updatedAt = fields.updated ?? now
 
+  // Priority / resolution are lifted out of raw.fields so the agile severity/
+  // resolution-mix metric can read them without re-parsing raw. Both default
+  // to null when Jira returns no value (unprioritised / unresolved).
+  const priority = fields.priority?.name ?? null
+  const resolution = fields.resolution?.name ?? null
+
   return {
     id: raw.id,
     projectId,
@@ -533,6 +537,8 @@ function mapRawIssue(raw, projectId, storyPointFieldId, epicLinkFieldId, statusC
     isSubtask,
     hierarchyLevel,
     assigneeIdentityId: assigneeId,
+    priority,
+    resolution,
     createdAt,
     resolvedAt,
     deletedAt: null,

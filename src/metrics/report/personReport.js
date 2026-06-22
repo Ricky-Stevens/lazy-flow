@@ -13,8 +13,14 @@
  * `preloaded` dataset), so a report is a handful of loads, not N×metrics loads.
  */
 
-import { classifyDrift, summarize } from '../../report/baseline/stats.js'
-import { comparePersonToCohort, MIN_COHORT, selectHumanCohort } from '../person/index.js'
+import { summarize } from '../../report/baseline/stats.js'
+import {
+  comparePersonToCohort,
+  MIN_COHORT,
+  momentumVsTeam,
+  selectHumanCohort,
+  selfBaselineDrift,
+} from '../person/index.js'
 import { assertNotRankingList } from '../visibility/index.js'
 
 /**
@@ -69,13 +75,19 @@ export const REPORT_METRICS = [
   { id: 'person.review_depth_mentorship', polarity: 0, question: 'Differentiator' },
 ]
 
-/** Metrics worth a self-baseline trend read (cheap scalars with a clear trajectory). */
+/**
+ * Metrics worth a self-baseline trend read (cheap scalars with a clear trajectory).
+ * `polarity` orients momentum_vs_team: +1 higher-better, -1 lower-better, 0
+ * descriptive (no orientation → momentum_vs_team is reported with the unsigned
+ * difference and is interpreted descriptively). Sourced FROM REPORT_METRICS so the
+ * two surfaces never disagree on whether a metric is higher- or lower-better.
+ */
 export const TREND_METRICS = [
-  'person.ci_green_before_merge_rate',
-  'pr.review_coverage',
-  'person.complexity_authored_delta',
-  'person.bugfix_share',
-  'pr.review_bypass_rate_received',
+  { id: 'person.ci_green_before_merge_rate', polarity: 1 },
+  { id: 'pr.review_coverage', polarity: 1 },
+  { id: 'person.complexity_authored_delta', polarity: 0 },
+  { id: 'person.bugfix_share', polarity: 0 },
+  { id: 'pr.review_bypass_rate_received', polarity: -1 },
 ]
 
 const DAY = 86_400_000
@@ -202,6 +214,7 @@ export async function computePersonReport(store, personId, opts, deps) {
     toDay,
     now,
     deps,
+    cohort,
   )
 
   return {
@@ -227,9 +240,19 @@ export async function computePersonReport(store, personId, opts, deps) {
 
 /**
  * On-demand self-baseline drift: split the window into trailing weekly buckets,
- * use all-but-last as the baseline distribution, classify the latest bucket.
- * Needs no pre-backfilled snapshots.
+ * use all-but-last as the baseline distribution, classify the latest bucket via
+ * the registered `selfBaselineDrift` module. For each metric we ALSO compute the
+ * team's weekly series over the same buckets and run `momentumVsTeam` to produce
+ * a difference-in-differences signal (is the person's trajectory out-pacing /
+ * tracking / lagging the team's?). Needs no pre-backfilled snapshots.
+ *
+ * Drift floor: the report carries a minN of 2 baseline points (series.length ≥ 3
+ * → "establishing" otherwise). That's intentionally below the module's default
+ * MIN_N of 5 — the trend is only ever 2–13 buckets, so the module floor would
+ * leave it permanently establishing.
  */
+const TREND_MIN_BASELINE_N = 2
+
 async function computeSelfTrend(
   store,
   personId,
@@ -239,6 +262,7 @@ async function computeSelfTrend(
   toDay,
   now,
   deps,
+  cohort,
 ) {
   const out = []
   const startMs = Date.parse(fromDay)
@@ -250,7 +274,14 @@ async function computeSelfTrend(
   // ALL trend metrics off that single slice (weeks-outer / metrics-inner). Was: a
   // full DB bulk-load per (metric × week) — up to 65 — reloading the same week 5×.
   const full = await deps.loadFullScopeData(store)
-  const seriesByMetric = new Map(TREND_METRICS.map((m) => [m, []]))
+  // Drop the team-momentum pass entirely when the cohort is below the peer-
+  // comparison floor: with a single (or near-single) person, the "team" series is
+  // structurally the same as the person's and the difference-in-differences is
+  // mathematically degenerate. The momentum line in `out` is omitted in that case.
+  const cohortViable = (cohort?.length ?? 0) - 1 >= MIN_COHORT
+  const personSeriesByMetric = new Map(TREND_METRICS.map((m) => [m.id, []]))
+  const teamSeriesByMetric = cohortViable ? new Map(TREND_METRICS.map((m) => [m.id, []])) : null
+
   for (let w = 0; w < weeks; w++) {
     const wTo = dayStr(endMs - w * 7 * DAY)
     const wFrom = dayStr(endMs - (w + 1) * 7 * DAY + DAY)
@@ -261,7 +292,7 @@ async function computeSelfTrend(
     // Reuse the window-independent extras (built once for the whole report) so the
     // big tables are NOT re-scanned per week — only per-week check-runs/issues.
     weekData.__sharedPersonExtras = sharedExtras
-    for (const metricId of TREND_METRICS) {
+    for (const { id: metricId } of TREND_METRICS) {
       const r = await deps.computeMetric(
         store,
         'person',
@@ -272,26 +303,101 @@ async function computeSelfTrend(
         now,
         weekData,
       )
-      if (r.value !== null && Number.isFinite(r.value)) seriesByMetric.get(metricId).push(r.value)
+      if (r.value !== null && Number.isFinite(r.value)) {
+        personSeriesByMetric.get(metricId).push(r.value)
+      }
+      // Team-scope value for the same metric / same window — built off the SAME
+      // preloaded weekData so no extra DB load. team-only/no-data results are
+      // skipped (the team series stays empty → momentum reports no_data).
+      if (teamSeriesByMetric) {
+        const t = await deps.computeMetric(
+          store,
+          'team',
+          'team',
+          metricId,
+          wFrom,
+          wTo,
+          now,
+          weekData,
+        )
+        if (t.value !== null && Number.isFinite(t.value)) {
+          teamSeriesByMetric.get(metricId).push(t.value)
+        }
+      }
     }
   }
 
-  for (const metricId of TREND_METRICS) {
-    const series = seriesByMetric.get(metricId) // index 0 = most recent week
-    if (series.length < 3) {
-      out.push({ metric: metricId, driftStatus: 'establishing', driftZ: null, n: series.length })
-      continue
+  for (const { id: metricId, polarity } of TREND_METRICS) {
+    const series = personSeriesByMetric.get(metricId) // index 0 = most recent week
+    // Drive the drift read through the registered module so the path documented
+    // by `explain_metric` (person.self_baseline_drift) is exactly the path that
+    // executes. Module returns `establishing` below the baseline floor; the
+    // report's existing contract — `driftStatus: 'establishing'`, `driftZ: null`,
+    // `n: series.length` when the series is too short — is preserved verbatim.
+    // selfBaselineDrift's "establishing" path needs a non-null current sample to
+    // emit (otherwise it returns no_data). The report's contract is that a series
+    // below the floor reads 'establishing' regardless of whether the latest week
+    // produced a sample, so default to 0 for the establishing classification when
+    // the current sample is missing — purely to drive the module past its
+    // no_data gate; the row carries no derived `value` in that case.
+    const baseline = series.length >= 2 ? summarize(series.slice(1)) : null
+    const currentForModule = series.length > 0 ? series[0] : 0
+    const drift = selfBaselineDrift.compute(
+      {
+        currentP50: currentForModule,
+        baseline,
+        baselineN: baseline?.n ?? 0,
+        minN: TREND_MIN_BASELINE_N,
+      },
+      now,
+    )
+    const baseRow = {
+      metric: metricId,
+      driftStatus: drift.driftStatus,
+      driftZ: drift.driftZ,
+      n: series.length,
     }
-    const current = series[0]
-    const baseline = summarize(series.slice(1))
-    const { driftZ, driftStatus } = classifyDrift(current, baseline)
+    if (drift.dataQuality === 'ok') {
+      baseRow.current = series[0]
+      baseRow.baselineP50 = baseline?.p50 ?? null
+    }
+    out.push(baseRow)
+
+    // Momentum vs team (difference-in-differences): compare the person's drift-z
+    // against the team's drift-z over the SAME weekly windows. Skipped entirely
+    // when the cohort is below the peer-comparison floor (a 1-person "team" is
+    // not a meaningful reference) and surfaced as no_data when either series is
+    // too short to derive a drift-z.
+    if (!teamSeriesByMetric) continue
+    const teamSeries = teamSeriesByMetric.get(metricId)
+    const teamBaseline = teamSeries.length >= 2 ? summarize(teamSeries.slice(1)) : null
+    const teamDrift = selfBaselineDrift.compute(
+      {
+        currentP50: teamSeries.length > 0 ? teamSeries[0] : null,
+        baseline: teamBaseline,
+        baselineN: teamBaseline?.n ?? 0,
+        minN: TREND_MIN_BASELINE_N,
+      },
+      now,
+    )
+    const momentum = momentumVsTeam.compute(
+      {
+        personDriftZ: drift.driftZ,
+        teamDriftZ: teamDrift.driftZ,
+        polarity,
+      },
+      now,
+    )
     out.push({
       metric: metricId,
-      driftStatus,
-      driftZ,
-      current,
-      baselineP50: baseline.p50,
-      n: series.length,
+      kind: 'momentum_vs_team',
+      value: momentum.value,
+      dataQuality: momentum.dataQuality,
+      interpretation: momentum.interpretation,
+      personDriftZ: momentum.personDriftZ,
+      teamDriftZ: momentum.teamDriftZ,
+      personN: series.length,
+      teamN: teamSeries.length,
     })
   }
   return out

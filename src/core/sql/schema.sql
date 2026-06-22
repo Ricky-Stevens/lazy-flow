@@ -25,9 +25,7 @@ CREATE TABLE ai_verdicts (
   structured_verdict_json TEXT NOT NULL,
   evidence_json           TEXT NOT NULL,
   confidence              REAL NOT NULL,
-  created_at              TEXT NOT NULL,
-  corrected_by            TEXT,
-  correction_json         TEXT
+  created_at              TEXT NOT NULL
 );
 
 -- Per-change AI-authorship signal (tool-agnostic stylometry + markers + agent author).
@@ -40,6 +38,10 @@ CREATE TABLE ai_authorship (
   ai_score           REAL NOT NULL,
   signals_json       TEXT NOT NULL,
   computed_at        TEXT NOT NULL,
+  llm_verdict        INTEGER,
+  llm_confidence     REAL,
+  llm_reasoning      TEXT,
+  verdict_at         TEXT,
   PRIMARY KEY (entity_type, entity_id)
 );
 CREATE INDEX idx_ai_authorship_repo ON ai_authorship(repo_id, authored_at);
@@ -95,7 +97,6 @@ CREATE TABLE check_runs (
   conclusion   TEXT,
   started_at   TEXT,
   completed_at TEXT,
-  raw          TEXT NOT NULL,
   updated_at   TEXT NOT NULL
 );
 
@@ -114,7 +115,6 @@ CREATE TABLE commits (
   sha                 TEXT    NOT NULL,
   author_identity_id  TEXT    NOT NULL REFERENCES identities(id),
   authored_at         TEXT    NOT NULL,
-  committed_at        TEXT    NOT NULL,
   additions           INTEGER NOT NULL DEFAULT 0,
   deletions           INTEGER NOT NULL DEFAULT 0,
   haloc               INTEGER NOT NULL DEFAULT 0,
@@ -214,6 +214,8 @@ CREATE TABLE issues (
   is_subtask             INTEGER NOT NULL DEFAULT 0,
   hierarchy_level        INTEGER NOT NULL DEFAULT 1,
   assignee_identity_id   TEXT    REFERENCES identities(id),
+  priority               TEXT,
+  resolution             TEXT,
   created_at             TEXT    NOT NULL,
   resolved_at            TEXT,
   deleted_at             TEXT,
@@ -297,16 +299,16 @@ CREATE TABLE persons (
 );
 
 CREATE TABLE pr_files (
-  pr_id      TEXT NOT NULL REFERENCES pull_requests(id) ON DELETE CASCADE,
-  repo_id    TEXT NOT NULL,
-  path       TEXT NOT NULL,
-  additions  INTEGER NOT NULL DEFAULT 0,
-  deletions  INTEGER NOT NULL DEFAULT 0,
-  haloc      INTEGER NOT NULL DEFAULT 0,
-  status     TEXT NOT NULL,
-  patch      TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
+  pr_id        TEXT NOT NULL REFERENCES pull_requests(id) ON DELETE CASCADE,
+  repo_id      TEXT NOT NULL,
+  path         TEXT NOT NULL,
+  additions    INTEGER NOT NULL DEFAULT 0,
+  deletions    INTEGER NOT NULL DEFAULT 0,
+  haloc        INTEGER NOT NULL DEFAULT 0,
+  patch        TEXT,
+  is_generated INTEGER NOT NULL DEFAULT 0,
+  created_at   TEXT NOT NULL,
+  updated_at   TEXT NOT NULL,
   PRIMARY KEY (pr_id, path)
 );
 
@@ -335,12 +337,10 @@ CREATE TABLE pull_requests (
   head_ref              TEXT    NOT NULL,
   base_ref              TEXT    NOT NULL,
   is_draft              INTEGER NOT NULL DEFAULT 0,
-  merged_via_queue      INTEGER NOT NULL DEFAULT 0,
   created_at            TEXT    NOT NULL,
   ready_at              TEXT,
   first_commit_at       TEXT,
   first_review_at       TEXT,
-  approved_at           TEXT,
   merged_at             TEXT,
   merged_by_identity_id TEXT    REFERENCES identities(id),
   deleted_at            TEXT,
@@ -415,17 +415,6 @@ CREATE TABLE status_category_history (
   valid_from  TEXT NOT NULL,
   valid_to    TEXT,
   PRIMARY KEY (status_id, valid_from)
-);
-
-CREATE TABLE survey_responses (
-  id                   TEXT NOT NULL PRIMARY KEY,
-  person_id            TEXT REFERENCES persons(id),
-  team_id              TEXT NOT NULL REFERENCES teams(id),
-  instrument_id        TEXT NOT NULL,
-  instrument_version   TEXT NOT NULL,
-  -- Per-question scores stored as a JSON object: { [questionId]: 1-5 }
-  scores_json          TEXT NOT NULL,
-  submitted_at         TEXT NOT NULL
 );
 
 CREATE TABLE sync_state (
@@ -511,12 +500,6 @@ CREATE INDEX idx_reviews_pr_id ON reviews(pr_id);
 CREATE INDEX idx_sprint_membership_issue ON sprint_membership_events(issue_id);
 CREATE INDEX idx_sprint_membership_sprint ON sprint_membership_events(sprint_id);
 CREATE INDEX idx_sprints_board_id ON sprints(board_id);
-CREATE INDEX idx_survey_responses_instrument
-  ON survey_responses(instrument_id, instrument_version);
-CREATE INDEX idx_survey_responses_person
-  ON survey_responses(person_id) WHERE person_id IS NOT NULL;
-CREATE INDEX idx_survey_responses_team
-  ON survey_responses(team_id, submitted_at);
 CREATE INDEX idx_team_membership_person ON team_membership(person_id);
 CREATE UNIQUE INDEX uq_sprint_membership_event
   ON sprint_membership_events(sprint_id, issue_id, change, transitioned_at);

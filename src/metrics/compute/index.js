@@ -1,6 +1,12 @@
 import { ENGINE_VERSION, isProductionEnv, percentile } from '../../core/index.js'
 
-import { estimationAccuracy, sayDo, sprintPredictability, sprintVelocity } from '../agile/index.js'
+import {
+  estimationAccuracy,
+  priorityMix,
+  sayDo,
+  sprintPredictability,
+  sprintVelocity,
+} from '../agile/index.js'
 import {
   detectDeployInflation,
   detectStatusJuggling,
@@ -144,6 +150,7 @@ export const COMPUTE_METRIC_IDS = [
   'agile.sprint_velocity',
   'agile.sprint_predictability',
   'agile.estimation_accuracy',
+  'agile.priority_mix',
   // Code (Group D). haloc_aggregate / nagappan_ball / change_impact compute from
   // ingested pr_files diffs. complexity_delta + maintainability_index compute from
   // per-PR whole-file ASTs (file_complexity, ingested via tree-sitter). rework_churn
@@ -251,8 +258,8 @@ async function resolveOrgId(store) {
  *   2. maintainability_index       — same pair, per PR×file×day
  *   3. buildStatusBoundaries       — getStatusCategory per status × metric × day
  *
- * Attached to BOTH `loadFullScopeData` and `loadScopeDataWindowed` so the
- * equivalence oracle continues to compute identical values.
+ * Attached to BOTH `loadFullScopeData` and the testkit `loadScopeDataWindowed`
+ * oracle so the equivalence test continues to compute identical values.
  */
 // Per-store memo: window-INDEPENDENT global lookups don't change between window
 // slices in a backfill or between the cohort load and trend load of a person
@@ -262,7 +269,18 @@ async function resolveOrgId(store) {
 // or use a fresh store; we attach the promise (not the value) so concurrent
 // callers de-dupe instead of racing duplicate scans.
 const GLOBAL_LOOKUPS_MEMO = new WeakMap()
-async function loadGlobalLookups(store) {
+// Per-store memo for the full scope dataset itself. A single tool call (e.g.
+// `get_person_report`, which builds the cohort window AND a 13-week trend over
+// the same store) used to call `loadFullScopeData` twice — once for cohort,
+// once for trend — re-reading every bulk table. The memo keys on the store
+// (WeakMap) so test stores GC normally; `invalidateLookupsCache(store)` clears
+// it alongside the global lookups so a post-sync recompute always reads fresh
+// state. The memo splits the patch-bearing vs patch-less variants so a code-
+// metric request can't return a stale patch-less dataset to a caller that
+// asked for patches (and vice versa).
+const FULL_SCOPE_MEMO = new WeakMap()
+
+export async function loadGlobalLookups(store) {
   let p = GLOBAL_LOOKUPS_MEMO.get(store)
   if (!p) {
     p = (async () => {
@@ -297,38 +315,60 @@ async function loadGlobalLookups(store) {
 }
 
 /**
- * Drop the per-store memo for window-independent lookups. Call after a sync
- * (writes that mutate pr_refs / file_complexity / status_category_history)
- * so the next compute reads the fresh state. Cheap — just a WeakMap delete.
+ * Drop the per-store memo for window-independent lookups AND the full-scope
+ * dataset memo. Call after a sync (writes that mutate any ingested entity) so
+ * the next compute reads fresh state. Cheap — just two WeakMap deletes.
  */
 export function invalidateLookupsCache(store) {
   GLOBAL_LOOKUPS_MEMO.delete(store)
+  FULL_SCOPE_MEMO.delete(store)
+}
+
+/**
+ * Metric ids whose compute path re-parses `pr_files.patch` (the unified diff
+ * text) rather than reading the denormalised additions/deletions/haloc/is_generated
+ * columns. Currently only `code.haloc_aggregate`, which calls `buildCodeChanges`
+ * to reconstruct each file's diff and re-runs `computeHaloc` on it. Every other
+ * metric — including the rest of the code.* family — reads the denormalised
+ * columns, so the loader can skip the fat patch column for them.
+ */
+const PATCH_BEARING_METRICS = new Set(['code.haloc_aggregate'])
+
+/** True iff any of `metricIds` requires `pr_files.patch` to be loaded. */
+export function metricSetNeedsPatch(metricIds) {
+  if (!metricIds) return false
+  for (const id of metricIds) if (PATCH_BEARING_METRICS.has(id)) return true
+  return false
 }
 
 /**
  * Load all the team/org-scoped entities for the window, once.
  * Window applies to PRs (createdAt), deploys (createdAt), commits (authoredAt),
  * check runs (completedAt/startedAt). Issues + transitions are loaded whole.
+ *
+ * `opts.needsPatch` — when truthy, load the patch-bearing variant of pr_files
+ * (the GraphQL-synthesised unified diffs `code.haloc_aggregate` re-parses). By
+ * default, the metric path loads the patch-less variant — the patch column is
+ * the largest in the DB and only ONE metric reads it, so materialising it on
+ * every `get_*` tool / cohort load was the single largest source of wasted
+ * memory in the engine.
  */
-export async function loadScopeData(store, windowFrom, windowTo) {
+export async function loadScopeData(store, windowFrom, windowTo, opts = {}) {
   // Single code path for on-demand (get_* tools) AND backfill: bulk-load the whole
   // dataset once, then slice the window in memory. The backfill passes the loaded
   // full dataset across all days/metrics via computeMetric's `preloaded` arg, so it
   // only pays the bulk load once per run rather than per (metric, day).
-  return sliceScopeData(await loadFullScopeData(store), windowFrom, windowTo)
+  return sliceScopeData(await loadFullScopeData(store, opts), windowFrom, windowTo)
 }
 
 /** Group an array into a Map keyed by `keyFn`, preserving input order within each
  * bucket (callers rely on the bulk getters' ORDER BY to order each bucket). */
 function groupBy(rows, keyFn) {
-  const m = new Map()
-  for (const row of rows) {
-    const k = keyFn(row)
-    const arr = m.get(k)
-    if (arr) arr.push(row)
-    else m.set(k, [row])
-  }
-  return m
+  // Map.groupBy preserves the input order WITHIN each group bucket (Map iteration
+  // order = first-insertion order), so the bulk getters' ORDER BY contract is
+  // preserved. Keeping the helper as a thin wrapper for a single point-of-change
+  // if future call sites want a different bucketing.
+  return Map.groupBy(rows, keyFn)
 }
 
 /**
@@ -336,84 +376,120 @@ function groupBy(rows, keyFn) {
  * by repo / parent id so any window can be sliced with `sliceScopeData` as pure
  * CPU (no further I/O). Window-independent and scope-independent — load it once
  * per backfill and reuse across every day and both the team and org scopes.
+ *
+ * Memoised per-store + per-variant (`needsPatch` true / false) so a single
+ * `computePersonReport` (cohort window load + 13-week trend full-load) or a
+ * `get_*` tool bundle pays the bulk-load cost ONCE. The memo holds the
+ * in-flight promise so concurrent callers de-dupe instead of racing duplicate
+ * scans; `invalidateLookupsCache(store)` (called by `backfillSnapshots` and the
+ * post-sync recompute) clears it so freshly-ingested rows are seen on the next
+ * call. Two slots — patch-bearing vs patch-less — so a code-metric request
+ * never receives a stale patch-less dataset that was cached for a non-code path
+ * (and vice versa).
  */
-export async function loadFullScopeData(store) {
-  const orgId = await resolveOrgId(store)
-  const repos = orgId ? await store.getRepositoriesByOrg(orgId) : []
-  const repoIds = new Set(repos.map((r) => r.id))
-
-  const allIdentities = await store.listAllIdentities()
-  const botIdentityIds = new Set(allIdentities.filter((i) => i.isBot).map((i) => i.id))
-
-  // One bulk query per table; group by repo/parent, scoped to the org's repos.
-  // The getters' ORDER BY preserves the same ordering the per-scope getters used.
-  const prsByRepo = new Map()
-  for (const pr of await store.getAllPullRequests()) {
-    if (!repoIds.has(pr.repoId)) continue
-    const arr = prsByRepo.get(pr.repoId)
-    if (arr) arr.push(pr)
-    else prsByRepo.set(pr.repoId, [pr])
+export async function loadFullScopeData(store, opts = {}) {
+  const needsPatch = opts.needsPatch === true
+  let slot = FULL_SCOPE_MEMO.get(store)
+  if (!slot) {
+    slot = { withPatch: null, metaOnly: null }
+    FULL_SCOPE_MEMO.set(store, slot)
   }
+  const key = needsPatch ? 'withPatch' : 'metaOnly'
+  if (slot[key]) return slot[key]
 
-  const reviewsByPr = groupBy(await store.getAllReviews(), (r) => r.prId)
-  const commentsByPr = groupBy(await store.getAllReviewComments(), (c) => c.prId)
-  const filesByPr = groupBy(await store.getAllPrFiles(), (f) => f.prId)
+  const promise = (async () => {
+    const orgId = await resolveOrgId(store)
+    const repos = orgId ? await store.getRepositoriesByOrg(orgId) : []
+    const repoIds = new Set(repos.map((r) => r.id))
 
-  const deploysByRepo = new Map()
-  for (const d of await store.getAllDeployments()) {
-    if (!repoIds.has(d.repoId)) continue
-    const arr = deploysByRepo.get(d.repoId)
-    if (arr) arr.push(d)
-    else deploysByRepo.set(d.repoId, [d])
-  }
+    const allIdentities = await store.listAllIdentities()
+    const botIdentityIds = new Set(allIdentities.filter((i) => i.isBot).map((i) => i.id))
 
-  const commitsByRepo = new Map()
-  for (const c of await store.getAllCommits()) {
-    if (!repoIds.has(c.repoId)) continue
-    const arr = commitsByRepo.get(c.repoId)
-    if (arr) arr.push(c)
-    else commitsByRepo.set(c.repoId, [c])
-  }
+    // One bulk query per table; group by repo/parent, scoped to the org's repos.
+    // The getters' ORDER BY preserves the same ordering the per-scope getters used.
+    // Compute path uses the *Meta variants (no `raw`/`patch`) by default — the fat
+    // columns are read ONLY by the verdict / AI-authorship / link callers, which
+    // go through separate code paths. `needsPatch: true` opts in to the
+    // patch-bearing pr_files variant for `code.haloc_aggregate` (the one metric
+    // that re-parses unified diffs).
+    const prsByRepo = new Map()
+    for (const pr of await store.getAllPullRequestsMeta()) {
+      if (!repoIds.has(pr.repoId)) continue
+      const arr = prsByRepo.get(pr.repoId)
+      if (arr) arr.push(pr)
+      else prsByRepo.set(pr.repoId, [pr])
+    }
 
-  const checkRunsByRepo = new Map()
-  for (const cr of await store.getAllCheckRuns()) {
-    if (!repoIds.has(cr.repoId)) continue
-    const arr = checkRunsByRepo.get(cr.repoId)
-    if (arr) arr.push(cr)
-    else checkRunsByRepo.set(cr.repoId, [cr])
-  }
+    const reviewsByPr = groupBy(await store.getAllReviewsMeta(), (r) => r.prId)
+    const commentsByPr = groupBy(await store.getAllReviewCommentsMeta(), (c) => c.prId)
+    const filesByPr = groupBy(
+      needsPatch ? await store.getAllPrFiles() : await store.getAllPrFilesMeta(),
+      (f) => f.prId,
+    )
 
-  // Issues per project (few projects — NOT an N+1 over issues); transitions bulk.
-  const projects = await store.listJiraProjects()
-  const issuesByProject = new Map()
-  for (const project of projects) {
-    issuesByProject.set(project.id, await store.getIssuesByProject(project.id))
-  }
-  const transitionsByIssue = groupBy(await store.getAllIssueTransitions(), (t) => t.issueId)
+    const deploysByRepo = new Map()
+    for (const d of await store.getAllDeploymentsMeta()) {
+      if (!repoIds.has(d.repoId)) continue
+      const arr = deploysByRepo.get(d.repoId)
+      if (arr) arr.push(d)
+      else deploysByRepo.set(d.repoId, [d])
+    }
 
-  // Window-INDEPENDENT global lookups (pr_refs, file_complexity, status
-  // category-by-id). Attached to the scope data so per-metric code can read
-  // them as in-memory maps instead of point-querying inside per-PR/per-file
-  // loops on every day of the backfill.
-  const lookups = await loadGlobalLookups(store)
+    const commitsByRepo = new Map()
+    for (const c of await store.getAllCommitsMeta()) {
+      if (!repoIds.has(c.repoId)) continue
+      const arr = commitsByRepo.get(c.repoId)
+      if (arr) arr.push(c)
+      else commitsByRepo.set(c.repoId, [c])
+    }
 
-  return {
-    repos,
-    prsByRepo,
-    reviewsByPr,
-    commentsByPr,
-    filesByPr,
-    deploysByRepo,
-    commitsByRepo,
-    checkRunsByRepo,
-    projectIds: projects.map((p) => p.id),
-    issuesByProject,
-    transitionsByIssue,
-    botIdentityIds,
-    prRefById: lookups.prRefById,
-    fileComplexityByKey: lookups.fileComplexityByKey,
-    statusCategoryById: lookups.statusCategoryById,
-  }
+    const checkRunsByRepo = new Map()
+    for (const cr of await store.getAllCheckRuns()) {
+      if (!repoIds.has(cr.repoId)) continue
+      const arr = checkRunsByRepo.get(cr.repoId)
+      if (arr) arr.push(cr)
+      else checkRunsByRepo.set(cr.repoId, [cr])
+    }
+
+    // Issues per project (few projects — NOT an N+1 over issues); transitions bulk.
+    const projects = await store.listJiraProjects()
+    const issuesByProject = new Map()
+    for (const project of projects) {
+      issuesByProject.set(project.id, await store.getIssuesByProject(project.id))
+    }
+    const transitionsByIssue = groupBy(await store.getAllIssueTransitions(), (t) => t.issueId)
+
+    // Window-INDEPENDENT global lookups (pr_refs, file_complexity, status
+    // category-by-id). Attached to the scope data so per-metric code can read
+    // them as in-memory maps instead of point-querying inside per-PR/per-file
+    // loops on every day of the backfill.
+    const lookups = await loadGlobalLookups(store)
+
+    return {
+      repos,
+      prsByRepo,
+      reviewsByPr,
+      commentsByPr,
+      filesByPr,
+      deploysByRepo,
+      commitsByRepo,
+      checkRunsByRepo,
+      projectIds: projects.map((p) => p.id),
+      issuesByProject,
+      transitionsByIssue,
+      botIdentityIds,
+      prRefById: lookups.prRefById,
+      fileComplexityByKey: lookups.fileComplexityByKey,
+      statusCategoryById: lookups.statusCategoryById,
+    }
+  })()
+  slot[key] = promise
+  // If the load throws, drop the rejected promise so the next caller retries
+  // instead of cementing the failure into the memo.
+  promise.catch(() => {
+    if (slot[key] === promise) slot[key] = null
+  })
+  return promise
 }
 
 /**
@@ -421,7 +497,7 @@ export async function loadFullScopeData(store) {
  * metric computations consume. Every predicate mirrors the corresponding store
  * getter's SQL EXACTLY (string compares on the same ISO bounds; numeric inWindow
  * for check runs) so the result is equivalent to the old per-window SQL load —
- * see loadScopeDataWindowed and its equivalence test.
+ * see `src/testkit/loadScopeDataWindowed.js` (oracle) and the equivalence test.
  */
 export function sliceScopeData(full, windowFrom, windowTo) {
   const fromMs = dayStartMs(windowFrom)
@@ -534,118 +610,10 @@ export function sliceScopeData(full, windowFrom, windowTo) {
   }
 }
 
-/**
- * REFERENCE IMPLEMENTATION (oracle): the original per-window SQL loader, kept as
- * the correctness oracle for `loadFullScopeData`+`sliceScopeData`. The equivalence
- * test asserts the in-memory slice yields identical metric values for every metric
- * over a range of windows. Not used on the hot path (it carries the per-PR /
- * per-issue N+1 the bulk loader eliminates).
- */
-export async function loadScopeDataWindowed(store, windowFrom, windowTo) {
-  const fromMs = dayStartMs(windowFrom)
-  const toMs = dayEndMs(windowTo)
-  const fromIso = dayStartIso(windowFrom)
-  const toIso = dayEndIso(windowTo)
-
-  const orgId = await resolveOrgId(store)
-  const repos = orgId ? await store.getRepositoriesByOrg(orgId) : []
-
-  const allIdentities = await store.listAllIdentities()
-  const botIdentityIds = new Set(allIdentities.filter((i) => i.isBot).map((i) => i.id))
-
-  const prs = []
-  const deploys = []
-  const commits = []
-  const checkRuns = []
-  const reviewsByPr = new Map()
-  const reviewCommentsByPr = new Map()
-  const prFilesByPr = new Map()
-  let priorHaloc = 0
-
-  for (const repo of repos) {
-    const repoPrs = await store.getPullRequestsForMetrics(repo.id, fromIso, toIso)
-    for (const pr of repoPrs) {
-      prs.push(pr)
-      reviewsByPr.set(pr.id, await store.getReviewsByPullRequest(pr.id))
-      reviewCommentsByPr.set(pr.id, await store.getReviewCommentsByPullRequest(pr.id))
-    }
-
-    const repoPrFiles = await store.getPrFilesByRepo(repo.id, fromIso, toIso)
-    for (const f of repoPrFiles) {
-      const arr = prFilesByPr.get(f.prId)
-      if (arr) arr.push(f)
-      else prFilesByPr.set(f.prId, [f])
-    }
-
-    const priorUntilIso = new Date(fromMs - 1).toISOString()
-    const repoPriorFiles = await store.getPrFilesByRepo(repo.id, undefined, priorUntilIso)
-    // Filter generated/vendored files to match the window numerator's filter
-    // (totalWindowHaloc) — see the parallel loop above for why.
-    for (const f of repoPriorFiles) {
-      if (f.isGenerated) continue
-      priorHaloc += f.haloc
-    }
-
-    deploys.push(...(await store.getDeploymentsByRepo(repo.id, fromIso, toIso)))
-
-    const repoCommits = await store.getCommitsByRepo(repo.id, fromIso, toIso)
-    for (const c of repoCommits) {
-      commits.push({ repoId: c.repoId, sha: c.sha, authoredAt: c.authoredAt })
-    }
-
-    const repoChecks = await store.getCheckRunsByRepo(repo.id)
-    for (const cr of repoChecks) {
-      const stamp = cr.completedAt ?? cr.startedAt
-      if (!inWindow(stamp, fromMs, toMs)) continue
-      checkRuns.push({
-        nodeId: cr.nodeId,
-        repoId: cr.repoId,
-        headSha: cr.headSha,
-        name: cr.name,
-        status: cr.status,
-        conclusion: cr.conclusion,
-        startedAt: cr.startedAt,
-        completedAt: cr.completedAt,
-      })
-    }
-  }
-
-  const projects = await store.listJiraProjects()
-  const issues = []
-  const transitionsByIssue = new Map()
-  for (const project of projects) {
-    const projectIssues = await store.getIssuesByProject(project.id)
-    for (const issue of projectIssues) {
-      if (issue.deletedAt !== null) continue
-      issues.push(issue)
-      transitionsByIssue.set(issue.id, await store.getIssueTransitions(issue.id))
-    }
-  }
-
-  // Window-INDEPENDENT global lookups — attached here too so the oracle path
-  // (computeMetric called with `preloaded = await loadScopeDataWindowed(...)`)
-  // computes identical values to the bulk slice path. The equivalence test
-  // depends on this.
-  const lookups = await loadGlobalLookups(store)
-
-  return {
-    prs,
-    reviewsByPr,
-    reviewCommentsByPr,
-    deploys,
-    commits,
-    checkRuns,
-    issues,
-    transitionsByIssue,
-    projectIds: projects.map((p) => p.id),
-    botIdentityIds,
-    prFilesByPr,
-    priorHaloc,
-    prRefById: lookups.prRefById,
-    fileComplexityByKey: lookups.fileComplexityByKey,
-    statusCategoryById: lookups.statusCategoryById,
-  }
-}
+// NOTE: the per-window SQL oracle (`loadScopeDataWindowed`) that this slice was
+// proven equivalent to lives in `src/testkit/loadScopeDataWindowed.js` — it has
+// no production caller and is kept solely as the correctness baseline for the
+// equivalence test (`compute.test.js`).
 
 // ---------------------------------------------------------------------------
 // Projection helpers
@@ -687,7 +655,6 @@ function toPrInput(pr, files) {
     createdAt: pr.createdAt,
     readyAt: pr.readyAt,
     firstReviewAt: pr.firstReviewAt,
-    approvedAt: pr.approvedAt,
     mergedAt: pr.mergedAt,
     updatedAt: pr.updatedAt,
     additions,
@@ -778,6 +745,18 @@ function toFlowIssueRecord(issue, transitions) {
  * This is the documented fallback when board config is absent (SPEC §8.2).
  */
 async function buildStatusBoundaries(store, data) {
+  // The result depends ONLY on `data` (issue list + transitions + the
+  // window-INDEPENDENT statusCategoryById map). Every flow/DORA metric case
+  // calls this — ~13 invocations at team scope plus the person flow path —
+  // each one rescanning every issue and transition and emitting fresh Sets.
+  // Memoise on the `data` instance: sliceScopeData produces a fresh `data` per
+  // request, so the cache lifetime is correct (no cross-request leakage). The
+  // returned object is treated as read-only by every caller; the per-metric
+  // codepaths spread `{ doneIds, startedIds, boardColumns }` and never mutate
+  // the sets — verified by `grep '\.add('` over the call sites — so sharing
+  // one instance across calls is safe.
+  if (data.__statusBoundaries) return data.__statusBoundaries
+
   const statusIds = new Set()
   for (const issue of data.issues) {
     statusIds.add(issue.statusId)
@@ -807,12 +786,14 @@ async function buildStatusBoundaries(store, data) {
     { statusIds: [...startedIds], isStartedCol: true, isDoneCol: false },
     { statusIds: [...doneIds], isStartedCol: false, isDoneCol: true },
   ]
-  return { boardColumns, startedIds, doneIds }
+  const result = { boardColumns, startedIds, doneIds }
+  data.__statusBoundaries = result
+  return result
 }
 
 /** Whether `issue` has its first Done transition within [fromMs, toMs]. */
 function firstDoneInWindow(issue, doneStatusIds, fromMs, toMs) {
-  const sorted = [...issue.transitions].sort(
+  const sorted = issue.transitions.toSorted(
     (a, b) => new Date(a.transitionedAt).getTime() - new Date(b.transitionedAt).getTime(),
   )
   for (const t of sorted) {
@@ -830,7 +811,7 @@ function firstDoneInWindow(issue, doneStatusIds, fromMs, toMs) {
  * on its first completion only.
  */
 function firstDoneAtMs(issue, doneStatusIds) {
-  const sorted = [...issue.transitions].sort(
+  const sorted = issue.transitions.toSorted(
     (a, b) => new Date(a.transitionedAt).getTime() - new Date(b.transitionedAt).getTime(),
   )
   for (const t of sorted) {
@@ -900,8 +881,7 @@ function countOpenWip(issues, startedStatusIds, doneStatusIds, asOfMs) {
     const sorted = [...issue.transitions]
       .filter((t) => new Date(t.transitionedAt).getTime() <= asOfMs)
       .sort((a, b) => new Date(a.transitionedAt).getTime() - new Date(b.transitionedAt).getTime())
-    const currentStatusId =
-      sorted.length > 0 ? sorted[sorted.length - 1].toStatusId : issue.currentStatusId
+    const currentStatusId = sorted.length > 0 ? sorted.at(-1).toStatusId : issue.currentStatusId
     if (startedStatusIds.has(currentStatusId) && !doneStatusIds.has(currentStatusId)) count++
   }
   return count
@@ -981,7 +961,7 @@ function deployDataSource(deploys) {
  * incident.
  */
 function resolutionTrace(issue, transitions, doneStatusIds) {
-  const sorted = [...transitions].sort(
+  const sorted = transitions.toSorted(
     (a, b) => new Date(a.transitionedAt).getTime() - new Date(b.transitionedAt).getTime(),
   )
 
@@ -1035,7 +1015,7 @@ function resolutionTrace(issue, transitions, doneStatusIds) {
  */
 function buildIncidents(issues, transitionsByIssue, doneStatusIds, prodDeploys, fromMs, toMs) {
   // Deploys sorted oldest→newest so we can pick the most recent preceding one.
-  const sortedDeploys = [...prodDeploys].sort(
+  const sortedDeploys = prodDeploys.toSorted(
     (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
   )
 
@@ -1215,12 +1195,34 @@ function buildCodeChanges(data) {
   for (const pr of data.prs) {
     const files = data.prFilesByPr.get(pr.id)
     if (!files || files.length === 0) continue
-    const diff = files.map((f) => reconstructFileDiff(f.path, f.patch)).join('')
+    // Split each PR's files: those whose patch is ingested get a precise per-hunk
+    // recompute (via the reconstructed diff); those still awaiting backfill fall
+    // back to the denormalised per-file HALOC set at ingest (max(add,del)), bucketed
+    // by the stored is_generated flag. GitHub's GraphQL files connection carries no
+    // patch text, so without this hybrid the metric either zeroed every file (no
+    // backfill) or — under partial backfill — discarded the precise patches entirely.
+    const patchedDiffs = []
+    let fbHaloc = 0
+    let fbGeneratedHaloc = 0
+    let patchedCount = 0
+    for (const f of files) {
+      if (typeof f.patch === 'string' && f.patch.length > 0) {
+        patchedDiffs.push(reconstructFileDiff(f.path, f.patch))
+        patchedCount++
+      } else if (f.isGenerated) {
+        fbGeneratedHaloc += f.haloc
+      } else {
+        fbHaloc += f.haloc
+      }
+    }
     changes.push({
       id: pr.id,
       author: pr.authorIdentityId,
       changedAt: pr.createdAt,
-      diff,
+      diff: patchedDiffs.join(''),
+      fallback: { haloc: fbHaloc, binaryHaloc: 0, generatedHaloc: fbGeneratedHaloc },
+      patchedCount,
+      fileCount: files.length,
       filePaths: files.map((f) => f.path),
     })
   }
@@ -1283,6 +1285,7 @@ const MODULES = {
   'agile.sprint_velocity': sprintVelocity,
   'agile.sprint_predictability': sprintPredictability,
   'agile.estimation_accuracy': estimationAccuracy,
+  'agile.priority_mix': priorityMix,
   'code.haloc_aggregate': halocAggregate,
   'code.nagappan_ball': nagappanBall,
   'code.change_impact': codeChangeImpact,
@@ -1402,6 +1405,25 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
   const fromMs = dayStartMs(windowFrom)
   const toMs = dayEndMs(windowTo)
   const winDays = windowDays(windowFrom, windowTo)
+
+  // Hoisted once per computeRaw call: toPrInput and allReviewInputs are pure,
+  // and the loaded `data` is the same for every case in this switch, so the
+  // many cases below would otherwise recompute the same shapes 9–11× per call.
+  // Both helpers walk every PR / every review respectively, so this is a real
+  // cost at scale (≥10k PRs per multi-repo team window). Lazy so the cases
+  // that need neither (DORA/agile) pay nothing.
+  let _prInputs
+  const prInputs = () => {
+    if (_prInputs === undefined) {
+      _prInputs = data.prs.map((pr) => toPrInput(pr, data.prFilesByPr.get(pr.id)))
+    }
+    return _prInputs
+  }
+  let _reviewInputs
+  const reviewInputs = () => {
+    if (_reviewInputs === undefined) _reviewInputs = allReviewInputs(data)
+    return _reviewInputs
+  }
 
   switch (metricId) {
     // --- DORA -------------------------------------------------------------
@@ -1726,7 +1748,7 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
     case 'pr.cycle_time':
       return prCycleTime.compute(
         {
-          prs: data.prs.map((pr) => toPrInput(pr, data.prFilesByPr.get(pr.id))),
+          prs: prInputs(),
           deploys: data.deploys.map(toDeployInput),
         },
         now,
@@ -1735,29 +1757,20 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
     case 'pr.review_latency':
       return reviewLatency.compute(
         {
-          prs: data.prs.map((pr) => toPrInput(pr, data.prFilesByPr.get(pr.id))),
-          reviews: allReviewInputs(data),
+          prs: prInputs(),
+          reviews: reviewInputs(),
         },
         now,
       )
 
     case 'pr.time_to_first_review':
-      return timeToFirstReview.compute(
-        { prs: data.prs.map((pr) => toPrInput(pr, data.prFilesByPr.get(pr.id))) },
-        now,
-      )
+      return timeToFirstReview.compute({ prs: prInputs() }, now)
 
     case 'pr.time_to_merge':
-      return timeToMerge.compute(
-        { prs: data.prs.map((pr) => toPrInput(pr, data.prFilesByPr.get(pr.id))) },
-        now,
-      )
+      return timeToMerge.compute({ prs: prInputs() }, now)
 
     case 'pr.size':
-      return prSize.compute(
-        { prs: data.prs.map((pr) => toPrInput(pr, data.prFilesByPr.get(pr.id))) },
-        now,
-      )
+      return prSize.compute({ prs: prInputs() }, now)
 
     case 'pr.ci_health':
       return ciHealth.compute({ checkRuns: data.checkRuns }, now)
@@ -1772,7 +1785,7 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
             createdAt: pr.createdAt,
             updatedAt: pr.updatedAt,
           })),
-          reviews: allReviewInputs(data),
+          reviews: reviewInputs(),
           reviewComments: allReviewCommentInputs(data),
         },
         now,
@@ -1781,8 +1794,8 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
     case 'pr.reviewer_load_gini':
       return reviewerLoad.compute(
         {
-          prs: data.prs.map((pr) => toPrInput(pr, data.prFilesByPr.get(pr.id))),
-          reviews: allReviewInputs(data),
+          prs: prInputs(),
+          reviews: reviewInputs(),
           reviewComments: [],
           botIdentityIds: data.botIdentityIds,
         },
@@ -1792,8 +1805,8 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
     case 'pr.merge_without_review_rate':
       return mergeWithoutReviewRate.compute(
         {
-          prs: data.prs.map((pr) => toPrInput(pr, data.prFilesByPr.get(pr.id))),
-          reviews: allReviewInputs(data),
+          prs: prInputs(),
+          reviews: reviewInputs(),
           reviewComments: [],
           botIdentityIds: data.botIdentityIds,
         },
@@ -1804,8 +1817,8 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
       // Merged PRs with ≥1 non-author human review / total merged PRs.
       return reviewCoverage.compute(
         {
-          prs: data.prs.map((pr) => toPrInput(pr, data.prFilesByPr.get(pr.id))),
-          reviews: allReviewInputs(data),
+          prs: prInputs(),
+          reviews: reviewInputs(),
           reviewComments: [],
           botIdentityIds: data.botIdentityIds,
         },
@@ -1816,8 +1829,8 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
       // Mean unique non-author, non-bot reviewers per merged PR.
       return reviewersPerPr.compute(
         {
-          prs: data.prs.map((pr) => toPrInput(pr, data.prFilesByPr.get(pr.id))),
-          reviews: allReviewInputs(data),
+          prs: prInputs(),
+          reviews: reviewInputs(),
           reviewComments: [],
           botIdentityIds: data.botIdentityIds,
         },
@@ -1828,8 +1841,8 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
       // Mean review comments per merged PR — uses the REAL ingested comments.
       return commentsPerPr.compute(
         {
-          prs: data.prs.map((pr) => toPrInput(pr, data.prFilesByPr.get(pr.id))),
-          reviews: allReviewInputs(data),
+          prs: prInputs(),
+          reviews: reviewInputs(),
           reviewComments: allReviewCommentInputs(data),
           botIdentityIds: data.botIdentityIds,
         },
@@ -1840,8 +1853,8 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
       // Mean changes_requested rounds (each followed by a later review) per merged PR.
       return reviewIterations.compute(
         {
-          prs: data.prs.map((pr) => toPrInput(pr, data.prFilesByPr.get(pr.id))),
-          reviews: allReviewInputs(data),
+          prs: prInputs(),
+          reviews: reviewInputs(),
           reviewComments: [],
           botIdentityIds: data.botIdentityIds,
         },
@@ -1968,39 +1981,21 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
     case 'agile.estimation_accuracy':
       return estimationAccuracy.compute({ pairs: buildEstimationPairs(data, fromMs, toMs) }, now)
 
+    case 'agile.priority_mix':
+      return priorityMix.compute({ issues: data.issues, fromMs, toMs }, now)
+
     // --- Code (Group D) ----------------------------------------------------
     case 'code.haloc_aggregate': {
-      // REAL: recomputes HALOC over the ingested per-PR diffs. Returns no_data
-      // inside the module when no pr_files were ingested for the window.
+      // REAL: per-file HYBRID HALOC. Files whose patch has been backfilled are
+      // recomputed precisely per-hunk; files still awaiting backfill use the
+      // denormalised per-file HALOC (max(add,del)) set at ingest. So the value is
+      // correct at ANY backfill coverage — never zero on GraphQL-ingested data, and
+      // already-backfilled patches are counted precisely rather than discarded.
+      // The module reports `halocSource` (recomputed_from_patch | hybrid… |
+      // denormalized_prfile_column) and `patchCoverage` for transparency. Returns
+      // no_data inside the module when no pr_files were ingested for the window.
       const changes = buildCodeChanges(data)
-      const result = halocAggregate.compute({ changes }, now)
-      // GraphQL ingestion stores per-file HALOC in the denormalised column but
-      // leaves pr_files.patch NULL, so the diff-recompute above only sees the
-      // files whose patch has been backfilled. The denormalised column is the
-      // authoritative, ALWAYS-complete source (set for every file at ingest, and
-      // upgraded to the patch-derived value when a file is later backfilled), so
-      // the recompute total can never legitimately EXCEED it — it equals the
-      // denorm total only once every file in the window has a patch.
-      //
-      // Therefore: whenever the recompute is incomplete (totalHaloc < denorm),
-      // use the complete denorm total. This covers BOTH the 0%-backfilled case
-      // (recompute 0) AND — critically — the PARTIALLY-backfilled case the
-      // post-sync auto-backfill creates, where a non-zero-but-undercounted
-      // recompute would otherwise be reported at "ok" quality (a silent
-      // undercount). The precise per-hunk recompute is only trusted when it has
-      // seen the whole window (totalHaloc === denorm). `halocSource` records the
-      // path for transparency.
-      const denormHaloc = totalWindowHaloc(data)
-      if (denormHaloc > 0 && result.totalHaloc < denormHaloc) {
-        return {
-          ...result,
-          value: denormHaloc,
-          totalHaloc: denormHaloc,
-          avgHalocPerChange: result.changeCount > 0 ? denormHaloc / result.changeCount : null,
-          halocSource: 'denormalized_prfile_column',
-        }
-      }
-      return { ...result, halocSource: 'recomputed_from_patch' }
+      return halocAggregate.compute({ changes }, now)
     }
 
     case 'code.nagappan_ball': {
@@ -2630,7 +2625,16 @@ async function computePersonRaw(store, metricId, windowFrom, windowTo, now, data
       const ex = await loadPersonExtras(store, data)
       const aiScores = []
       for (const id of identityIds) {
-        for (const a of ex.aiByIdentity.get(id) ?? []) aiScores.push(a.aiScore)
+        for (const a of ex.aiByIdentity.get(id) ?? []) {
+          // Prefer the in-session-Claude verdict (authoritative AI/human call)
+          // when present; collapse to 1 / 0 so aiBlend and pctAiHeavy reflect
+          // the verdict instead of the deterministic ai_score. Without a
+          // verdict, the stylometry score stands — preserving prior behaviour
+          // for every entity that has not yet been judged.
+          if (a.llmVerdict === true) aiScores.push(1)
+          else if (a.llmVerdict === false) aiScores.push(0)
+          else aiScores.push(a.aiScore)
+        }
       }
       return aiBlendCoupling.compute(
         buildAiBlendInputs(
@@ -2876,6 +2880,8 @@ export async function computeMetric(
   // per-person-meaningful subset; team-only metrics stay no_data. No gaming pass
   // runs — a private self-view is advisory, not a ranking to game.
   if (scopeType === 'person' || scopeType === 'self') {
+    // Person scope never computes patch-bearing metrics (code.haloc_aggregate is
+    // team-only via PERSON_SUPPORTED_METRICS), so a metaOnly load is always safe.
     const personData = preloaded ?? (await loadScopeData(store, windowFrom, windowTo))
     // Resolve the person's identity ids ONCE per (data, person), memoised on the
     // data object. A caller computing M metrics for the same person — or one that
@@ -2890,7 +2896,13 @@ export async function computeMetric(
   // scope — so a caller computing many metrics for the same window (e.g. the
   // snapshot backfill: 39 metrics × 2 scopes per day) can load it ONCE and pass it
   // in via `preloaded`, instead of re-reading the whole scope dataset per metric.
-  const data = preloaded ?? (await loadScopeData(store, windowFrom, windowTo))
+  // When no preloaded set is supplied, opt into the patch-bearing variant for
+  // metrics that re-parse the unified diff (currently just code.haloc_aggregate).
+  const data =
+    preloaded ??
+    (await loadScopeData(store, windowFrom, windowTo, {
+      needsPatch: PATCH_BEARING_METRICS.has(metricId),
+    }))
   const result = await computeRaw(store, scopeType, metricId, windowFrom, windowTo, now, data)
 
   // Goodhart caution for pin-target-sensitive metrics (independent of data).
@@ -2954,8 +2966,13 @@ export async function backfillSnapshots(store, opts) {
   // N+1). Every day's window is then sliced from it in memory (pure CPU, no I/O),
   // and each day's snapshots are bulk-inserted. This replaces what was ~16M
   // queries (9,360 (metric,day) × ~1,700 reads each) with ~10 reads + chunked
-  // writes.
-  const full = await loadFullScopeData(store)
+  // writes. Opt into the fat-patch pr_files variant only when this backfill
+  // includes a metric that re-parses unified diffs (code.haloc_aggregate); every
+  // other metric reads the denormalised columns and the patch text is the
+  // single largest column in the DB.
+  const full = await loadFullScopeData(store, {
+    needsPatch: metricSetNeedsPatch(opts.metricIds),
+  })
 
   for (const day of days) {
     const windowFrom = shiftDay(day, -(window - 1))

@@ -284,7 +284,6 @@ describe('PR stage timestamps', () => {
     const pr = await store.getPullRequest(`${SYNCED_REPO_ALPHA}-pr-2`)
     expect(pr).not.toBeNull()
     expect(pr?.firstReviewAt).toBeNull()
-    expect(pr?.approvedAt).toBeNull()
   })
 
   it('pr-3 is a draft with state open', async () => {

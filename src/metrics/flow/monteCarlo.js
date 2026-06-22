@@ -58,7 +58,7 @@ export const monteCarlo = {
     // CANONICAL SORTED sample order (SPEC §8.6 — reproducible). Throughput is a
     // non-negative count; a negative weekly sample (corrupt ingest) would let
     // `completed` move backwards and inflate the forecast, so clamp at 0.
-    const sortedSamples = [...inputs.weeklySamples].map((s) => Math.max(0, s)).sort((a, b) => a - b)
+    const sortedSamples = inputs.weeklySamples.map((s) => Math.max(0, s)).toSorted((a, b) => a - b)
     const n = sortedSamples.length
 
     // A history of all-zero (or non-positive) throughput cannot complete any

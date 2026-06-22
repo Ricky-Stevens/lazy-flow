@@ -197,7 +197,7 @@ const REPO_PULL_REQUESTS_QUERY = /* graphql */ `
           }
           files(first: 100) {
             pageInfo { hasNextPage endCursor }
-            nodes { path additions deletions changeType }
+            nodes { path additions deletions }
           }
           headChecks: commits(last: 1) {
             nodes {
@@ -288,7 +288,7 @@ const PR_CONNECTIONS_QUERY = /* graphql */ `
         }
         files(first: 100, after: $filesAfter) {
           pageInfo { hasNextPage endCursor }
-          nodes { path additions deletions changeType }
+          nodes { path additions deletions }
         }
       }
     }
@@ -360,7 +360,7 @@ function adaptCommitNode(node) {
 /** Adapt a GraphQL pull-request node into the REST-ish shapes writePr consumes:
  * `rawPr` (PR metadata), `reviews`, `comments`, `files`, `headChecks`, plus
  * `__overflow` flags so the caller can REST-paginate any connection that
- * exceeded its inline page. GraphQL enums (state, review state, changeType) are
+ * exceeded its inline page. GraphQL enums (state, review state) are
  * preserved/lower-cased to match what the REST mappers expect. */
 // Field mappers shared by adaptPrNode and the overflow continuation.
 const adaptReviewNode = (r) => ({
@@ -389,7 +389,6 @@ const adaptFileNode = (f) => ({
   filename: f.path,
   additions: f.additions ?? 0,
   deletions: f.deletions ?? 0,
-  status: f.changeType ? String(f.changeType).toLowerCase() : 'modified',
   // GraphQL exposes no per-file patch — mapPrFile falls back to max(add,del).
 })
 

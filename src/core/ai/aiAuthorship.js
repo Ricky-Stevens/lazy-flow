@@ -23,6 +23,8 @@
  */
 
 /** Known AI agent / assistant bot logins (overridable via options.aiBotLogins). */
+import { safeJsonParse } from '../json.js'
+
 export const DEFAULT_AI_BOT_LOGINS = [
   'copilot',
   'github-copilot[bot]',
@@ -99,11 +101,7 @@ export function scoreAiText(text, opts = {}) {
 }
 
 function parse(raw) {
-  try {
-    return JSON.parse(raw)
-  } catch {
-    return {}
-  }
+  return safeJsonParse(raw, {})
 }
 
 function commitMessage(raw) {

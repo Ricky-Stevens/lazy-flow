@@ -237,7 +237,7 @@ export function detectTrivialPrSplitting(prs, opts = {}) {
     if (tinyPrs.length < minPrs) continue
 
     // Sort by createdAt
-    const sorted = [...tinyPrs].sort(
+    const sorted = tinyPrs.toSorted(
       (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
     )
 

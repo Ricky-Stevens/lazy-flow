@@ -20,14 +20,13 @@ import { setupServer } from 'msw/node'
 
 import { BunSqliteStore, migrate } from '../../core/index.js'
 import { GitHubClient, syncGitHub } from '../../ingest-github/index.js'
-import { baseOrg, IDS, mockGitHub } from '../../testkit/index.js'
+import { baseOrg, IDS, loadScopeDataWindowed, mockGitHub } from '../../testkit/index.js'
 import {
   backfillSnapshots,
   COMPUTE_METRIC_IDS,
   computeMetric,
   invalidateLookupsCache,
   loadFullScopeData,
-  loadScopeDataWindowed,
 } from './index.js'
 
 const NOW = '2024-06-01T00:00:00.000Z'
@@ -757,13 +756,15 @@ describe('computeMetric', () => {
     expect(r.halocSource).toBe('denormalized_prfile_column')
   })
 
-  it('code.haloc_aggregate → uses the complete denorm total when patches are only PARTIALLY backfilled (no silent undercount)', async () => {
-    // Regression: the post-sync auto-backfill populates patches incrementally, so
-    // the steady state is PARTIAL — some files have a patch, some are still NULL.
-    // The diff-recompute then sums ONLY the backfilled files: a confident
-    // undercount at "ok" quality. Null the patch on ONE file (gadget.go, denorm
-    // HALOC 11), leaving pr-1's two files patched (recompute 8). The denorm total
-    // stays 19, so the metric must report 19 — not the partial 8.
+  it('code.haloc_aggregate → PARTIAL backfill is a per-file HYBRID: precise patches + denorm for the rest (no undercount, no discard)', async () => {
+    // The post-sync auto-backfill populates patches incrementally, so the steady
+    // state is PARTIAL. The metric must count each file at its BEST available
+    // fidelity: precise per-hunk HALOC where a patch exists, denormalised
+    // max(add,del) where it does not. Null the patch on ONE file (gadget.go,
+    // denorm HALOC 11), leaving pr-1's two files patched (precise recompute 8).
+    // Total = 8 (precise) + 11 (denorm) = 19, correctly labelled hybrid — neither
+    // a silent undercount (the old all-or-nothing recompute of 8) nor a discard of
+    // the backfilled patches (the old all-or-nothing fallback to pure denorm).
     const partial = baseOrg.prFiles.find((f) => f.path.endsWith('gadget.go'))
     await store.upsertPrFile({
       prId: partial.prId,
@@ -779,9 +780,11 @@ describe('computeMetric', () => {
     })
     const r = await compute('code.haloc_aggregate')
     expect(r.dataQuality).toBe('ok')
-    expect(r.value).toBe(19) // complete, NOT the partial recompute of 8
+    expect(r.value).toBe(19) // 8 precise (patched) + 11 denorm (unpatched)
     expect(r.totalHaloc).toBe(19)
-    expect(r.halocSource).toBe('denormalized_prfile_column')
+    expect(r.halocSource).toBe('hybrid_patch_and_denormalized')
+    expect(r.patchCoverage).toBeGreaterThan(0)
+    expect(r.patchCoverage).toBeLessThan(1)
   })
 
   it('code.nagappan_ball → ok with a REAL relative-churn M1 from window HALOC', async () => {
@@ -1519,6 +1522,37 @@ describe('global-lookups memo — invalidated by recompute entry points', () => 
     invalidateLookupsCache(store)
     const fresh = await loadFullScopeData(store)
     expect(fresh.fileComplexityByKey.size).toBe(baseSize + 1)
+  })
+
+  it('invalidateLookupsCache after pr_files.haloc update surfaces new values (backfill regression)', async () => {
+    // Simulates what backfill_pr_patches does: it writes pr_files.haloc then the
+    // MCP handler calls invalidateLookupsCache so the next get_* sees fresh data.
+    await loadFullScopeData(store)
+
+    // Upsert a pr_file with an updated haloc (simulating patch backfill).
+    await store.upsertPrFile({
+      prId: IDS.pr1,
+      repoId: IDS.repoAlpha,
+      path: 'src/memo-regression.ts',
+      additions: 5,
+      deletions: 2,
+      haloc: 7,
+      patch: '--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new\n',
+      isGenerated: false,
+      createdAt: NOW,
+      updatedAt: NOW,
+    })
+
+    // Without invalidation, memo is stale — new file is NOT visible.
+    const stale = await loadFullScopeData(store)
+    const staleFiles = [...(stale.filesByPr.get(IDS.pr1) ?? [])]
+    expect(staleFiles.some((f) => f.path === 'src/memo-regression.ts')).toBe(false)
+
+    // After invalidation (what the server handler does), fresh load reflects it.
+    invalidateLookupsCache(store)
+    const fresh = await loadFullScopeData(store)
+    const freshFiles = [...(fresh.filesByPr.get(IDS.pr1) ?? [])]
+    expect(freshFiles.some((f) => f.path === 'src/memo-regression.ts')).toBe(true)
   })
 
   it('backfillSnapshots invalidates the memo so the recompute reads post-write state', async () => {

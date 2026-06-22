@@ -22,7 +22,7 @@ export const timeInStatus = {
     const statusDurations = new Map()
 
     for (const issue of inputs.issues) {
-      const transitions = [...issue.transitions].sort(
+      const transitions = issue.transitions.toSorted(
         (a, b) => new Date(a.transitionedAt).getTime() - new Date(b.transitionedAt).getTime(),
       )
 
@@ -62,7 +62,7 @@ export const timeInStatus = {
         }
 
         // Last transition → now
-        const lastT = transitions[transitions.length - 1]
+        const lastT = transitions.at(-1)
         if (lastT) {
           recordInterval(lastT.toStatusId, new Date(lastT.transitionedAt).getTime(), nowMs)
         }

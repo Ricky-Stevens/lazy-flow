@@ -195,8 +195,8 @@ describe('verdicts pipeline (in-session, no API)', () => {
         `INSERT INTO ai_verdicts
            (id, subject_type, subject_id, metric, prompt_version, model_id, model_snapshot,
             request_shape, feature_vector_json, structured_verdict_json, evidence_json,
-            confidence, created_at, corrected_by, correction_json)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            confidence, created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         'v-bad',
@@ -212,8 +212,6 @@ describe('verdicts pipeline (in-session, no API)', () => {
         '[]',
         0.5,
         NOW,
-        null,
-        null,
       )
 
     const stored = await store.getAiVerdictsByMetric('pull_request', 'person.design_bearing_ratio')

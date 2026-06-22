@@ -45,7 +45,7 @@ function doneStatusIds(boardColumns) {
  */
 export function computePerIssueCycleTime(issue, startedIds, doneIds) {
   // Transitions must already be sorted ascending (SPEC C1 — sort on ingest).
-  const transitions = [...issue.transitions].sort(
+  const transitions = issue.transitions.toSorted(
     (a, b) => new Date(a.transitionedAt).getTime() - new Date(b.transitionedAt).getTime(),
   )
 

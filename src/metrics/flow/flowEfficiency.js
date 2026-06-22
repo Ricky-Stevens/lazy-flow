@@ -22,7 +22,7 @@ const DEFAULT_ZOMBIE_THRESHOLD_DAYS = 90
  */
 
 function buildIntervals(issue, nowMs) {
-  const transitions = [...issue.transitions].sort(
+  const transitions = issue.transitions.toSorted(
     (a, b) => new Date(a.transitionedAt).getTime() - new Date(b.transitionedAt).getTime(),
   )
 
@@ -63,7 +63,7 @@ function buildIntervals(issue, nowMs) {
   }
 
   // Interval from last transition to now (still open) or to final state
-  const lastT = transitions[transitions.length - 1]
+  const lastT = transitions.at(-1)
   if (lastT) {
     intervals.push({
       statusId: lastT.toStatusId,
@@ -86,7 +86,7 @@ export function computePerIssueEfficiency(
   nowMs,
   zombieThresholdMs,
 ) {
-  const transitions = [...issue.transitions].sort(
+  const transitions = issue.transitions.toSorted(
     (a, b) => new Date(a.transitionedAt).getTime() - new Date(b.transitionedAt).getTime(),
   )
 

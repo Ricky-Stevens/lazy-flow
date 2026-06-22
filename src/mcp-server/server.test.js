@@ -115,9 +115,11 @@ describe('MCP server — bootstrap', () => {
       'get_flow',
       'get_person_report',
       'get_pr_metrics',
+      'list_pending_ai_authorship',
       'list_pending_verdicts',
       'list_report_presets',
       'query_db',
+      'record_ai_authorship_verdict',
       'record_verdict',
       'run_sync',
       'sync_status',
@@ -849,6 +851,59 @@ describe('MCP server — metric bundles load the dataset once (perf regression g
     })
     expect(result.isError).toBeFalsy()
     // One shared load for the bundle — NOT once per metric.
-    expect(counts.getAllPullRequests ?? 0).toBeLessThanOrEqual(1)
+    expect(counts.getAllPullRequestsMeta ?? counts.getAllPullRequests ?? 0).toBeLessThanOrEqual(1)
+  })
+
+  // ---------------------------------------------------------------------------
+  // Fat-column regression guard — Finding 1
+  //
+  // The metric-compute path must NEVER hit the patch-bearing pr_files getter
+  // unless a metric in the request actually re-parses unified diffs (currently
+  // only `code.haloc_aggregate`). Every other tool — PR/flow/DORA/agile/person
+  // bundles — must go through `getAllPrFilesMeta` (no patch column). Loading
+  // hundreds of MB of diff text just to compute pr.cycle_time was the single
+  // largest source of wasted I/O before this fix.
+  //
+  // Symmetric guard for the patch path: a tool that DOES need patches
+  // (`get_code_metrics`, which computes `code.haloc_aggregate`) must hit the
+  // patch-bearing getter exactly once and NOT the patch-less variant.
+  // ---------------------------------------------------------------------------
+  it('get_pr_metrics never loads the patch-bearing pr_files getter', async () => {
+    const { ctx, counts } = countingCtx()
+    const server = createServer(ctx)
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+    await server.connect(serverTransport)
+    const client = new Client({ name: 'test-client', version: '0.0.0' })
+    await client.connect(clientTransport)
+
+    const result = await client.callTool({
+      name: 'get_pr_metrics',
+      arguments: { window_days: 30 },
+    })
+    expect(result.isError).toBeFalsy()
+    // Patch-less variant should have run; the patch-bearing variant must NOT
+    // — pr.* metrics read denormalised additions/deletions/haloc, never patch.
+    expect(counts.getAllPrFiles ?? 0).toBe(0)
+    expect(counts.getAllPrFilesMeta ?? 0).toBeLessThanOrEqual(1)
+  })
+
+  it('get_code_metrics loads pr_files patches exactly once and skips the meta variant', async () => {
+    const { ctx, counts } = countingCtx()
+    const server = createServer(ctx)
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+    await server.connect(serverTransport)
+    const client = new Client({ name: 'test-client', version: '0.0.0' })
+    await client.connect(clientTransport)
+
+    const result = await client.callTool({
+      name: 'get_code_metrics',
+      arguments: { window_days: 30 },
+    })
+    expect(result.isError).toBeFalsy()
+    // code.haloc_aggregate is patch-bearing → patch getter runs (≤ once per
+    // dataset memo slot); the meta variant must NOT also fire for the same
+    // bundle, otherwise we'd be paying for both loads.
+    expect(counts.getAllPrFiles ?? 0).toBeLessThanOrEqual(1)
+    expect(counts.getAllPrFilesMeta ?? 0).toBe(0)
   })
 })

@@ -14,6 +14,8 @@
  * the LLM judgement local and human-auditable (every verdict carries evidence).
  */
 
+import { safeJsonParse } from '../../core/json.js'
+
 const PROMPT_VERSION = 'session-claude-v1'
 const MODEL_ID = 'in-session-claude'
 
@@ -41,15 +43,12 @@ export const VERDICT_METRICS = Object.keys(VERDICT_SHAPE)
 
 /** Best-effort text extraction from a stored raw API payload. */
 function extractText(raw) {
-  try {
-    const j = JSON.parse(raw)
-    const node = j.node ?? j
-    return {
-      title: node.title ?? null,
-      body: String(node.body ?? node.bodyText ?? j.body ?? '').slice(0, 4000),
-    }
-  } catch {
-    return { title: null, body: '' }
+  const j = safeJsonParse(raw, null)
+  if (j === null) return { title: null, body: '' }
+  const node = j.node ?? j
+  return {
+    title: node.title ?? null,
+    body: String(node.body ?? node.bodyText ?? j.body ?? '').slice(0, 4000),
   }
 }
 
@@ -188,8 +187,6 @@ export async function recordVerdict(
     evidenceJson: JSON.stringify(evidence ?? []),
     confidence: typeof confidence === 'number' ? confidence : 0.7,
     createdAt: ids.now,
-    correctedBy: null,
-    correctionJson: null,
   })
   return { recorded: true, subjectType, subjectId, metric }
 }

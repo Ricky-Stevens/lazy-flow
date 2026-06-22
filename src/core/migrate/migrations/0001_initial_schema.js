@@ -103,7 +103,6 @@ CREATE TABLE IF NOT EXISTS commits (
   sha                 TEXT    NOT NULL,
   author_identity_id  TEXT    NOT NULL REFERENCES identities(id),
   authored_at         TEXT    NOT NULL,
-  committed_at        TEXT    NOT NULL,
   additions           INTEGER NOT NULL DEFAULT 0,
   deletions           INTEGER NOT NULL DEFAULT 0,
   haloc               INTEGER NOT NULL DEFAULT 0,
@@ -138,12 +137,10 @@ CREATE TABLE IF NOT EXISTS pull_requests (
   head_ref              TEXT    NOT NULL,
   base_ref              TEXT    NOT NULL,
   is_draft              INTEGER NOT NULL DEFAULT 0,
-  merged_via_queue      INTEGER NOT NULL DEFAULT 0,
   created_at            TEXT    NOT NULL,
   ready_at              TEXT,
   first_commit_at       TEXT,
   first_review_at       TEXT,
-  approved_at           TEXT,
   merged_at             TEXT,
   merged_by_identity_id TEXT    REFERENCES identities(id),
   deleted_at            TEXT,
@@ -163,7 +160,6 @@ CREATE TABLE IF NOT EXISTS pr_files (
   additions    INTEGER NOT NULL DEFAULT 0,
   deletions    INTEGER NOT NULL DEFAULT 0,
   haloc        INTEGER NOT NULL DEFAULT 0,
-  status       TEXT NOT NULL,
   patch        TEXT,
   -- 1 when the path matches generated/vendored/lockfile/minified globs (see
   -- classifyIsGenerated). Persisted so authored-code-volume metrics (pr.size,
@@ -218,7 +214,6 @@ CREATE TABLE IF NOT EXISTS check_runs (
   conclusion   TEXT,
   started_at   TEXT,
   completed_at TEXT,
-  raw          TEXT NOT NULL,
   updated_at   TEXT NOT NULL
 );
 
@@ -267,6 +262,11 @@ CREATE TABLE IF NOT EXISTS issues (
   is_subtask             INTEGER NOT NULL DEFAULT 0,
   hierarchy_level        INTEGER NOT NULL DEFAULT 1,
   assignee_identity_id   TEXT    REFERENCES identities(id),
+  -- Jira priority name (e.g. 'Highest'..'Lowest') and resolution name (e.g.
+  -- 'Done'/'Won't Do'), lifted out of raw.fields so evaluative severity/
+  -- resolution-mix metrics can read them without re-parsing the raw blob.
+  priority               TEXT,
+  resolution             TEXT,
   created_at             TEXT    NOT NULL,
   resolved_at            TEXT,
   deleted_at             TEXT,
@@ -386,30 +386,6 @@ CREATE TABLE IF NOT EXISTS team_membership (
 
 CREATE INDEX IF NOT EXISTS idx_team_membership_person ON team_membership(person_id);
 
--- Survey responses (WP-SURVEY, SPEC D6 / §2.2 N4)
--- Perceptual scores are SURVEY-SOURCED ONLY; this table is the sole permitted
--- source for any dimension score. Append-only (no UPDATE; DELETE only for
--- subject erasure per SPEC §6.5 WP-GDPR-SCAFFOLD).
-CREATE TABLE IF NOT EXISTS survey_responses (
-  id                   TEXT NOT NULL PRIMARY KEY,
-  person_id            TEXT REFERENCES persons(id),
-  team_id              TEXT NOT NULL REFERENCES teams(id),
-  instrument_id        TEXT NOT NULL,
-  instrument_version   TEXT NOT NULL,
-  -- Per-question scores stored as a JSON object: { [questionId]: 1-5 }
-  scores_json          TEXT NOT NULL,
-  submitted_at         TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_survey_responses_team
-  ON survey_responses(team_id, submitted_at);
-
-CREATE INDEX IF NOT EXISTS idx_survey_responses_person
-  ON survey_responses(person_id) WHERE person_id IS NOT NULL;
-
-CREATE INDEX IF NOT EXISTS idx_survey_responses_instrument
-  ON survey_responses(instrument_id, instrument_version);
-
 -- GitHub↔Jira issue linkage
 CREATE TABLE IF NOT EXISTS pr_issue_links (
   pr_id        TEXT NOT NULL REFERENCES pull_requests(id),
@@ -496,9 +472,7 @@ CREATE TABLE IF NOT EXISTS ai_verdicts (
   structured_verdict_json TEXT NOT NULL,
   evidence_json           TEXT NOT NULL,
   confidence              REAL NOT NULL,
-  created_at              TEXT NOT NULL,
-  corrected_by            TEXT,
-  correction_json         TEXT
+  created_at              TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_ai_verdicts_subject ON ai_verdicts(subject_type, subject_id);
@@ -518,6 +492,14 @@ CREATE TABLE IF NOT EXISTS ai_authorship (
   ai_score           REAL NOT NULL,
   signals_json       TEXT NOT NULL,
   computed_at        TEXT NOT NULL,
+  -- Semantic tier: a verdict produced by the in-session Claude (NOT an external
+  -- API) for changes whose deterministic ai_score lands in the ambiguous band.
+  -- NULL until the session adjudicates via record_ai_authorship_verdict.
+  -- llm_verdict: 1 = AI-assisted, 0 = human-authored.
+  llm_verdict        INTEGER,
+  llm_confidence     REAL,
+  llm_reasoning      TEXT,
+  verdict_at         TEXT,
   PRIMARY KEY (entity_type, entity_id)
 );
 CREATE INDEX IF NOT EXISTS idx_ai_authorship_repo ON ai_authorship(repo_id, authored_at);
@@ -629,7 +611,6 @@ DROP TABLE IF EXISTS ai_verdicts;
 DROP TABLE IF EXISTS metric_baselines;
 DROP TABLE IF EXISTS metric_snapshots;
 DROP TABLE IF EXISTS pr_issue_links;
-DROP TABLE IF EXISTS survey_responses;
 DROP TABLE IF EXISTS team_membership;
 DROP TABLE IF EXISTS teams;
 DROP TABLE IF EXISTS workflow_scheme_mappings;

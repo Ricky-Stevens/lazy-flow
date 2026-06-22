@@ -1,17 +1,18 @@
 import { ENGINE_VERSION, safeRatio } from '../../core/index.js'
+import { BUG_TYPES } from '../shared/bugTypes.js'
 
 const FORMULA_DOC =
   'Flow Distribution (SPEC §8.2): ' +
-  'Classify completed issues into feature/bug/debt/other buckets. ' +
-  'Deterministic prior: Jira issue type field. ' +
-  'LLM classifier hook: pass llmClassifications to override. ' +
-  'Distribution = count/total per bucket.'
+  'Classify completed issues into feature/bug/debt/other buckets from the Jira ' +
+  'issue type field (deterministic). Distribution = count/total per bucket. ' +
+  '(Reserved extension point: an `llmClassifications` map keyed by issue id may ' +
+  'override the deterministic call per-issue — no production caller wires it ' +
+  'today; semantic skill-domain classification is a separate, unbuilt layer.)'
 
 // ---------------------------------------------------------------------------
 // Deterministic type classifier
 // ---------------------------------------------------------------------------
 
-const BUG_TYPES = new Set(['bug', 'defect', 'hotfix', 'incident', 'fix'])
 const DEBT_TYPES = new Set(['technical debt', 'tech debt', 'debt', 'refactor', 'chore', 'task'])
 const FEATURE_TYPES = new Set([
   'story',

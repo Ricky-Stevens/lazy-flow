@@ -10,5 +10,7 @@
 export { baseOrg, IDS } from './dataset/baseOrg.js'
 
 export { fakeClock, seed, withMockServer } from './harness.js'
+// TEST-ONLY oracle for the metrics-compute equivalence test.
+export { loadScopeDataWindowed } from './loadScopeDataWindowed.js'
 export { mockGitHub } from './mocks/github.js'
 export { mockJira } from './mocks/jira.js'

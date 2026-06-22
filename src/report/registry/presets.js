@@ -169,6 +169,27 @@ export const PRESETS = [
             'are suppressed until the throughput history meets the sample floor.',
         ],
       },
+      {
+        id: 'severity',
+        title: 'Severity & Resolution Mix',
+        purpose:
+          'Headline priority-coverage ratio for the month (share of issues that carry a ' +
+          'Jira priority). For the full priority bucket breakdown and resolved-bug ' +
+          "resolution distribution (Done / Won't Do / Duplicate / …) call " +
+          '`get_agile_metrics` (agile.priority_mix) directly — the rendered report cell ' +
+          'shows only the scalar headline value.',
+        metrics: [
+          {
+            metricId: 'agile.priority_mix',
+            label: 'Priority & resolution mix',
+            unit: 'ratio',
+          },
+        ],
+        caveats: [
+          'Priority mix is sample-gated (≥5 prioritised issues); bug-resolution sub-mix ' +
+            'is sample-gated (≥3 resolved bugs). Below the floor the section reads as no_data.',
+        ],
+      },
     ],
   },
   {

@@ -36,6 +36,9 @@ export {
 
 // PR ↔ Jira issue linking (SPEC WP-LINKING)
 
+// JSON parsing helper — guarded with one centrally-justified suppression for
+// the writable-DB raw-payload threat model (full-transparency contract).
+export { safeJsonParse } from './json.js'
 // Deploy ↔ incident linking (DORA CFR / recovery / rework attribution)
 export {
   INCIDENT_DEPLOY_PROXIMITY_MS,
