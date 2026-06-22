@@ -1,6 +1,6 @@
 {
   "name": "lazy-flow",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Open-source DORA + Flow + PR + Code + Agile metrics platform for Claude Code. Fuses GitHub and Jira into a local-first, fully-transparent delivery intelligence layer that Claude can query directly over SQL.",
   "mcpServers": {
     "lazy-flow": {
@@ -19,34 +19,46 @@
   },
   "userConfig": {
     "github_token": {
+      "type": "string",
+      "title": "GitHub Token",
       "description": "GitHub Personal Access Token or App installation token. Required for GitHub sync.",
       "sensitive": true,
       "required": true
     },
     "jira_oauth_token": {
+      "type": "string",
+      "title": "Jira API Token",
       "description": "Jira Cloud API token (create at id.atlassian.com → API tokens). Used with jira_email for Basic auth. Required for Jira sync.",
       "sensitive": true,
       "required": false
     },
     "jira_email": {
+      "type": "string",
+      "title": "Jira Account Email",
       "description": "Atlassian account email for the API token, e.g. you@acme.com. Required alongside the Jira API token.",
       "sensitive": false,
       "required": false,
       "default": ""
     },
     "jira_base_url": {
+      "type": "string",
+      "title": "Jira Base URL",
       "description": "Jira Cloud base URL, e.g. https://acme.atlassian.net. Required for Jira sync.",
       "sensitive": false,
       "required": false,
       "default": ""
     },
     "repos": {
+      "type": "string",
+      "title": "GitHub Repositories",
       "description": "Comma-separated list of GitHub repositories to track, e.g. ORG/app,ORG/api. Use ORG/* to track every repo in an organisation (excludes archived repos and forks); wildcards and explicit entries can be mixed, e.g. ORG/*,OTHER/special.",
       "sensitive": false,
       "required": false,
       "default": ""
     },
     "jira_projects": {
+      "type": "string",
+      "title": "Jira Project Keys",
       "description": "Comma-separated list of Jira project keys to track, e.g. ENG,INFRA",
       "sensitive": false,
       "required": false,
