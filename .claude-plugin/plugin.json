@@ -1,7 +1,7 @@
 {
   "name": "lazy-flow",
   "displayName": "Lazy Flow",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "description": "Open-source DORA + Flow + PR + Code + Agile metrics platform for Claude Code. Fuses GitHub and Jira into a local-first, fully-transparent delivery intelligence layer that Claude can query directly over SQL.",
   "author": {
     "name": "Ricky Stevens"
@@ -19,6 +19,7 @@
         "LAZYFLOW_JIRA_BASE_URL": "${user_config.jira_base_url}",
         "LAZYFLOW_REPOS": "${user_config.repos}",
         "LAZYFLOW_REPO_MAX_IDLE_DAYS": "${user_config.repo_max_idle_days}",
+        "LAZYFLOW_SKIP_BOT_PATCHES": "${user_config.skip_bot_patches}",
         "LAZYFLOW_JIRA_PROJECTS": "${user_config.jira_projects}",
         "LAZYFLOW_DB_PATH": "${CLAUDE_PLUGIN_DATA}/lazy-flow.db"
       }
@@ -70,6 +71,14 @@
       "sensitive": false,
       "required": false,
       "default": ""
+    },
+    "skip_bot_patches": {
+      "type": "boolean",
+      "title": "Skip Bot PR Diff Analysis",
+      "description": "Skip the diff/blob analysis (patch backfill) for bot-authored PRs such as dependabot lockfile bumps — saves GitHub blob-fetch budget and database space with no analytical loss (bots are excluded from per-person metrics and verdicts regardless). Bot commits, PRs and AI-adoption signals are still ingested. Default: on.",
+      "sensitive": false,
+      "required": false,
+      "default": true
     },
     "jira_projects": {
       "type": "string",

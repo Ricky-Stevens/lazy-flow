@@ -613,6 +613,104 @@ describe('pull_requests', () => {
 // PR files (per-file diffs)
 // ---------------------------------------------------------------------------
 
+describe('patch-backfill candidate filtering (excludeBots)', () => {
+  // A bot-authored PR's patch-less files must be droppable from the backfill
+  // work-set AND the pending count (so `remaining` can reach 0), while a
+  // human/unknown author's files are kept.
+  async function seedPrWithAuthor(store, prId, repoId, authorId) {
+    await store.upsertPullRequest({
+      id: prId,
+      repoId,
+      number: Number(prId.replace(/\D/g, '')) || 1,
+      authorIdentityId: authorId,
+      state: 'merged',
+      headRef: 'feat',
+      baseRef: 'main',
+      isDraft: false,
+      mergedViaQueue: false,
+      createdAt: T1,
+      readyAt: null,
+      firstCommitAt: null,
+      firstReviewAt: null,
+      approvedAt: null,
+      mergedAt: T1,
+      mergedByIdentityId: null,
+      deletedAt: null,
+      raw: '{}',
+      updatedAt: T1,
+    })
+    await store.upsertPrFile({
+      prId,
+      repoId,
+      path: `${prId}.txt`,
+      additions: 1,
+      deletions: 0,
+      haloc: 1,
+      status: 'added',
+      patch: null,
+      createdAt: T1,
+      updatedAt: T1,
+    })
+  }
+
+  async function seedHumanAndBot(store) {
+    await seedRepo(store)
+    await seedIdentity(store, 'ident-human') // isBot: false
+    await store.upsertIdentity({
+      id: 'ident-bot',
+      personId: null,
+      kind: 'github_login',
+      externalId: 'dependabot[bot]',
+      isBot: true,
+      confidence: 1,
+      raw: '{}',
+      updatedAt: T1,
+    })
+    await seedPrWithAuthor(store, 'pr-human', 'repo-1', 'ident-human')
+    await seedPrWithAuthor(store, 'pr-bot', 'repo-1', 'ident-bot')
+  }
+
+  it('getPrFilesMissingPatchByRepo + count drop bot-authored files only when excludeBots', async () => {
+    const { store } = migratedStore()
+    await seedHumanAndBot(store)
+
+    // Default: both files are pending.
+    expect((await store.getPrFilesMissingPatchByRepo('repo-1', 100)).length).toBe(2)
+    expect(await store.countPrFilesMissingPatchByRepo('repo-1')).toBe(2)
+
+    // excludeBots: only the human file remains, and the count agrees with the work-set.
+    const human = await store.getPrFilesMissingPatchByRepo('repo-1', 100, { excludeBots: true })
+    expect(human.map((f) => f.path)).toEqual(['pr-human.txt'])
+    expect(await store.countPrFilesMissingPatchByRepo('repo-1', { excludeBots: true })).toBe(1)
+  })
+
+  it('getRepoIdsWithMissingPatches drops a bot-only repo under excludeBots', async () => {
+    const { store } = migratedStore()
+    await seedRepo(store)
+    await store.upsertIdentity({
+      id: 'ident-bot',
+      personId: null,
+      kind: 'github_login',
+      externalId: 'renovate[bot]',
+      isBot: true,
+      confidence: 1,
+      raw: '{}',
+      updatedAt: T1,
+    })
+    await seedPrWithAuthor(store, 'pr-bot', 'repo-1', 'ident-bot')
+
+    expect(await store.getRepoIdsWithMissingPatches()).toEqual(['repo-1'])
+    // The repo's only patch-less files are bot-authored → no work under excludeBots.
+    expect(await store.getRepoIdsWithMissingPatches({ excludeBots: true })).toEqual([])
+  })
+
+  it('countBotPrFilesMissingPatch tallies only bot-authored patch-less files', async () => {
+    const { store } = migratedStore()
+    await seedHumanAndBot(store)
+    expect(await store.countBotPrFilesMissingPatch()).toBe(1)
+  })
+})
+
 describe('pr_files', () => {
   async function seedPr(store, id, createdAt) {
     await store.upsertPullRequest({

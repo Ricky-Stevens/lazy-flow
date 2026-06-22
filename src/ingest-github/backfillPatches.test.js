@@ -246,6 +246,140 @@ describe('backfillPrPatches — no-repoId multi-repo guard', () => {
   })
 })
 
+describe('backfillPrPatches — bot-author exclusion (excludeBots)', () => {
+  // Seed a SECOND PR authored by a bot, with its own patch-less file, alongside
+  // the human pr-1 from seed(). A recording stub proves the bot file's blobs are
+  // never fetched when excludeBots is set.
+  async function seedBotPr(store) {
+    await store.upsertIdentity({
+      id: 'id-bot',
+      personId: null,
+      kind: 'github_login',
+      externalId: 'dependabot[bot]',
+      isBot: true,
+      confidence: 1,
+      raw: '{}',
+      updatedAt: NOW,
+    })
+    await store.upsertPullRequest({
+      id: 'pr-bot',
+      repoId: 'repo-1',
+      number: 9,
+      authorIdentityId: 'id-bot',
+      state: 'merged',
+      headRef: 'dependabot/npm/x',
+      baseRef: 'main',
+      isDraft: false,
+      mergedViaQueue: false,
+      createdAt: NOW,
+      readyAt: NOW,
+      firstCommitAt: NOW,
+      firstReviewAt: null,
+      approvedAt: null,
+      mergedAt: NOW,
+      mergedByIdentityId: 'id-bot',
+      deletedAt: null,
+      raw: '{}',
+      updatedAt: NOW,
+    })
+    await store.upsertPrRef({
+      prId: 'pr-bot',
+      repoId: 'repo-1',
+      baseSha: 'baseB',
+      headSha: 'headB',
+      updatedAt: NOW,
+    })
+    await store.upsertPrFile({
+      prId: 'pr-bot',
+      repoId: 'repo-1',
+      path: 'package-lock.json',
+      additions: 500,
+      deletions: 480,
+      haloc: 500,
+      status: 'modified',
+      patch: null,
+      createdAt: NOW,
+      updatedAt: NOW,
+    })
+  }
+
+  /** Stub that RECORDS every (sha:path) it was asked to fetch. */
+  function recordingStubClient(blobMap, fetched) {
+    return {
+      async fetchBlobs(_owner, _name, refPaths) {
+        const out = new Map()
+        for (const { sha, path } of refPaths) {
+          fetched.push(`${sha}:${path}`)
+          const key = `${sha}:${path}`
+          if (blobMap.has(key)) out.set(key, blobMap.get(key))
+        }
+        return out
+      },
+    }
+  }
+
+  it('with excludeBots: never fetches bot-PR blobs, backfills only the human file, count agrees', async () => {
+    const store = freshStore()
+    await seed(store) // human pr-1 → src/x.ts
+    await seedBotPr(store) // bot pr-bot → package-lock.json
+
+    const fetched = []
+    const client = recordingStubClient(
+      new Map([
+        ['base1:src/x.ts', 'a\nb\n'],
+        ['head1:src/x.ts', 'a\nB\n'],
+      ]),
+      fetched,
+    )
+
+    const res = await backfillPrPatches(store, client, {
+      owner: 'acme',
+      name: 'app',
+      repoId: 'repo-1',
+      excludeBots: true,
+    })
+
+    // Only the human file was eligible/backfilled; the bot lockfile never entered the work-set…
+    expect(res.backfilled).toBe(1)
+    expect(res.prFilesPending).toBe(1) // count excludes the bot file → remaining can reach 0
+    expect(res.remaining).toBe(0)
+    // …and its blobs were never fetched (no wasted GraphQL budget).
+    expect(fetched.some((k) => k.includes('package-lock.json'))).toBe(false)
+
+    // The bot file is still present, just left unpatched (honest, reportable).
+    const botFile = (await store.getAllPrFiles()).find((f) => f.path === 'package-lock.json')
+    expect(botFile.patch).toBeNull()
+    expect(await store.countBotPrFilesMissingPatch()).toBe(1)
+  })
+
+  it('without excludeBots (default): the bot file IS processed (backward-compatible)', async () => {
+    const store = freshStore()
+    await seed(store)
+    await seedBotPr(store)
+
+    const fetched = []
+    const client = recordingStubClient(
+      new Map([
+        ['base1:src/x.ts', 'a\nb\n'],
+        ['head1:src/x.ts', 'a\nB\n'],
+        ['baseB:package-lock.json', 'x\n'],
+        ['headB:package-lock.json', 'x\ny\n'],
+      ]),
+      fetched,
+    )
+
+    const res = await backfillPrPatches(store, client, {
+      owner: 'acme',
+      name: 'app',
+      repoId: 'repo-1',
+    })
+
+    expect(res.prFilesPending).toBe(2)
+    expect(res.backfilled).toBe(2)
+    expect(fetched.some((k) => k.includes('package-lock.json'))).toBe(true)
+  })
+})
+
 describe('backfillAllPatches drain mode', () => {
   let store
   beforeEach(async () => {

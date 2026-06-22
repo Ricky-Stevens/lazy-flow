@@ -116,14 +116,18 @@ describe('MCP server — bootstrap', () => {
       'get_person_report',
       'get_pr_metrics',
       'get_schema',
+      'link_identity',
+      'list_identity_matches',
       'list_pending_ai_authorship',
       'list_pending_verdicts',
       'list_report_presets',
       'query_db',
       'record_ai_authorship_verdict',
       'record_verdict',
+      'resolve_identity_match',
       'run_sync',
       'sync_status',
+      'unmerge_identity_match',
     ].sort()
 
     expect(names).toEqual(expected)
@@ -993,5 +997,276 @@ describe('MCP server — metric bundles load the dataset once (perf regression g
     // bundle, otherwise we'd be paying for both loads.
     expect(counts.getAllPrFiles ?? 0).toBeLessThanOrEqual(1)
     expect(counts.getAllPrFilesMeta ?? 0).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Identity stitching review tools: list / resolve (confirm/reject) / link
+// ---------------------------------------------------------------------------
+
+describe('identity stitching tools', () => {
+  const T = '2024-01-01T00:00:00.000Z'
+
+  async function seedIdentityGraph(ctx) {
+    const store = ctx.store
+    // A known person anchored by a GitHub identity.
+    await store.upsertPerson({
+      id: 'person-phil',
+      displayName: 'Phil Higgins',
+      primaryAccountRef: 'gh:phil',
+      updatedAt: T,
+    })
+    await store.upsertIdentity({
+      id: 'gh:phil',
+      personId: null,
+      kind: 'github_login',
+      externalId: 'phil-b-higgins',
+      isBot: false,
+      confidence: 1,
+      raw: JSON.stringify({ login: 'phil-b-higgins' }),
+      updatedAt: T,
+    })
+    await store.setIdentityPerson('gh:phil', 'person-phil', T)
+    // An orphan legacy commit-email identity (no person) — the comsechq-era case.
+    await store.upsertIdentity({
+      id: 'email:legacy',
+      personId: null,
+      kind: 'commit_email',
+      externalId: 'phil.b.higgins@comsechq.com',
+      isBot: false,
+      confidence: 1,
+      raw: JSON.stringify({ email: 'phil.b.higgins@comsechq.com' }),
+      updatedAt: T,
+    })
+    return store
+  }
+
+  async function seedPendingMatch(ctx) {
+    await ctx.store.appendCandidateMatch({
+      id: 'm1',
+      identityIdA: 'email:legacy',
+      identityIdB: 'gh:phil',
+      reason: 'xsrc_name',
+      confidence: 0.6,
+      status: 'pending',
+      decidedAt: null,
+      decidedBy: null,
+      createdAt: T,
+      updatedAt: T,
+    })
+  }
+
+  it('list_identity_matches resolves both sides of a pending candidate', async () => {
+    const { client, ctx } = await makeConnectedPair()
+    await seedIdentityGraph(ctx)
+    await seedPendingMatch(ctx)
+
+    const res = await client.callTool({ name: 'list_identity_matches', arguments: {} })
+    const out = res.structuredContent
+    expect(out.count).toBe(1)
+    expect(out.matches[0].match_id).toBe('m1')
+    expect(out.matches[0].b.personName).toBe('Phil Higgins')
+    expect(out.matches[0].a.externalId).toBe('phil.b.higgins@comsechq.com')
+  })
+
+  it('resolve_identity_match confirm links the orphan email to the person', async () => {
+    const { client, ctx } = await makeConnectedPair()
+    await seedIdentityGraph(ctx)
+    await seedPendingMatch(ctx)
+
+    const res = await client.callTool({
+      name: 'resolve_identity_match',
+      arguments: { match_id: 'm1', decision: 'confirm' },
+    })
+    expect(res.structuredContent.linkedPersonId).toBe('person-phil')
+    const linked = await ctx.store.findIdentityByExternalId(
+      'commit_email',
+      'phil.b.higgins@comsechq.com',
+    )
+    expect(linked?.personId).toBe('person-phil')
+  })
+
+  it('resolve_identity_match reject keeps identities separate + clears the queue', async () => {
+    const { client, ctx } = await makeConnectedPair()
+    await seedIdentityGraph(ctx)
+    await seedPendingMatch(ctx)
+
+    await client.callTool({
+      name: 'resolve_identity_match',
+      arguments: { match_id: 'm1', decision: 'reject' },
+    })
+    expect((await ctx.store.findIdentityById('email:legacy'))?.personId).toBeNull()
+    const res = await client.callTool({ name: 'list_identity_matches', arguments: {} })
+    expect(res.structuredContent.count).toBe(0)
+  })
+
+  it('link_identity manually assigns an orphan to a known person, and unlinks', async () => {
+    const { client, ctx } = await makeConnectedPair()
+    await seedIdentityGraph(ctx)
+
+    // No candidate exists — manual assignment via the target identity's person.
+    const res = await client.callTool({
+      name: 'link_identity',
+      arguments: { identity_id: 'email:legacy', to_identity_id: 'gh:phil' },
+    })
+    expect(res.structuredContent.linkedPersonId).toBe('person-phil')
+    expect((await ctx.store.findIdentityById('email:legacy'))?.personId).toBe('person-phil')
+
+    const res2 = await client.callTool({
+      name: 'link_identity',
+      arguments: { identity_id: 'email:legacy', unlink: true },
+    })
+    expect(res2.structuredContent.unlinked).toBe(true)
+    expect((await ctx.store.findIdentityById('email:legacy'))?.personId).toBeNull()
+  })
+
+  it('resolve_identity_match returns a graceful error for an unknown match', async () => {
+    const { client, ctx } = await makeConnectedPair()
+    await seedIdentityGraph(ctx)
+    const res = await client.callTool({
+      name: 'resolve_identity_match',
+      arguments: { match_id: 'nope', decision: 'confirm' },
+    })
+    expect(res.structuredContent.error).toMatch(/not found/)
+  })
+
+  async function addId(ctx, id, kind, externalId, isBot = false) {
+    await ctx.store.upsertIdentity({
+      id,
+      personId: null,
+      kind,
+      externalId,
+      isBot,
+      confidence: 1,
+      raw: '{}',
+      updatedAt: T,
+    })
+  }
+
+  it('confirm does NOT consume a both-orphan match — errors and stays pending', async () => {
+    const { client, ctx } = await makeConnectedPair()
+    await addId(ctx, 'o1', 'commit_email', 'a@x.com')
+    await addId(ctx, 'o2', 'commit_email', 'a@y.com')
+    await ctx.store.appendCandidateMatch({
+      id: 'mo',
+      identityIdA: 'o1',
+      identityIdB: 'o2',
+      reason: 'local_part_name',
+      confidence: 0.8,
+      status: 'pending',
+      decidedAt: null,
+      decidedBy: null,
+      createdAt: T,
+      updatedAt: T,
+    })
+
+    const res = await client.callTool({
+      name: 'resolve_identity_match',
+      arguments: { match_id: 'mo', decision: 'confirm' },
+    })
+    expect(res.structuredContent.error).toMatch(/neither identity/)
+    expect((await ctx.store.getCandidateMatch('mo'))?.status).toBe('pending') // not burned
+  })
+
+  it('confirm fully merges two populated persons — no stranded identities', async () => {
+    const { client, ctx } = await makeConnectedPair()
+    await ctx.store.upsertPerson({
+      id: 'person-x',
+      displayName: 'X',
+      primaryAccountRef: 'gh:x',
+      updatedAt: T,
+    })
+    await ctx.store.upsertPerson({
+      id: 'person-y',
+      displayName: 'Y',
+      primaryAccountRef: 'gh:y',
+      updatedAt: T,
+    })
+    await addId(ctx, 'gh:x', 'github_login', 'x')
+    await addId(ctx, 'gh:y', 'github_login', 'y')
+    await addId(ctx, 'email:y2', 'commit_email', 'y@y.com')
+    await ctx.store.setIdentityPerson('gh:x', 'person-x', T)
+    await ctx.store.setIdentityPerson('gh:y', 'person-y', T)
+    await ctx.store.setIdentityPerson('email:y2', 'person-y', T)
+    await ctx.store.appendCandidateMatch({
+      id: 'mm',
+      identityIdA: 'gh:x',
+      identityIdB: 'gh:y',
+      reason: 'xsrc_name',
+      confidence: 0.6,
+      status: 'pending',
+      decidedAt: null,
+      decidedBy: null,
+      createdAt: T,
+      updatedAt: T,
+    })
+
+    const res = await client.callTool({
+      name: 'resolve_identity_match',
+      arguments: { match_id: 'mm', decision: 'confirm' },
+    })
+    expect(res.structuredContent.mergedPersons).toBe(true)
+    // BOTH of the loser person's identities migrate to the winner; loser deleted.
+    expect((await ctx.store.findIdentityById('gh:y'))?.personId).toBe('person-x')
+    expect((await ctx.store.findIdentityById('email:y2'))?.personId).toBe('person-x')
+    expect(await ctx.store.getPerson('person-y')).toBeNull()
+  })
+
+  it('link_identity refuses a bot + self-link, and writes an audit row on success', async () => {
+    const { client, ctx } = await makeConnectedPair()
+    await seedIdentityGraph(ctx)
+    await addId(ctx, 'bot1', 'github_login', 'dependabot[bot]', true)
+
+    const botRes = await client.callTool({
+      name: 'link_identity',
+      arguments: { identity_id: 'bot1', to_person_id: 'person-phil' },
+    })
+    expect(botRes.structuredContent.error).toMatch(/bot/)
+
+    const selfRes = await client.callTool({
+      name: 'link_identity',
+      arguments: { identity_id: 'gh:phil', to_identity_id: 'gh:phil' },
+    })
+    expect(selfRes.structuredContent.error).toMatch(/different/)
+
+    await client.callTool({
+      name: 'link_identity',
+      arguments: { identity_id: 'email:legacy', to_identity_id: 'gh:phil' },
+    })
+    const audits = ctx.store.db
+      .prepare("SELECT action, to_person_id FROM identity_audit WHERE action = 'link'")
+      .all()
+    expect(audits.length).toBe(1)
+    expect(audits[0].to_person_id).toBe('person-phil')
+  })
+
+  it('dry_run previews a link without writing', async () => {
+    const { client, ctx } = await makeConnectedPair()
+    await seedIdentityGraph(ctx)
+    const res = await client.callTool({
+      name: 'link_identity',
+      arguments: { identity_id: 'email:legacy', to_identity_id: 'gh:phil', dry_run: true },
+    })
+    expect(res.structuredContent.dryRun).toBe(true)
+    expect(res.structuredContent.wouldLinkPersonId).toBe('person-phil')
+    expect((await ctx.store.findIdentityById('email:legacy'))?.personId).toBeNull() // not written
+  })
+
+  it('unmerge_identity_match reverses a confirmed merge', async () => {
+    const { client, ctx } = await makeConnectedPair()
+    await seedIdentityGraph(ctx)
+    await seedPendingMatch(ctx)
+    await client.callTool({
+      name: 'resolve_identity_match',
+      arguments: { match_id: 'm1', decision: 'confirm' },
+    })
+    expect((await ctx.store.findIdentityById('email:legacy'))?.personId).toBe('person-phil')
+
+    const res = await client.callTool({
+      name: 'unmerge_identity_match',
+      arguments: { match_id: 'm1' },
+    })
+    expect(res.structuredContent.unmerged).toBe(true)
+    expect((await ctx.store.findIdentityById('email:legacy'))?.personId).toBeNull()
   })
 })

@@ -26,6 +26,17 @@ function now() {
 /** Tables that carry a `deleted_at` column and may be soft-deleted by id. */
 const SOFT_DELETABLE_TABLES = new Set(['repositories', 'pull_requests', 'issues'])
 
+/**
+ * STATIC SQL fragment (no interpolated values — safe to concatenate) that drops
+ * pull requests whose author identity is a confirmed bot. Appended to the
+ * patch-backfill queries when `excludeBots` is set so dependabot/renovate
+ * lockfile diffs are never blob-fetched. Keeps a PR with an unknown/sentinel
+ * author (is_bot=0) — only confirmed bots are excluded. Shared so the get/count
+ * queries can never drift apart (which would strand `remaining`).
+ */
+const BOT_AUTHOR_PR_FILTER =
+  ' AND NOT EXISTS (SELECT 1 FROM identities ai WHERE ai.id = p.author_identity_id AND ai.is_bot = 1)'
+
 /** Convert a JS boolean to SQLite INTEGER 0/1. */
 function b(v) {
   return v ? 1 : 0
@@ -239,6 +250,28 @@ export class BunSqliteStore {
     if ((res.changes ?? 0) === 0) {
       throw new Error(`setIdentityPerson: identity not found: ${identityId}`)
     }
+  }
+
+  /**
+   * Append an immutable audit row for a manual identity-graph edit (link / unlink
+   * / confirm / reject / unmerge). Append-only — never updated or deleted.
+   */
+  async appendIdentityAudit(entry) {
+    this.stmt(`
+      INSERT INTO identity_audit
+        (id, action, identity_id, from_person_id, to_person_id, match_id, decided_by, note, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      entry.id,
+      entry.action,
+      entry.identityId ?? null,
+      entry.fromPersonId ?? null,
+      entry.toPersonId ?? null,
+      entry.matchId ?? null,
+      entry.decidedBy ?? null,
+      entry.note ?? null,
+      entry.createdAt,
+    )
   }
 
   /**
@@ -982,14 +1015,16 @@ export class BunSqliteStore {
    * entirely — turning the drain into a fixed-cost scan per chunk. Sort by
    * pr_id/path so chunked iteration is deterministic.
    */
-  async getPrFilesMissingPatchByRepo(repoId, limit) {
+  async getPrFilesMissingPatchByRepo(repoId, limit, opts = {}) {
     const cap = Math.max(1, Number(limit) || 1)
     const rows = this.stmt(
       `SELECT f.pr_id, f.repo_id, f.path, f.additions, f.deletions, f.haloc,
               f.is_generated, f.created_at, f.updated_at
        FROM pr_files f
        JOIN pull_requests p ON p.id = f.pr_id
-       WHERE p.deleted_at IS NULL AND f.repo_id = ? AND f.patch IS NULL
+       WHERE p.deleted_at IS NULL AND f.repo_id = ? AND f.patch IS NULL${
+         opts.excludeBots ? BOT_AUTHOR_PR_FILTER : ''
+}
        ORDER BY f.pr_id ASC, f.path ASC
        LIMIT ?`,
     ).all(repoId, cap)
@@ -1003,26 +1038,49 @@ export class BunSqliteStore {
    * pattern loaded hundreds of MB of patch text just to extract a handful of
    * distinct ids).
    */
-  async getRepoIdsWithMissingPatches() {
+  async getRepoIdsWithMissingPatches(opts = {}) {
     const rows = this.stmt(
       `SELECT DISTINCT f.repo_id
        FROM pr_files f
        JOIN pull_requests p ON p.id = f.pr_id
-       WHERE p.deleted_at IS NULL AND f.patch IS NULL`,
+       WHERE p.deleted_at IS NULL AND f.patch IS NULL${
+         opts.excludeBots ? BOT_AUTHOR_PR_FILTER : ''
+}`,
     ).all()
     return rows.map((r) => String(r.repo_id))
   }
 
   /** Count of patch-less pr_files rows for a repo — for the budget-spent tally
    * in `backfillAllPatches` (avoids re-loading the whole pr_files table just to
-   * count the residual). */
-  async countPrFilesMissingPatchByRepo(repoId) {
+   * count the residual). With `excludeBots`, bot-authored PRs are dropped so the
+   * count matches the work-set returned by getPrFilesMissingPatchByRepo (else
+   * `remaining` would never reach 0 — bot files are never backfilled). */
+  async countPrFilesMissingPatchByRepo(repoId, opts = {}) {
     const row = this.stmt(
       `SELECT COUNT(*) AS n
        FROM pr_files f
        JOIN pull_requests p ON p.id = f.pr_id
-       WHERE p.deleted_at IS NULL AND f.repo_id = ? AND f.patch IS NULL`,
+       WHERE p.deleted_at IS NULL AND f.repo_id = ? AND f.patch IS NULL${
+         opts.excludeBots ? BOT_AUTHOR_PR_FILTER : ''
+}`,
     ).get(repoId)
+    return Number(row?.n ?? 0)
+  }
+
+  /**
+   * Count of patch-less pr_files rows authored by a BOT, across all repos. Used
+   * purely for honest reporting: when patch backfill excludes bots, this is how
+   * many files were deliberately skipped (never blob-fetched). Not part of the
+   * pending/remaining accounting.
+   */
+  async countBotPrFilesMissingPatch() {
+    const row = this.stmt(
+      `SELECT COUNT(*) AS n
+       FROM pr_files f
+       JOIN pull_requests p ON p.id = f.pr_id
+       JOIN identities ai ON ai.id = p.author_identity_id
+       WHERE p.deleted_at IS NULL AND f.patch IS NULL AND ai.is_bot = 1`,
+    ).get()
     return Number(row?.n ?? 0)
   }
 
@@ -2910,44 +2968,74 @@ export class BunSqliteStore {
       throw new Error(`CandidateMatch ${id} is already resolved (${match.status})`)
     }
 
-    // The status flip and the two identity re-links must commit atomically:
-    // otherwise a crash between them leaves a `confirmed` match whose identities
-    // were never merged, and the merge can never be retried (the guard above
-    // refuses any non-pending match), so the person stays split forever.
+    // The link/merge and the status flip must commit atomically. The status flip
+    // happens LAST, so any guard throw below rolls the whole transaction back and
+    // the match stays 'pending' (retryable) — never consumed without effect.
     await this.transaction(async () => {
+      if (status === 'confirmed') {
+        const identityA = await this.findIdentityById(match.identityIdA)
+        const identityB = await this.findIdentityById(match.identityIdB)
+        if (!identityA || !identityB) {
+          throw new Error(
+            `Cannot confirm ${id}: identity not found ` + `(a=${!!identityA}, b=${!!identityB})`,
+          )
+        }
+
+        const targetPersonId = identityA.personId ?? identityB.personId
+        // Confirming with NO person on either side would mark the match confirmed
+        // without forming any link, permanently consuming it. Throw so it stays
+        // pending; the caller should assign a person first (link_identity).
+        if (!targetPersonId) {
+          throw new Error(
+            `Cannot confirm ${id}: neither identity is linked to a person — ` +
+              'assign one first via link_identity, then confirm',
+          )
+        }
+
+        // Full person-merge: when both identities already belong to DIFFERENT
+        // persons, migrate EVERY identity of the loser person to the winner (not
+        // just the matched pair), then delete the now-empty loser — otherwise the
+        // loser's other identities are stranded on a ghost person. A person still
+        // referenced by team_membership is never deleted (NOT NULL FK, no cascade).
+        const loserPersonId =
+          identityA.personId && identityB.personId && identityA.personId !== identityB.personId
+            ? identityA.personId === targetPersonId
+              ? identityB.personId
+              : identityA.personId
+            : null
+
+        if (loserPersonId) {
+          this.stmt(`UPDATE identities SET person_id = ?, updated_at = ? WHERE person_id = ?`).run(
+            targetPersonId,
+            decidedAt,
+            loserPersonId,
+          )
+          this.stmt(
+            `DELETE FROM persons WHERE id = ? AND id NOT IN (SELECT person_id FROM team_membership)`,
+          ).run(loserPersonId)
+        } else {
+          if (identityA.personId !== targetPersonId) {
+            this.stmt(`UPDATE identities SET person_id = ?, updated_at = ? WHERE id = ?`).run(
+              targetPersonId,
+              decidedAt,
+              identityA.id,
+            )
+          }
+          if (identityB.personId !== targetPersonId) {
+            this.stmt(`UPDATE identities SET person_id = ?, updated_at = ? WHERE id = ?`).run(
+              targetPersonId,
+              decidedAt,
+              identityB.id,
+            )
+          }
+        }
+      }
+
       this.stmt(
         `UPDATE candidate_matches
          SET status = ?, decided_by = ?, decided_at = ?, updated_at = ?
          WHERE id = ?`,
       ).run(status, decidedBy, decidedAt, decidedAt, id)
-
-      if (status === 'confirmed') {
-        // Merge: link both identities to the same person.
-        // Find or create a person for identityIdA; then link identityIdB to the same person.
-        const identityA = await this.findIdentityById(match.identityIdA)
-        const identityB = await this.findIdentityById(match.identityIdB)
-        if (!identityA || !identityB) return
-
-        // Determine target person: prefer an existing person_id, or identityA's
-        const targetPersonId = identityA.personId ?? identityB.personId
-        if (!targetPersonId) return // Neither has a person yet — stitchPersons should run first
-
-        // Link both to the same person
-        if (identityA.personId !== targetPersonId) {
-          this.stmt(`UPDATE identities SET person_id = ?, updated_at = ? WHERE id = ?`).run(
-            targetPersonId,
-            decidedAt,
-            identityA.id,
-          )
-        }
-        if (identityB.personId !== targetPersonId) {
-          this.stmt(`UPDATE identities SET person_id = ?, updated_at = ? WHERE id = ?`).run(
-            targetPersonId,
-            decidedAt,
-            identityB.id,
-          )
-        }
-      }
     })
   }
 

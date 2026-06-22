@@ -10,7 +10,7 @@
  */
 
 import { describe, expect, it } from 'bun:test'
-import { githubTokenFromEnv, githubTokenFromGhCli } from './config.js'
+import { githubTokenFromEnv, githubTokenFromGhCli, parseBool } from './config.js'
 
 describe('githubTokenFromEnv', () => {
   it('prefers LAZYFLOW_GITHUB_TOKEN over the conventional env vars', () => {
@@ -59,5 +59,25 @@ describe('githubTokenFromGhCli', () => {
   it('returns null when gh prints nothing', () => {
     expect(githubTokenFromGhCli(() => '')).toBeNull()
     expect(githubTokenFromGhCli(() => '   \n')).toBeNull()
+  })
+})
+
+describe('parseBool', () => {
+  it('uses the fallback for unset/empty (the plugin injects "")', () => {
+    expect(parseBool(undefined, true)).toBe(true)
+    expect(parseBool('', true)).toBe(true)
+    expect(parseBool('   ', false)).toBe(false)
+  })
+
+  it('treats explicit falsy tokens as false (case/whitespace-insensitive)', () => {
+    for (const v of ['false', 'FALSE', '0', 'no', 'off', ' Off ']) {
+      expect(parseBool(v, true)).toBe(false)
+    }
+  })
+
+  it('treats any other value as true', () => {
+    expect(parseBool('true', false)).toBe(true)
+    expect(parseBool('1', false)).toBe(true)
+    expect(parseBool('yes', false)).toBe(true)
   })
 })

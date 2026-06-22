@@ -21,7 +21,14 @@ import {
   listPendingAuthorshipVerdicts,
   recordAuthorshipVerdict,
 } from '../core/ai/authorshipVerdicts.js'
-import { BunSqliteStore, ENGINE_VERSION } from '../core/index.js'
+import {
+  BunSqliteStore,
+  confirmCandidateMatch,
+  ENGINE_VERSION,
+  listCandidateMatches,
+  rejectCandidateMatch,
+  unmergeIdentities,
+} from '../core/index.js'
 import { backfillAllPatches } from '../ingest-github/index.js'
 import {
   backfillSnapshots,
@@ -68,7 +75,7 @@ import {
 // ---------------------------------------------------------------------------
 
 const SERVER_NAME = 'lazy-flow'
-const SERVER_VERSION = '0.1.5'
+const SERVER_VERSION = '0.1.6'
 
 // Stale threshold: warn at 4h, refuse at 24h (SPEC §7.5)
 const STALE_WARN_MS = 4 * 60 * 60 * 1000
@@ -2082,6 +2089,349 @@ function registerGetSchemaTool(server, ctx) {
 }
 
 // ---------------------------------------------------------------------------
+// Tools: identity stitching review — confirm/reject queued matches + manual link
+// ---------------------------------------------------------------------------
+
+/**
+ * Human-readable summary of an identity for the stitch-review tools: its kind,
+ * external id, the person it links to (if any), and a best-effort display label
+ * (Jira displayName / GitHub login / commit email from the raw payload).
+ */
+async function summariseIdentity(store, identityId) {
+  if (!identityId) return null
+  const id = await store.findIdentityById(identityId)
+  if (!id) return { id: identityId, missing: true }
+  let label = id.externalId
+  try {
+    const raw = JSON.parse(id.raw ?? '{}')
+    label = raw.displayName ?? raw.login ?? raw.email ?? id.externalId
+  } catch {
+    // raw not JSON — fall back to externalId.
+  }
+  let personName = null
+  if (id.personId) {
+    const p = await store.getPerson(id.personId)
+    personName = p?.displayName ?? null
+  }
+  return {
+    id: id.id,
+    kind: id.kind,
+    externalId: id.externalId,
+    label,
+    personId: id.personId,
+    personName,
+  }
+}
+
+function registerListIdentityMatchesTool(server, ctx) {
+  server.registerTool(
+    'list_identity_matches',
+    {
+      title: 'List Identity Match Candidates',
+      description:
+        'List identity-stitch candidates from the human-confirm queue, each side resolved (kind, ' +
+        'external id, linked person, display label) so you can decide. Default status "pending". ' +
+        'Then use resolve_identity_match to confirm/reject, or link_identity to assign manually. ' +
+        'Two candidates pointing at the SAME person are NOT a conflict — confirm both to attach two ' +
+        "accounts (e.g. a person's work + personal GitHub) to one person.",
+      inputSchema: z.object({
+        status: z.enum(['pending', 'confirmed', 'rejected']).optional(),
+      }),
+    },
+    async ({ status }) => {
+      const st = status ?? 'pending'
+      const matches = await listCandidateMatches(ctx.store, { status: st })
+      const rows = []
+      for (const m of matches) {
+        rows.push({
+          match_id: m.id,
+          reason: m.reason,
+          confidence: m.confidence,
+          status: m.status,
+          a: await summariseIdentity(ctx.store, m.identityIdA),
+          b: await summariseIdentity(ctx.store, m.identityIdB),
+        })
+      }
+      const output = { ...provenance('n/a'), status: st, count: rows.length, matches: rows }
+      return {
+        content: [{ type: 'text', text: JSON.stringify(output) }],
+        structuredContent: output,
+      }
+    },
+  )
+}
+
+function registerResolveIdentityMatchTool(server, ctx) {
+  server.registerTool(
+    'resolve_identity_match',
+    {
+      title: 'Confirm or Reject an Identity Match',
+      description:
+        'Confirm (merge both identities under one person — if they belong to two DIFFERENT persons, ' +
+        'every identity of the loser person migrates to the winner and the loser is removed) or reject ' +
+        '(keep separate; suppress from the queue) a candidate from list_identity_matches. Confirm needs ' +
+        'at least ONE side already linked to a person — otherwise it errors and the match stays pending ' +
+        '(use link_identity first). Pass dry_run:true to preview without writing. Audited; a confirm is ' +
+        'reversible via unmerge_identity_match.',
+      inputSchema: z.object({
+        match_id: z.string(),
+        decision: z.enum(['confirm', 'reject']),
+        decided_by: z.string().optional().describe('Who decided (audit). Default "mcp-agent".'),
+        dry_run: z.boolean().optional().describe('Preview the effect without writing.'),
+      }),
+    },
+    async ({ match_id, decision, decided_by, dry_run }) => {
+      const now = new Date().toISOString()
+      const actor = decided_by ?? 'mcp-agent'
+      const mk = (extra) => {
+        const output = { ...provenance('n/a'), match_id, decision, ...extra }
+        return {
+          content: [{ type: 'text', text: JSON.stringify(output) }],
+          structuredContent: output,
+        }
+      }
+      const match = await ctx.store.getCandidateMatch(match_id)
+      if (!match) return mk({ error: `candidate match not found: ${match_id}` })
+      if (match.status !== 'pending') return mk({ error: `match already ${match.status}` })
+
+      const a = await summariseIdentity(ctx.store, match.identityIdA)
+      const b = await summariseIdentity(ctx.store, match.identityIdB)
+
+      if (decision === 'confirm') {
+        const targetPersonId = a?.personId ?? b?.personId ?? null
+        if (!targetPersonId) {
+          return mk({
+            error:
+              'neither identity is linked to a person — use link_identity to assign one first, then confirm',
+            a,
+            b,
+          })
+        }
+        // Would this merge two distinct persons (migrating the loser's identities)?
+        const loserPersonId =
+          a?.personId && b?.personId && a.personId !== b.personId
+            ? a.personId === targetPersonId
+              ? b.personId
+              : a.personId
+            : null
+        if (dry_run) {
+          return mk({
+            dryRun: true,
+            wouldLinkPersonId: targetPersonId,
+            wouldMergePersons: !!loserPersonId,
+            loserPersonId,
+            a,
+            b,
+          })
+        }
+        try {
+          await confirmCandidateMatch(ctx.store, match_id, actor, now)
+        } catch (err) {
+          return mk({ error: err instanceof Error ? err.message : String(err), a, b })
+        }
+        await ctx.store.appendIdentityAudit({
+          id: crypto.randomUUID(),
+          action: 'confirm_match',
+          identityId: match.identityIdB,
+          fromPersonId: b?.personId ?? null,
+          toPersonId: targetPersonId,
+          matchId: match_id,
+          decidedBy: actor,
+          note: loserPersonId ? `merged person ${loserPersonId} into ${targetPersonId}` : null,
+          createdAt: now,
+        })
+        return mk({ linkedPersonId: targetPersonId, mergedPersons: !!loserPersonId, loserPersonId })
+      }
+
+      // reject
+      if (dry_run) return mk({ dryRun: true, wouldReject: true, a, b })
+      try {
+        await rejectCandidateMatch(ctx.store, match_id, actor, now)
+      } catch (err) {
+        return mk({ error: err instanceof Error ? err.message : String(err) })
+      }
+      await ctx.store.appendIdentityAudit({
+        id: crypto.randomUUID(),
+        action: 'reject_match',
+        identityId: match.identityIdA,
+        matchId: match_id,
+        decidedBy: actor,
+        createdAt: now,
+      })
+      return mk({ rejected: true })
+    },
+  )
+}
+
+function registerLinkIdentityTool(server, ctx) {
+  server.registerTool(
+    'link_identity',
+    {
+      title: 'Manually Link or Unlink an Identity',
+      description:
+        'Manually assign an identity to a person when the auto-stitcher had no signal — e.g. a legacy ' +
+        'commit email (old@company.com) or a personal GitHub account belonging to a known person. ' +
+        'Provide to_person_id (a persons.id) OR to_identity_id (adopt THAT identity’s person). Set ' +
+        'unlink:true to detach. Refuses bot identities and self-links; warns when it would leave the ' +
+        'source person with no identities. Pass dry_run:true to preview. Audited; survives re-syncs.',
+      inputSchema: z.object({
+        identity_id: z.string().describe('The identity to (re)assign (identities.id).'),
+        to_person_id: z.string().optional().describe('Target persons.id to link to.'),
+        to_identity_id: z
+          .string()
+          .optional()
+          .describe('Adopt the person of this already-linked identity.'),
+        unlink: z.boolean().optional().describe('If true, detach the identity from its person.'),
+        dry_run: z.boolean().optional().describe('Preview the effect without writing.'),
+        decided_by: z.string().optional().describe('Who decided (audit). Default "mcp-agent".'),
+      }),
+    },
+    async ({ identity_id, to_person_id, to_identity_id, unlink, dry_run, decided_by }) => {
+      const now = new Date().toISOString()
+      const actor = decided_by ?? 'mcp-agent'
+      const mk = (extra) => {
+        const output = { ...provenance('n/a'), identity_id, ...extra }
+        return {
+          content: [{ type: 'text', text: JSON.stringify(output) }],
+          structuredContent: output,
+        }
+      }
+      // Warn if leaving `personId` with zero identities (it will be GC'd next sync).
+      const orphanWarn = async (personId) => {
+        if (!personId) return null
+        const sibs = await ctx.store.getIdentitiesByPerson(personId)
+        return sibs.length <= 1
+          ? `person ${personId} will have no identities left and be removed on the next sync`
+          : null
+      }
+
+      const id = await ctx.store.findIdentityById(identity_id)
+      if (!id) return mk({ error: `identity not found: ${identity_id}` })
+      // A bot identity must never be attached to a person (it would pollute that
+      // person's metrics). Unlinking a bot is always allowed.
+      if (!unlink && id.isBot) {
+        return mk({ error: `${identity_id} is a bot identity — bots are excluded from persons` })
+      }
+
+      if (unlink) {
+        const warning = await orphanWarn(id.personId)
+        if (dry_run)
+          return mk({
+            dryRun: true,
+            wouldUnlink: true,
+            fromPersonId: id.personId,
+            orphanWarning: warning,
+          })
+        await ctx.store.setIdentityPerson(identity_id, null, now)
+        await ctx.store.appendIdentityAudit({
+          id: crypto.randomUUID(),
+          action: 'unlink',
+          identityId: identity_id,
+          fromPersonId: id.personId,
+          toPersonId: null,
+          decidedBy: actor,
+          note: warning,
+          createdAt: now,
+        })
+        return mk({ unlinked: true, orphanWarning: warning })
+      }
+
+      if (to_identity_id && to_identity_id === identity_id) {
+        return mk({ error: 'identity_id and to_identity_id must be different' })
+      }
+
+      let targetPersonId = to_person_id ?? null
+      if (!targetPersonId && to_identity_id) {
+        const target = await ctx.store.findIdentityById(to_identity_id)
+        if (!target) return mk({ error: `to_identity_id not found: ${to_identity_id}` })
+        if (!target.personId) {
+          return mk({
+            error: `to_identity_id ${to_identity_id} has no person yet — pass to_person_id, or link that identity first`,
+          })
+        }
+        targetPersonId = target.personId
+      }
+      if (!targetPersonId) {
+        return mk({ error: 'provide one of: to_person_id, to_identity_id, or unlink:true' })
+      }
+
+      const person = await ctx.store.getPerson(targetPersonId)
+      if (!person) return mk({ error: `person not found: ${targetPersonId}` })
+
+      // Reassigning away from a current (different) person may orphan it.
+      const warning =
+        id.personId && id.personId !== targetPersonId ? await orphanWarn(id.personId) : null
+
+      if (dry_run) {
+        return mk({
+          dryRun: true,
+          wouldLinkPersonId: targetPersonId,
+          personName: person.displayName ?? null,
+          orphanWarning: warning,
+        })
+      }
+      await ctx.store.setIdentityPerson(identity_id, targetPersonId, now)
+      await ctx.store.appendIdentityAudit({
+        id: crypto.randomUUID(),
+        action: 'link',
+        identityId: identity_id,
+        fromPersonId: id.personId,
+        toPersonId: targetPersonId,
+        decidedBy: actor,
+        note: warning,
+        createdAt: now,
+      })
+      return mk({
+        linkedPersonId: targetPersonId,
+        personName: person.displayName ?? null,
+        orphanWarning: warning,
+      })
+    },
+  )
+}
+
+function registerUnmergeIdentityMatchTool(server, ctx) {
+  server.registerTool(
+    'unmerge_identity_match',
+    {
+      title: 'Un-merge a Confirmed Identity Match',
+      description:
+        'Reverse a previously CONFIRMED candidate match: detaches the less-anchored identity ' +
+        '(commit_email before login/account) back to no person, non-destructively. The candidate-match ' +
+        'history is preserved. Use when a confirm or auto-stitch merged the wrong identities. Audited.',
+      inputSchema: z.object({
+        match_id: z.string(),
+        decided_by: z.string().optional().describe('Who decided (audit). Default "mcp-agent".'),
+      }),
+    },
+    async ({ match_id, decided_by }) => {
+      const now = new Date().toISOString()
+      const actor = decided_by ?? 'mcp-agent'
+      const mk = (extra) => {
+        const output = { ...provenance('n/a'), match_id, ...extra }
+        return {
+          content: [{ type: 'text', text: JSON.stringify(output) }],
+          structuredContent: output,
+        }
+      }
+      try {
+        await unmergeIdentities(ctx.store, match_id, now)
+      } catch (err) {
+        return mk({ error: err instanceof Error ? err.message : String(err) })
+      }
+      await ctx.store.appendIdentityAudit({
+        id: crypto.randomUUID(),
+        action: 'unmerge',
+        matchId: match_id,
+        decidedBy: actor,
+        createdAt: now,
+      })
+      return mk({ unmerged: true })
+    },
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Tool: get_person_report — the per-person insight suite (cohort + trend)
 // ---------------------------------------------------------------------------
 
@@ -2290,7 +2640,9 @@ function registerBackfillPrPatchesTool(server, ctx) {
         'to process EVERY remaining file to completion in one call (use before a verdict pass so ' +
         'diff-level metrics see the full diff set); otherwise `limit` bounds one chunk. NOTE: ' +
         'code.haloc_aggregate does NOT need this — it always uses the complete denormalised HALOC ' +
-        'column; backfill is only required for the diff-level verdict layer.',
+        'column; backfill is only required for the diff-level verdict layer. Bot-authored PRs ' +
+        '(dependabot etc.) are skipped by default (LAZYFLOW_SKIP_BOT_PATCHES) and reported as ' +
+        'botFilesExcluded — no blobs fetched, no DB bloat.',
       inputSchema: z.object({
         limit: z
           .number()
@@ -2316,17 +2668,25 @@ function registerBackfillPrPatchesTool(server, ctx) {
         return inputError('GitHub client not configured — LAZYFLOW_GITHUB_TOKEN required.')
       }
       const cap = limit ?? 500
+      // Skip bot-authored PRs (dependabot lockfile bumps etc.) by default — no
+      // analytical value (bots are excluded from verdicts/person metrics) and a
+      // big blob-fetch + DB-bloat saving. Overridable via LAZYFLOW_SKIP_BOT_PATCHES.
+      const excludeBots = ctx.config.skipBotPatches !== false
       const res = drain
-        ? await backfillAllPatches(ctx.store, ctx.githubClient, { drain: true })
-        : await backfillAllPatches(ctx.store, ctx.githubClient, { maxFiles: cap })
+        ? await backfillAllPatches(ctx.store, ctx.githubClient, { drain: true, excludeBots })
+        : await backfillAllPatches(ctx.store, ctx.githubClient, { maxFiles: cap, excludeBots })
       // Backfill rewrites pr_files.patch AND the denormalised pr_files.haloc, so
       // any memoised scope data (FULL_SCOPE_MEMO) derived before the backfill will
       // contain stale haloc values. Invalidate so the next get_* call reloads.
       invalidateLookupsCache(ctx.store)
+      // Honest reporting: how many patch-less files we deliberately skipped
+      // because their PR author is a bot (never blob-fetched).
+      const botFilesExcluded = excludeBots ? await ctx.store.countBotPrFilesMissingPatch() : 0
       const output = {
         backfilled: res.backfilled,
         skipped: res.skipped,
         remaining: res.remaining,
+        botFilesExcluded,
         drained: res.drained ?? false,
         repos: res.repos,
       }
@@ -2366,6 +2726,10 @@ export function createServer(ctx) {
   registerRecordAiAuthorshipVerdictTool(server, ctx)
   registerBackfillPrPatchesTool(server, ctx)
   registerGetSchemaTool(server, ctx)
+  registerListIdentityMatchesTool(server, ctx)
+  registerResolveIdentityMatchTool(server, ctx)
+  registerLinkIdentityTool(server, ctx)
+  registerUnmergeIdentityMatchTool(server, ctx)
 
   // Tools — reporting
   registerGenerateReportTool(server, ctx)

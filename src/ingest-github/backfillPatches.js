@@ -27,12 +27,14 @@ function halocOfPatch(path, patch, additions, deletions) {
 /**
  * @param store   BunSqliteStore
  * @param client  GitHubClient (uses client.fetchBlobs — GraphQL)
- * @param opts    { owner, name, repoId?, limit? } — limit caps files per call
- *                (bounds blob volume); re-run to continue (idempotent).
+ * @param opts    { owner, name, repoId?, limit?, excludeBots? } — limit caps
+ *                files per call (bounds blob volume); re-run to continue
+ *                (idempotent). excludeBots drops bot-authored PRs so their
+ *                files (e.g. dependabot lockfile bumps) are never blob-fetched.
  * Returns { prFilesPending, eligible, backfilled, skipped, remaining }.
  */
 export async function backfillPrPatches(store, client, opts) {
-  const { owner, name, repoId, limit } = opts
+  const { owner, name, repoId, limit, excludeBots = false } = opts
   const refByPr = new Map((await store.getAllPrRefs()).map((r) => [r.prId, r]))
 
   // Patch-less rows ONLY, scoped to this repo, capped at `limit` (or a sane
@@ -52,15 +54,15 @@ export async function backfillPrPatches(store, client, opts) {
   let pending
   let prFilesPending
   if (repoScope) {
-    pending = await store.getPrFilesMissingPatchByRepo(repoScope, chunkSize)
-    prFilesPending = await store.countPrFilesMissingPatchByRepo(repoScope)
+    pending = await store.getPrFilesMissingPatchByRepo(repoScope, chunkSize, { excludeBots })
+    prFilesPending = await store.countPrFilesMissingPatchByRepo(repoScope, { excludeBots })
   } else {
     // Direct caller did not narrow by repo. Collect pending files across all
     // repos — but we can only fetch blobs for a single (owner, name) endpoint
     // per call. Guard: if files span more than one repo the caller has not
     // supplied enough information to fetch correctly, so fail fast rather than
     // silently fetching the wrong blobs.
-    const repoIdsWithWork = await store.getRepoIdsWithMissingPatches()
+    const repoIdsWithWork = await store.getRepoIdsWithMissingPatches({ excludeBots })
     if (repoIdsWithWork.length > 1) {
       throw new Error(
         'backfillPrPatches called without repoId but patch-less files span ' +
@@ -71,9 +73,11 @@ export async function backfillPrPatches(store, client, opts) {
     pending = []
     prFilesPending = 0
     for (const id of repoIdsWithWork) {
-      prFilesPending += await store.countPrFilesMissingPatchByRepo(id)
+      prFilesPending += await store.countPrFilesMissingPatchByRepo(id, { excludeBots })
       if (pending.length < chunkSize) {
-        const more = await store.getPrFilesMissingPatchByRepo(id, chunkSize - pending.length)
+        const more = await store.getPrFilesMissingPatchByRepo(id, chunkSize - pending.length, {
+          excludeBots,
+        })
         for (const f of more) pending.push(f)
       }
     }
@@ -164,6 +168,7 @@ export async function backfillPrPatches(store, client, opts) {
  * @returns { backfilled, skipped, remaining, repos: [{ repo, ...res }], errors }
  */
 export async function backfillAllPatches(store, client, opts = {}) {
+  const excludeBots = opts.excludeBots ?? false
   // Drain mode: process EVERY patch-less file across all repos to completion,
   // looping in bounded chunks. Used by the explicit `backfill_pr_patches` tool
   // (drain:true) before a verdict pass — the per-sync auto-backfill stays
@@ -179,7 +184,7 @@ export async function backfillAllPatches(store, client, opts = {}) {
     // previous `getAllPrFiles().filter(...).map(repoId)` materialised the full
     // patch-bearing table (hundreds of MB) just to read a handful of distinct
     // ids.
-    const repoIds = await store.getRepoIdsWithMissingPatches()
+    const repoIds = await store.getRepoIdsWithMissingPatches({ excludeBots })
     const repos = []
     const errors = []
     let backfilled = 0
@@ -200,6 +205,7 @@ export async function backfillAllPatches(store, client, opts = {}) {
             name: repo.name,
             repoId,
             limit: chunk,
+            excludeBots,
           })
         } catch (err) {
           errors.push(
@@ -227,7 +233,7 @@ export async function backfillAllPatches(store, client, opts = {}) {
   }
 
   const maxFiles = opts.maxFiles ?? 500
-  const repoIds = await store.getRepoIdsWithMissingPatches()
+  const repoIds = await store.getRepoIdsWithMissingPatches({ excludeBots })
   const repos = []
   const errors = []
   let backfilled = 0
@@ -238,7 +244,7 @@ export async function backfillAllPatches(store, client, opts = {}) {
     // cheap COUNT — the previous tally re-loaded the entire patch-bearing
     // pr_files table to filter in memory.
     if (backfilled >= maxFiles) {
-      remaining += await store.countPrFilesMissingPatchByRepo(repoId)
+      remaining += await store.countPrFilesMissingPatchByRepo(repoId, { excludeBots })
       continue
     }
     const repo = await store.getRepository(repoId)
@@ -249,6 +255,7 @@ export async function backfillAllPatches(store, client, opts = {}) {
         name: repo.name,
         repoId,
         limit: maxFiles - backfilled,
+        excludeBots,
       })
       backfilled += res.backfilled
       skipped += res.skipped

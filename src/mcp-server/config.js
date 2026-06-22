@@ -55,6 +55,16 @@ function parseNonNegInt(raw) {
   return Number.isFinite(n) && n > 0 ? n : 0
 }
 
+/**
+ * Parse a boolean from an env string with an explicit default for unset/empty
+ * (the plugin maps an unfilled config field to ""). Only the explicit falsy
+ * tokens turn it off; anything else with a value is true.
+ */
+export function parseBool(raw, fallback) {
+  if (raw === undefined || raw === null || String(raw).trim() === '') return fallback
+  return !['false', '0', 'no', 'off'].includes(String(raw).trim().toLowerCase())
+}
+
 /** First env var in `keys` with a non-empty, trimmed value; else null. */
 function firstNonEmptyEnv(env, keys) {
   for (const key of keys) {
@@ -120,6 +130,10 @@ export function loadConfig() {
     repos: parseList(env.LAZYFLOW_REPOS),
     // Org-wildcard idle filter: skip ORG/* repos with no push in N days. 0 = off.
     repoMaxIdleDays: parseNonNegInt(env.LAZYFLOW_REPO_MAX_IDLE_DAYS),
+    // Skip the patch/blob analysis for bot-authored PRs (dependabot lockfile
+    // bumps etc.) — saves blob-fetch budget + DB bloat with no analytical loss
+    // (bots are excluded from verdicts/person metrics anyway). Default ON.
+    skipBotPatches: parseBool(env.LAZYFLOW_SKIP_BOT_PATCHES, true),
     jiraProjects: parseList(env.LAZYFLOW_JIRA_PROJECTS),
     jiraBaseUrl: env.LAZYFLOW_JIRA_BASE_URL ?? '',
     // Atlassian account email — REQUIRED for an API token (Basic auth) against a

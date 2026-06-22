@@ -1,11 +1,13 @@
 import { MIGRATION_0001_DOWN, MIGRATION_0001_UP } from './migrations/0001_initial_schema.js'
+import { MIGRATION_0002_DOWN, MIGRATION_0002_UP } from './migrations/0002_identity_audit.js'
 
 /**
  * The ordered list of all migrations.
  *
- * Pre-launch, the history is kept flattened to this single consolidated baseline
- * (no need for incremental migrations yet). Once v1 ships, append new migrations
- * here at version 2 and upward — never edit the baseline again.
+ * Version 1 is the consolidated pre-launch baseline; never edit it. Incremental
+ * migrations resume at version 2 — they apply to existing databases on next open
+ * (a new CREATE TABLE is non-destructive), which is exactly why the identity_audit
+ * table is a forward migration rather than folded into the baseline.
  */
 export const MIGRATIONS = [
   {
@@ -13,6 +15,12 @@ export const MIGRATIONS = [
     description: 'initial_schema',
     up: MIGRATION_0001_UP,
     down: MIGRATION_0001_DOWN,
+  },
+  {
+    version: 2,
+    description: 'identity_audit',
+    up: MIGRATION_0002_UP,
+    down: MIGRATION_0002_DOWN,
   },
 ]
 
