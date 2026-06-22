@@ -240,7 +240,7 @@ function registerDoctorTool(server, ctx) {
           ? 'LAZYFLOW_JIRA_TOKEN not set — Jira sync unavailable'
           : jiraMissing.length > 0
             ? `LAZYFLOW_JIRA_TOKEN set but ${jiraMissing.join(' + ')} missing — Jira sync will be skipped/403 until set`
-            : 'Jira token + email + base URL configured (Basic auth)',
+            : `Jira token + email + base URL (${ctx.config.jiraBaseUrl}) configured (Basic auth)`,
       })
 
       // 4. Repos configured. NOTE: this checks config PRESENCE, not live
@@ -249,9 +249,12 @@ function registerDoctorTool(server, ctx) {
       checks.push({
         name: 'repos_configured',
         status: ctx.config.repos.length > 0 ? 'ok' : 'warn',
+        // Surface the actual patterns (not just a count) so Claude can report the
+        // configured scope from this tool — it never needs to read .env to find
+        // out which repos are tracked. These are non-secret operational config.
         message:
           ctx.config.repos.length > 0
-            ? `${ctx.config.repos.length} repo pattern(s) configured (run run_sync to verify they resolve)`
+            ? `${ctx.config.repos.length} repo pattern(s) configured: ${ctx.config.repos.join(', ')} (run run_sync to verify they resolve)`
             : 'LAZYFLOW_REPOS not set — no repos to sync',
       })
 
@@ -261,9 +264,10 @@ function registerDoctorTool(server, ctx) {
         checks.push({
           name: 'jira_projects_configured',
           status: ctx.config.jiraProjects.length > 0 ? 'ok' : 'warn',
+          // Surface the actual project keys so scope is readable from doctor.
           message:
             ctx.config.jiraProjects.length > 0
-              ? `${ctx.config.jiraProjects.length} Jira project(s) configured`
+              ? `${ctx.config.jiraProjects.length} Jira project(s) configured: ${ctx.config.jiraProjects.join(', ')}`
               : 'LAZYFLOW_JIRA_PROJECTS not set — Jira sync will ingest 0 issues',
         })
       }
