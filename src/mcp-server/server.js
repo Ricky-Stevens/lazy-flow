@@ -68,7 +68,7 @@ import {
 // ---------------------------------------------------------------------------
 
 const SERVER_NAME = 'lazy-flow'
-const SERVER_VERSION = '0.1.1'
+const SERVER_VERSION = '0.1.2'
 
 // Stale threshold: warn at 4h, refuse at 24h (SPEC §7.5)
 const STALE_WARN_MS = 4 * 60 * 60 * 1000
@@ -129,11 +129,26 @@ const SNAPSHOT_HISTORY_DAYS = 119
  * backfill uses, so a re-derived snapshot reconverges with its backfilled value.
  */
 function makeComputeDayFn(ctx, now) {
-  return async (scopeType, scopeId, metricId, day) => {
+  // Per-DAY batch: load + slice the rolling window ONCE (the bulk DB load is
+  // memoised across the whole pass; the slice is then shared by every metric for
+  // this day), then compute each metric against that in-memory slice via the
+  // `preloaded` arg — no per-metric re-read or re-slice. Opt into the patch-bearing
+  // pr_files variant only when a stale metric needs it. Mirrors backfillSnapshots.
+  return async (scopeType, scopeId, day, metricIds) => {
     const windowFrom = new Date(Date.parse(day) - (SNAPSHOT_WINDOW_DAYS - 1) * 86_400_000)
       .toISOString()
       .slice(0, 10)
-    return computeMetric(ctx.store, scopeType, scopeId, metricId, windowFrom, day, now)
+    const data = await loadScopeData(ctx.store, windowFrom, day, {
+      needsPatch: metricSetNeedsPatch(metricIds),
+    })
+    const results = new Map()
+    for (const metricId of metricIds) {
+      results.set(
+        metricId,
+        await computeMetric(ctx.store, scopeType, scopeId, metricId, windowFrom, day, now, data),
+      )
+    }
+    return results
   }
 }
 
@@ -146,7 +161,7 @@ function makeComputeDayFn(ctx, now) {
  * (run_sync) and server startup so an engine upgrade can never leave a series
  * silently mixing formula versions.
  */
-async function rederiveOnEngineBump(ctx, now) {
+async function rederiveOnEngineBump(ctx, now, signal) {
   // Runs after ingestion (inside runSync) and at startup; drop any stale lookup
   // memo so the recompute reads post-write pr_refs / file_complexity / statuses.
   invalidateLookupsCache(ctx.store)
@@ -160,8 +175,9 @@ async function rederiveOnEngineBump(ctx, now) {
     metricIds: COMPUTE_METRIC_IDS,
     fromDay,
     toDay: today,
-    computeFn: makeComputeDayFn(ctx, now),
+    computeDay: makeComputeDayFn(ctx, now),
     now,
+    signal,
   })
 }
 
@@ -2340,20 +2356,58 @@ export function createServer(ctx) {
   return server
 }
 
-/** Start the MCP server on stdio. */
-export async function startServer(ctx) {
+/**
+ * Start the MCP server on stdio.
+ *
+ * `opts.transport` / `opts.rederive` are injectable for tests; production uses
+ * the stdio transport and the real engine-bump re-derive. Returns the connected
+ * server and the (still-running) background re-derive promise so callers/tests
+ * can await it — the entrypoint ignores the return.
+ */
+export async function startServer(ctx, opts = {}) {
   const server = createServer(ctx)
+  const usingDefaultTransport = !opts.transport
+  const transport = opts.transport ?? new StdioServerTransport()
+  // AbortSignal lets a graceful shutdown stop a long background re-derive between
+  // days (see rederiveStaleEngineSnapshots) so it can't keep the event loop busy
+  // through teardown.
+  const abort = new AbortController()
+  const rederive = opts.rederive ?? ((now, signal) => rederiveOnEngineBump(ctx, now, signal))
 
-  // Engine-version-bump re-derivation on startup (SPEC §8.6): if ENGINE_VERSION
-  // has bumped since the stored snapshots were written, re-derive the stale ones
-  // so reads never silently mix formula versions. No-op when versions match.
-  // Best-effort: a failure here must not prevent the server from starting.
-  try {
-    await rederiveOnEngineBump(ctx, new Date().toISOString())
-  } catch (err) {
-    process.stderr.write(`lazy-flow: startup rederive failed: ${String(err)}\n`)
+  // Connect FIRST so the MCP handshake always completes promptly, whatever the
+  // DB size. The engine-bump re-derive (below) can take MINUTES on a large
+  // pre-existing DB after an ENGINE_VERSION bump; awaiting it before connect (the
+  // original ordering) stalled the handshake past the client's startup timeout,
+  // so the server was killed before any tool loaded — every user with existing
+  // data hit this on an engine-version upgrade.
+  await server.connect(transport)
+
+  // Only the real stdio startup installs shutdown hooks; tests inject a transport.
+  if (usingDefaultTransport) {
+    const onShutdown = () => abort.abort()
+    process.once('SIGTERM', onShutdown)
+    process.once('SIGINT', onShutdown)
   }
 
-  const transport = new StdioServerTransport()
-  await server.connect(transport)
+  // Engine-version-bump re-derivation (SPEC §8.6): if ENGINE_VERSION has bumped
+  // since the stored snapshots were written, re-derive the stale ones so reads
+  // never silently mix formula versions. Runs in the BACKGROUND after connect —
+  // a no-op when nothing is stale, bounded to SNAPSHOT_HISTORY_DAYS when a
+  // populated DB upgrades. Fire-and-forget: a slow or failing re-derive must
+  // never block startup (this is the same trigger run_sync already invokes).
+  const rederivePromise = Promise.resolve()
+    .then(() => rederive(new Date().toISOString(), abort.signal))
+    .then((res) => {
+      if (res && res.failed > 0) {
+        process.stderr.write(
+          `lazy-flow: startup rederive recomputed ${res.recomputed} snapshot(s); ` +
+            `${res.failed} left stale after compute errors\n`,
+        )
+      }
+    })
+    .catch((err) => {
+      process.stderr.write(`lazy-flow: startup rederive failed: ${String(err)}\n`)
+    })
+
+  return { server, rederivePromise, abort }
 }

@@ -26,7 +26,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import { BunSqliteStore, ENGINE_VERSION, migrate } from '../core/index.js'
 import { loadConfig } from './config.js'
 
-import { createServer } from './server.js'
+import { createServer, startServer } from './server.js'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -127,6 +127,53 @@ describe('MCP server — bootstrap', () => {
     ].sort()
 
     expect(names).toEqual(expected)
+  })
+
+  it('startServer connects BEFORE the engine-bump re-derive completes (no startup block)', async () => {
+    // Regression: startServer awaited rederiveOnEngineBump before connecting the
+    // transport. On a large pre-existing DB after an ENGINE_VERSION bump the
+    // re-derive runs for minutes, so the MCP handshake timed out and the server
+    // was killed before any tool loaded. The re-derive must now run in the
+    // background AFTER connect.
+    const ctx = makeTestCtx()
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+
+    let rederiveStarted = false
+    let rederiveDone = false
+    let releaseRederive
+    const rederiveGate = new Promise((resolve) => {
+      releaseRederive = resolve
+    })
+    const slowRederive = async () => {
+      rederiveStarted = true
+      await rederiveGate // simulate a long-running re-derive
+      rederiveDone = true
+    }
+
+    const { server, rederivePromise } = await startServer(ctx, {
+      transport: serverTransport,
+      rederive: slowRederive,
+    })
+
+    // startServer has resolved → the transport is connected. The slow re-derive
+    // was kicked off but must NOT have been awaited (else this line is unreached).
+    expect(rederiveStarted).toBe(true)
+    expect(rederiveDone).toBe(false)
+
+    // The client can complete the handshake + list tools while the re-derive is
+    // still pending — proving the server is live, not blocked.
+    const client = new Client({ name: 'test-client', version: '0.0.0' })
+    await client.connect(clientTransport)
+    const { tools } = await client.listTools()
+    expect(tools.length).toBeGreaterThan(0)
+
+    // Let the background re-derive finish; it completes without blocking startup.
+    releaseRederive()
+    await rederivePromise
+    expect(rederiveDone).toBe(true)
+
+    await client.close()
+    await server.close()
   })
 
   it('get_schema returns the schema guide + live DDL (tool mirror of the resource)', async () => {

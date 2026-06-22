@@ -227,7 +227,22 @@ export async function rederiveStaleSnapshots(
  * days flagged stale here and stamps the current ENGINE_VERSION + watermark.
  */
 export async function rederiveStaleEngineSnapshots(opts) {
-  const { store, scopes, metricIds, fromDay, toDay, computeFn, now } = opts
+  const { store, scopes, metricIds, fromDay, toDay, now, signal } = opts
+  const yieldEvery = opts.yieldEvery ?? 1
+
+  // Compute contract: a per-DAY batch that loads/slices the rolling window ONCE
+  // and recomputes every requested metric against that one in-memory slice
+  // (production passes `computeDay`). Legacy callers/tests pass a per-(metric,day)
+  // `computeFn`; adapt it so both share the same resilient orchestration below.
+  const computeDay =
+    opts.computeDay ??
+    (async (scopeType, scopeId, day, ids) => {
+      const out = new Map()
+      for (const metricId of ids) {
+        out.set(metricId, await opts.computeFn(scopeType, scopeId, metricId, day))
+      }
+      return out
+    })
 
   // Bound the scan to the requested window up front so we never enumerate an
   // unbounded history (the window is the caller's responsibility).
@@ -236,43 +251,126 @@ export async function rederiveStaleEngineSnapshots(opts) {
   let bumpDetected = false
   let markedStale = 0
   let recomputed = 0
+  let failed = 0
+  let daysProcessed = 0
 
   for (const { scopeType, scopeId } of scopes) {
-    for (const metricId of metricIds) {
-      const stored = await store.getSnapshots(scopeType, scopeId, metricId, fromDay, toDay)
+    if (signal?.aborted) break
 
-      // Days whose stored snapshot was computed by a DIFFERENT engine version.
-      // De-duplicate days (a day can carry multiple rows across watermark versions).
-      const staleDays = new Set()
-      for (const snap of stored) {
-        if (snap.engineVersion !== ENGINE_VERSION && windowDays.has(snap.day)) {
-          staleDays.add(snap.day)
+    // Discover stale cells with ONE snapshot read per (scope, metric) — the old
+    // path read here AND AGAIN inside the per-metric recompute helper. Grouped by
+    // day so all of a day's metrics share a single window load/slice below.
+    const { byDay, count } = await collectStaleCells(
+      store,
+      scopeType,
+      scopeId,
+      metricIds,
+      fromDay,
+      toDay,
+      windowDays,
+    )
+    if (count === 0) continue
+    bumpDetected = true
+    markedStale += count
+
+    // The ingest watermark is constant across the whole pass — read it ONCE per
+    // scope, not once per (metric, day) as the old recompute helper did.
+    const syncState = await store.getSyncState('github', 'pulls', scopeId)
+    const ingestWatermarkVersion = syncState?.watermarkAt ?? 'unknown'
+    const coverageFingerprint = buildCoverageFingerprint(ingestWatermarkVersion)
+
+    for (const [day, cells] of byDay) {
+      if (signal?.aborted) break
+      const ids = [...cells.keys()]
+
+      let results
+      try {
+        results = await computeDay(scopeType, scopeId, day, ids)
+      } catch {
+        // Whole-day load/compute failed: leave those cells at their old engine
+        // version (re-detected on the next pass) and flag them stale so reads
+        // don't trust them. One bad day never aborts the rest of the pass.
+        for (const metricId of ids) {
+          await store.markSnapshotsStale(scopeType, scopeId, metricId, day)
         }
+        failed += ids.length
+        continue
       }
 
-      if (staleDays.size === 0) continue
-      bumpDetected = true
-
-      for (const day of staleDays) {
-        await store.markSnapshotsStale(scopeType, scopeId, metricId, day)
-        markedStale++
+      // Collect this day's fresh snapshots and write them in ONE bulk insert
+      // (was one single-row write — and fsync — per cell).
+      const daySnapshots = []
+      for (const [metricId, window] of cells) {
+        const result = results.get(metricId)
+        if (!result) {
+          await store.markSnapshotsStale(scopeType, scopeId, metricId, day)
+          failed++
+          continue
+        }
+        daySnapshots.push({
+          scopeType,
+          scopeId,
+          metric: metricId,
+          day,
+          value: result.value,
+          window,
+          trustTier: result.trustTier,
+          dataQuality: result.dataQuality,
+          engineVersion: ENGINE_VERSION,
+          ingestWatermarkVersion,
+          coverageFingerprint,
+          computedAt: now,
+          isStale: false,
+          dataSource: result.dataSource,
+        })
+      }
+      if (daySnapshots.length > 0) {
+        await store.putSnapshots(daySnapshots)
+        recomputed += daySnapshots.length
       }
 
-      // Recompute exactly the days we just flagged stale, stamping the current
-      // ENGINE_VERSION. rederiveStaleSnapshots filters to isStale rows internally.
-      const result = await rederiveStaleSnapshots(
-        store,
-        scopeType,
-        scopeId,
-        metricId,
-        fromDay,
-        toDay,
-        computeFn,
-        now,
-      )
-      recomputed += result.recomputed
+      // Yield to the event loop between days so a multi-minute background pass
+      // (after an engine bump on a populated DB) never starves the MCP transport
+      // from servicing queued tool calls.
+      daysProcessed++
+      if (yieldEvery > 0 && daysProcessed % yieldEvery === 0) await yieldToEventLoop()
     }
   }
 
-  return { bumpDetected, markedStale, recomputed }
+  return { bumpDetected, markedStale, recomputed, failed }
+}
+
+/**
+ * Find stale (engine-version-mismatched) snapshot cells for a scope, grouped by
+ * day. Returns `byDay: Map<day, Map<metricId, windowDescriptor>>` (the window is
+ * preserved from the stored row so the re-derive keeps each day's '30d'/'90d'
+ * descriptor) and the total stale-cell `count`.
+ */
+async function collectStaleCells(store, scopeType, scopeId, metricIds, fromDay, toDay, windowDays) {
+  const byDay = new Map()
+  let count = 0
+  for (const metricId of metricIds) {
+    const stored = await store.getSnapshots(scopeType, scopeId, metricId, fromDay, toDay)
+    for (const snap of stored) {
+      if (snap.engineVersion === ENGINE_VERSION || !windowDays.has(snap.day)) continue
+      let dayCells = byDay.get(snap.day)
+      if (!dayCells) {
+        dayCells = new Map()
+        byDay.set(snap.day, dayCells)
+      }
+      if (!dayCells.has(metricId)) {
+        dayCells.set(metricId, snap.window ?? '1d')
+        count++
+      }
+    }
+  }
+  return { byDay, count }
+}
+
+/**
+ * Yield control to the event loop at a macrotask boundary so pending I/O (e.g. an
+ * incoming MCP tool request) can run between chunks of a long background pass.
+ */
+function yieldToEventLoop() {
+  return new Promise((resolve) => setTimeout(resolve, 0))
 }

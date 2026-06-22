@@ -34,6 +34,20 @@ function makeStore() {
 
 const NOW = '2024-06-05T00:00:00Z'
 
+function makeResult(metricId, value) {
+  return {
+    id: metricId,
+    trustTier: 'deterministic',
+    scope: 'team',
+    value,
+    unit: 'count',
+    dataQuality: 'ok',
+    engineVersion: ENGINE_VERSION,
+    asOf: NOW,
+    formulaDoc: 'test',
+  }
+}
+
 function makeComputeFn(value = 42) {
   return async (scopeType, _scopeId, metricId, day) => ({
     id: metricId,
@@ -433,5 +447,141 @@ describe('rederiveStaleEngineSnapshots', () => {
     expect(result.bumpDetected).toBe(false)
     expect(result.markedStale).toBe(0)
     expect(result.recomputed).toBe(0)
+  })
+
+  it('uses the day-batch computeDay contract, loading each day ONCE for all metrics', async () => {
+    const store = makeStore()
+    await store.putSyncState({
+      source: 'github',
+      resource: 'pulls',
+      scopeId: 'team',
+      cursor: null,
+      watermarkAt: '2024-05-10T00:00:00Z',
+      lastRunAt: '2024-05-10T00:00:00Z',
+      status: 'idle',
+      error: null,
+    })
+    // Two metrics on the same day, both stale → computeDay must be called ONCE for
+    // that day with both metric ids (proving the shared-window batch).
+    for (const metric of ['flow.throughput', 'flow.cycle_time']) {
+      await store.putSnapshot({
+        ...makeSnapshot('team', '2024-05-01', 1),
+        metric,
+        engineVersion: '0.0.0',
+      })
+    }
+
+    const dayCalls = []
+    const computeDay = async (_scopeType, _scopeId, day, ids) => {
+      dayCalls.push({ day, ids: [...ids].sort() })
+      return new Map(ids.map((id) => [id, makeResult(id, 77)]))
+    }
+
+    const result = await rederiveStaleEngineSnapshots({
+      store,
+      scopes: [{ scopeType: 'team', scopeId: 'team' }],
+      metricIds: ['flow.throughput', 'flow.cycle_time'],
+      fromDay: '2024-05-01',
+      toDay: '2024-05-01',
+      computeDay,
+      now: NOW,
+    })
+
+    expect(result.recomputed).toBe(2)
+    expect(result.failed).toBe(0)
+    // ONE batch call for the day, carrying both metrics — not one call per metric.
+    expect(dayCalls).toHaveLength(1)
+    expect(dayCalls[0]).toEqual({ day: '2024-05-01', ids: ['flow.cycle_time', 'flow.throughput'] })
+  })
+
+  it('isolates a failed day: flags it stale, keeps going, recomputes the rest', async () => {
+    const store = makeStore()
+    await store.putSyncState({
+      source: 'github',
+      resource: 'pulls',
+      scopeId: 'team',
+      cursor: null,
+      watermarkAt: '2024-05-10T00:00:00Z',
+      lastRunAt: '2024-05-10T00:00:00Z',
+      status: 'idle',
+      error: null,
+    })
+    await store.putSnapshot({ ...makeSnapshot('team', '2024-05-01', 1), engineVersion: '0.0.0' })
+    await store.putSnapshot({ ...makeSnapshot('team', '2024-05-02', 2), engineVersion: '0.0.0' })
+
+    // computeDay throws for the first day, succeeds for the second.
+    const computeDay = async (_scopeType, _scopeId, day, ids) => {
+      if (day === '2024-05-01') throw new Error('boom')
+      return new Map(ids.map((id) => [id, makeResult(id, 88)]))
+    }
+
+    const result = await rederiveStaleEngineSnapshots({
+      store,
+      scopes: [{ scopeType: 'team', scopeId: 'team' }],
+      metricIds: ['flow.throughput'],
+      fromDay: '2024-05-01',
+      toDay: '2024-05-02',
+      computeDay,
+      now: NOW,
+    })
+
+    expect(result.failed).toBe(1)
+    expect(result.recomputed).toBe(1)
+
+    const snaps = await store.getSnapshots(
+      'team',
+      'team',
+      'flow.throughput',
+      '2024-05-01',
+      '2024-05-02',
+    )
+    const failedDay = snaps.find((s) => s.day === '2024-05-01')
+    const okDay = snaps.find((s) => s.day === '2024-05-02')
+    // Failed day kept its OLD version (re-detected next pass) and is flagged stale.
+    expect(failedDay?.engineVersion).toBe('0.0.0')
+    expect(failedDay?.isStale).toBe(true)
+    // The other day recomputed cleanly to the current version.
+    expect(okDay?.engineVersion).toBe(ENGINE_VERSION)
+    expect(okDay?.value).toBe(88)
+  })
+
+  it('stops early when the abort signal fires', async () => {
+    const store = makeStore()
+    await store.putSyncState({
+      source: 'github',
+      resource: 'pulls',
+      scopeId: 'team',
+      cursor: null,
+      watermarkAt: '2024-05-10T00:00:00Z',
+      lastRunAt: '2024-05-10T00:00:00Z',
+      status: 'idle',
+      error: null,
+    })
+    for (const day of ['2024-05-01', '2024-05-02', '2024-05-03']) {
+      await store.putSnapshot({ ...makeSnapshot('team', day, 1), engineVersion: '0.0.0' })
+    }
+
+    const controller = new AbortController()
+    let calls = 0
+    const computeDay = async (_scopeType, _scopeId, _day, ids) => {
+      calls++
+      controller.abort() // abort after the first day's compute
+      return new Map(ids.map((id) => [id, makeResult(id, 5)]))
+    }
+
+    const result = await rederiveStaleEngineSnapshots({
+      store,
+      scopes: [{ scopeType: 'team', scopeId: 'team' }],
+      metricIds: ['flow.throughput'],
+      fromDay: '2024-05-01',
+      toDay: '2024-05-03',
+      computeDay,
+      now: NOW,
+      signal: controller.signal,
+    })
+
+    // Only the first day ran before the abort was observed at the next day boundary.
+    expect(calls).toBe(1)
+    expect(result.recomputed).toBe(1)
   })
 })
