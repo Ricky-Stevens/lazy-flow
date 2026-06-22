@@ -213,13 +213,16 @@ function registerDoctorTool(server, ctx) {
           : 'Not running under Bun — this server requires the Bun runtime for bun:sqlite',
       })
 
-      // 2. GitHub token presence
+      // 2. GitHub token presence. The token may come from LAZYFLOW_GITHUB_TOKEN /
+      //    GH_TOKEN / GITHUB_TOKEN, or fall back to the authenticated `gh` CLI
+      //    (resolved at startup in index.js). A warn means none of those produced
+      //    a credential.
       checks.push({
         name: 'github_token',
         status: ctx.config.githubToken ? 'ok' : 'warn',
         message: ctx.config.githubToken
           ? 'GitHub token configured'
-          : 'LAZYFLOW_GITHUB_TOKEN not set — GitHub sync unavailable',
+          : 'No GitHub credential — set LAZYFLOW_GITHUB_TOKEN or run `gh auth login`; GitHub sync unavailable',
       })
 
       // 3. Jira config. A Jira Cloud API token needs BOTH the account email

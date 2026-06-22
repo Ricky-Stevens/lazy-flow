@@ -17,11 +17,19 @@
 import { BunSqliteStore, migrate } from '../core/index.js'
 import { GitHubClient } from '../ingest-github/index.js'
 import { JiraClient } from '../ingest-jira/index.js'
-import { loadConfig } from './config.js'
+import { githubTokenFromGhCli, loadConfig } from './config.js'
 import { startServer } from './server.js'
 
 async function main() {
   const config = loadConfig()
+
+  // No token from the environment? Fall back to the locally-authenticated GitHub
+  // CLI (`gh auth login`), so a local-first user need not paste a PAT — sync runs
+  // as their gh account against repos that account can see. Done here (not in
+  // loadConfig) to keep config loading pure; returns null if gh is unavailable.
+  if (config.githubToken === null) {
+    config.githubToken = githubTokenFromGhCli()
+  }
 
   // Open / migrate the SQLite DB
   const store = new BunSqliteStore(config.dbPath)

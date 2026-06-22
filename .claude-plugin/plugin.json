@@ -1,6 +1,6 @@
 {
   "name": "lazy-flow",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Open-source DORA + Flow + PR + Code + Agile metrics platform for Claude Code. Fuses GitHub and Jira into a local-first, fully-transparent delivery intelligence layer that Claude can query directly over SQL.",
   "mcpServers": {
     "lazy-flow": {
@@ -21,9 +21,9 @@
     "github_token": {
       "type": "string",
       "title": "GitHub Token",
-      "description": "GitHub Personal Access Token or App installation token. Required for GitHub sync.",
+      "description": "Optional. GitHub Personal Access Token or App installation token for GitHub sync. Leave blank to use your locally-authenticated GitHub CLI account (run `gh auth login`); the tool falls back to `gh auth token` automatically. Also honours GH_TOKEN / GITHUB_TOKEN.",
       "sensitive": true,
-      "required": true
+      "required": false
     },
     "jira_oauth_token": {
       "type": "string",
