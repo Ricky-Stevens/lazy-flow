@@ -544,7 +544,12 @@ async function writePr(store, rawPr, fetched, repoId, defaultBranch, now) {
 
   // Author identity — upserted BEFORE the PR row (NOT NULL FK), falling back to
   // the sentinel when the PR has no author (deleted account).
-  const authorIdentityId = await resolveLoginIdentity(store, rawPr.user?.login, now)
+  const authorIdentityId = await resolveLoginIdentity(
+    store,
+    rawPr.user?.login,
+    now,
+    rawPr.user?.type,
+  )
 
   // rawReviews / rawComments come from the prefetched bundle (see fetchPrBundle),
   // and feed firstReviewAt below.
@@ -578,7 +583,7 @@ async function writePr(store, rawPr, fetched, repoId, defaultBranch, now) {
   const mergedByLogin = rawPr.merged_by?.login
   const mergedByIdentityId = mergedByLogin ? buildIdentityId('github_login', mergedByLogin) : null
   if (mergedByLogin) {
-    await store.upsertIdentity(mapIdentityFromLogin(mergedByLogin, now))
+    await store.upsertIdentity(mapIdentityFromLogin(mergedByLogin, now, rawPr.merged_by?.type))
   }
 
   const state = resolveState(rawPr)
@@ -608,7 +613,12 @@ async function writePr(store, rawPr, fetched, repoId, defaultBranch, now) {
 
   // Persist reviews.
   for (const rawReview of rawReviews) {
-    const reviewerIdentityId = await resolveLoginIdentity(store, rawReview.user?.login, now)
+    const reviewerIdentityId = await resolveLoginIdentity(
+      store,
+      rawReview.user?.login,
+      now,
+      rawReview.user?.type,
+    )
 
     const review = {
       nodeId: buildReviewNodeId(rawReview),
@@ -625,7 +635,12 @@ async function writePr(store, rawPr, fetched, repoId, defaultBranch, now) {
 
   // Persist review comments.
   for (const rawComment of rawComments) {
-    const commentAuthorIdentityId = await resolveLoginIdentity(store, rawComment.user?.login, now)
+    const commentAuthorIdentityId = await resolveLoginIdentity(
+      store,
+      rawComment.user?.login,
+      now,
+      rawComment.user?.type,
+    )
 
     const comment = {
       nodeId: String(rawComment.id),
@@ -920,13 +935,16 @@ function mapCheckRun(raw, repoId, headSha, now) {
   }
 }
 
-function mapIdentityFromLogin(login, now) {
+function mapIdentityFromLogin(login, now, accountType) {
   // Catch GitHub-App-shaped logins (e.g. graphite-app, detail-app, greptile-apps)
-  // at first-ingest so they never enter the human cohort even briefly. The
-  // post-ingest resolveIdentities pass re-applies this with the richer `type`
-  // signal from the raw payload — both must agree, or a row could briefly read
-  // human at write time.
-  const isBot = isLikelyBotLogin(login)
+  // at first-ingest so they never enter the human cohort even briefly. When the
+  // GraphQL author `__typename` is available (accountType === 'Bot'), it is
+  // definitive — this is the ONLY signal that flags App reviewers like
+  // claude/semgrep/linearb that carry no bot-shaped suffix. The post-ingest
+  // resolveIdentities pass re-applies this with the richer `type` from the raw
+  // payload — both must agree, or a row could briefly read human at write time.
+  const isBot = isLikelyBotLogin(login, accountType)
+  const raw = accountType ? { login, type: accountType } : { login }
   return {
     id: buildIdentityId('github_login', login),
     personId: null,
@@ -934,7 +952,7 @@ function mapIdentityFromLogin(login, now) {
     externalId: login,
     isBot,
     confidence: 1,
-    raw: JSON.stringify({ login }),
+    raw: JSON.stringify(raw),
     updatedAt: now,
   }
 }
@@ -978,9 +996,9 @@ function sentinelIdentity(now) {
  * absent — a deleted account) and return its id, ALWAYS ensuring the row exists
  * so a NOT NULL identity FK can never be violated.
  */
-async function resolveLoginIdentity(store, login, now) {
+async function resolveLoginIdentity(store, login, now, accountType) {
   if (login) {
-    await store.upsertIdentity(mapIdentityFromLogin(login, now))
+    await store.upsertIdentity(mapIdentityFromLogin(login, now, accountType))
     return buildIdentityId('github_login', login)
   }
   await store.upsertIdentity(sentinelIdentity(now))
@@ -1041,6 +1059,10 @@ function normaliseReviewState(state) {
  * authored_date or fall back to null (will be enriched by GraphQL later).
  */
 function deriveFirstCommitAt(rawPr) {
+  // Primary: the earliest commit's authored date, surfaced by adaptPrNode from
+  // the PR `commits` connection (GraphQL). Fallback: the legacy REST-ish nested
+  // head-commit shape some fixtures use.
+  if (rawPr.first_commit_at) return rawPr.first_commit_at
   const head = rawPr.head
   const commit = head?.commit
   const commitData = commit?.commit

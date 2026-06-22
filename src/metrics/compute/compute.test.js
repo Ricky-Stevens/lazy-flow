@@ -18,7 +18,7 @@ import { Database } from 'bun:sqlite'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'bun:test'
 import { setupServer } from 'msw/node'
 
-import { BunSqliteStore, migrate } from '../../core/index.js'
+import { BunSqliteStore, ENGINE_VERSION, migrate } from '../../core/index.js'
 import { GitHubClient, syncGitHub } from '../../ingest-github/index.js'
 import { baseOrg, IDS, loadScopeDataWindowed, mockGitHub } from '../../testkit/index.js'
 import {
@@ -591,6 +591,31 @@ describe('computeMetric', () => {
   it('agile.say_do → ok with a non-null ratio (sprint completed in window)', async () => {
     const r = await compute('agile.say_do')
     expect(r.dataQuality).toBe('ok')
+    expect(r.value).not.toBeNull()
+    // Full coverage in the base dataset: every in-window sprint has data.
+    expect(r.sprintCoverage).toBe(1)
+    expect(r.coverageNote).toBeUndefined()
+  })
+
+  it('agile.say_do flags partial sprint coverage when a report was unavailable', async () => {
+    // Regression: a sprint whose report was unavailable at sync time (no
+    // membership events ingested) was silently folded in as a 0/0 sprint and the
+    // aggregate read confident. It is now excluded and the result carries a
+    // coverage signal so the consumer knows the value is partial.
+    await store.upsertSprint({
+      id: 'sprint-noreport',
+      boardId: BOARD_ID,
+      state: 'closed',
+      startAt: '2024-04-01T00:00:00Z',
+      endAt: '2024-04-14T00:00:00Z',
+      completeAt: '2024-04-15T00:00:00Z',
+      updatedAt: '2024-04-15T00:00:00Z',
+    })
+    const r = await compute('agile.say_do')
+    expect(r.sprintsConsidered).toBeGreaterThan(r.sprintsWithData)
+    expect(r.sprintCoverage).toBeLessThan(1)
+    expect(r.coverageNote).toContain('no usable data')
+    // The real sprint still produced a ratio — flagged, not suppressed.
     expect(r.value).not.toBeNull()
   })
 
@@ -1236,7 +1261,7 @@ describe('backfillSnapshots', () => {
     expect(snaps.length).toBe(3)
     for (const s of snaps) {
       expect(s.window).toBe('90d')
-      expect(s.engineVersion).toBe('0.1.0')
+      expect(s.engineVersion).toBe(ENGINE_VERSION)
       expect(s.ingestWatermarkVersion).toBe('wm-1')
       expect(s.coverageFingerprint).toBe('fp-test')
       expect(s.isStale).toBe(false)

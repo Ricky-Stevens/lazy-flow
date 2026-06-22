@@ -115,6 +115,7 @@ describe('MCP server — bootstrap', () => {
       'get_flow',
       'get_person_report',
       'get_pr_metrics',
+      'get_schema',
       'list_pending_ai_authorship',
       'list_pending_verdicts',
       'list_report_presets',
@@ -126,6 +127,18 @@ describe('MCP server — bootstrap', () => {
     ].sort()
 
     expect(names).toEqual(expected)
+  })
+
+  it('get_schema returns the schema guide + live DDL (tool mirror of the resource)', async () => {
+    const { client } = await makeConnectedPair()
+
+    const result = await client.callTool({ name: 'get_schema', arguments: {} })
+    expect(result.structuredContent).toBeDefined()
+    const text = result.structuredContent.schema
+    expect(typeof text).toBe('string')
+    // Carries the live DDL section and at least one real table.
+    expect(text).toContain('Live schema (sqlite_master)')
+    expect(text).toContain('pull_requests')
   })
 })
 

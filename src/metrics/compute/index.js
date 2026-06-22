@@ -1138,7 +1138,37 @@ async function sprintPoints(store, data, sprint, now) {
     { sprint: sprintRecord, membershipEvents: memberEvents, issues: issueRecords },
     now,
   )
-  return { committed: result.committed, completed: result.completed }
+  // hasData distinguishes a report-backed sprint from one whose sprint report
+  // was unavailable at sync time (404 → no membership ingested → zero events).
+  // Without this, an unavailable-report sprint silently folds into say_do /
+  // predictability as a real 0/0 sprint and the aggregate reads confident.
+  return {
+    committed: result.committed,
+    completed: result.completed,
+    hasData: memberEvents.length > 0,
+  }
+}
+
+/**
+ * Attach sprint-coverage provenance to an agile metric result. When some
+ * in-window sprints had no usable (report-backed) data — their sprint report was
+ * unavailable at sync time (404) or the board lacks sprint support — the headline
+ * is computed from a subset, so the consumer must be told rather than reading a
+ * confident number. Adds sprintsConsidered / sprintsWithData / sprintCoverage and,
+ * on incomplete coverage, a coverageNote. The underlying module already degrades
+ * to no_data when NO sprint contributed; this layer flags the partial case.
+ */
+function withSprintCoverage(result, sprintsConsidered, sprintsWithData) {
+  const coverage = sprintsConsidered > 0 ? sprintsWithData / sprintsConsidered : null
+  const annotated = { ...result, sprintsConsidered, sprintsWithData, sprintCoverage: coverage }
+  if (sprintsConsidered > 0 && sprintsWithData < sprintsConsidered) {
+    const missing = sprintsConsidered - sprintsWithData
+    annotated.coverageNote =
+      `${missing} of ${sprintsConsidered} in-window sprint(s) had no usable data ` +
+      '(sprint report unavailable at sync time, or board without sprint support); ' +
+      `value is computed from the remaining ${sprintsWithData}.`
+  }
+  return annotated
 }
 
 /**
@@ -1475,7 +1505,13 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
         .map((i) => ({ deployId: i.linkedDeployId, incidentIssueId: i.id }))
       // dataSource is always 'proxy': the deploy↔incident linkage is the
       // temporal-proximity heuristic (WS-3), never an authoritative join.
-      const result = changeFailureRate.compute({ deploys, deployIncidentLinks }, now)
+      // incidentsTracked lets CFR distinguish a measured 0% (incidents exist,
+      // none linked to prod deploys) from no failure signal at all (no incidents
+      // tracked → no_data).
+      const result = changeFailureRate.compute(
+        { deploys, deployIncidentLinks, incidentsTracked: incidents.length },
+        now,
+      )
       return { ...result, dataSource: 'proxy' }
     }
 
@@ -1869,18 +1905,25 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
       let committed = 0
       let completed = 0
       let any = false
+      let sprintsWithData = 0
       for (const sprint of sprints) {
         const pts = await sprintPoints(store, data, sprint, now)
+        // Only sprints with a usable (report-backed) baseline contribute. A
+        // sprint whose report was unavailable at sync time has no membership
+        // events; folding it in as 0/0 would understate say/do and hide the gap.
+        if (!pts.hasData) continue
+        sprintsWithData++
         if (pts.committed != null && pts.completed != null) {
           committed += pts.committed
           completed += pts.completed
           any = true
         }
       }
-      return sayDo.compute(
+      const sayDoResult = sayDo.compute(
         { committed: any ? committed : null, completed: any ? completed : null },
         now,
       )
+      return withSprintCoverage(sayDoResult, sprints.length, sprintsWithData)
     }
 
     case 'agile.sprint_velocity': {
@@ -1923,6 +1966,7 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
       // completed points across all in-window sprints so a consumer never reads
       // a single sprint as the period's velocity.
       const completedAcrossWindow = []
+      let sprintsWithData = 0
       for (const s of sprints) {
         const bc = await store.getBoardConfig(s.boardId)
         const events = (await store.getSprintMembershipEvents(s.id)).map((e) => ({
@@ -1933,6 +1977,8 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
           transitionedAt: e.transitionedAt,
           wasPresentAtStart: e.wasPresentAtStart,
         }))
+        // A sprint with no membership events had no usable report at sync time.
+        if (events.length > 0) sprintsWithData++
         const r = sprintVelocity.compute(
           {
             sprint: {
@@ -1954,14 +2000,18 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
         completedAcrossWindow.length > 0
           ? completedAcrossWindow.reduce((a, b) => a + b, 0) / completedAcrossWindow.length
           : null
-      return {
-        ...latestResult,
-        sprintCount: sprints.length,
-        sprintId: latest.id,
-        sprintName: latest.name ?? null,
-        isLatestSprintOnly: true,
-        windowAvgCompleted,
-      }
+      return withSprintCoverage(
+        {
+          ...latestResult,
+          sprintCount: sprints.length,
+          sprintId: latest.id,
+          sprintName: latest.name ?? null,
+          isLatestSprintOnly: true,
+          windowAvgCompleted,
+        },
+        sprints.length,
+        sprintsWithData,
+      )
     }
 
     case 'agile.sprint_predictability': {
@@ -1969,13 +2019,19 @@ async function computeRaw(store, scopeType, metricId, windowFrom, windowTo, now,
         inWindow(s.completeAt, fromMs, toMs),
       )
       const records = []
+      let sprintsWithData = 0
       for (const sprint of sprints) {
         const pts = await sprintPoints(store, data, sprint, now)
+        // Skip sprints whose report was unavailable at sync time (no membership
+        // events) — otherwise they enter predictability as spurious 0/0 records.
+        if (!pts.hasData) continue
+        sprintsWithData++
         if (pts.committed != null && pts.completed != null) {
           records.push({ sprintId: sprint.id, committed: pts.committed, completed: pts.completed })
         }
       }
-      return sprintPredictability.compute({ sprints: records }, now)
+      const predictabilityResult = sprintPredictability.compute({ sprints: records }, now)
+      return withSprintCoverage(predictabilityResult, sprints.length, sprintsWithData)
     }
 
     case 'agile.estimation_accuracy':

@@ -55,13 +55,13 @@ const PR_GRAPH_QUERY = /* graphql */ `
         mergedAt
         baseRefName
         headRefName
-        author { login }
+        author { login __typename }
         reviews(first: 100, after: $reviewsAfter) {
-          nodes { id state submittedAt author { login } }
+          nodes { id state submittedAt author { login __typename } }
           pageInfo { hasNextPage endCursor }
         }
         comments(first: 100, after: $commentsAfter) {
-          nodes { id createdAt path author { login } }
+          nodes { id createdAt path author { login __typename } }
           pageInfo { hasNextPage endCursor }
         }
         timelineItems(first: 100, after: $timelineAfter) {
@@ -181,17 +181,20 @@ const REPO_PULL_REQUESTS_QUERY = /* graphql */ `
           baseRefOid
           headRefName
           headRefOid
-          author { login }
-          mergedBy { login }
+          author { login __typename }
+          mergedBy { login __typename }
+          firstCommit: commits(first: 1) {
+            nodes { commit { authoredDate } }
+          }
           reviews(first: 100) {
             pageInfo { hasNextPage endCursor }
-            nodes { databaseId state submittedAt author { login } }
+            nodes { databaseId state submittedAt author { login __typename } }
           }
           reviewThreads(first: 100) {
             pageInfo { hasNextPage endCursor }
             nodes {
               comments(first: 50) {
-                nodes { databaseId createdAt updatedAt path author { login } replyTo { databaseId } }
+                nodes { databaseId createdAt updatedAt path author { login __typename } replyTo { databaseId } }
               }
             }
           }
@@ -365,7 +368,11 @@ function adaptCommitNode(node) {
 // Field mappers shared by adaptPrNode and the overflow continuation.
 const adaptReviewNode = (r) => ({
   id: r.databaseId,
-  user: r.author?.login ? { login: r.author.login } : null,
+  // Carry the actor `__typename` (User|Bot|Organization|…) so bot reviewers
+  // (GitHub Apps like claude/semgrep/linearb) are classified at write time —
+  // resolveIdentities only re-derives bot-ness from commit/PR authors, never
+  // reviewers, so a pure bot reviewer is otherwise never flagged.
+  user: r.author?.login ? { login: r.author.login, type: r.author.__typename } : null,
   state: r.state, // UPPER enum; normaliseReviewState upper-cases anyway
   submitted_at: r.submittedAt,
 })
@@ -375,7 +382,7 @@ const adaptThreadComments = (threadNodes) => {
     for (const c of thread?.comments?.nodes ?? []) {
       comments.push({
         id: c.databaseId,
-        user: c.author?.login ? { login: c.author.login } : null,
+        user: c.author?.login ? { login: c.author.login, type: c.author.__typename } : null,
         created_at: c.createdAt,
         updated_at: c.updatedAt,
         path: c.path ?? null,
@@ -399,6 +406,12 @@ function adaptPrNode(node) {
   const files = (node.files?.nodes ?? []).map(adaptFileNode)
   const headCommit = node.headChecks?.nodes?.[0]?.commit
   const headSha = node.headRefOid ?? headCommit?.oid ?? null
+  // first_commit_at: earliest commit authored date on the PR branch. The PR
+  // `commits` connection is chronological, so `commits(first: 1)` is the oldest.
+  // `firstCommit` is the bulk-query alias; fall back to a full `commits` page for
+  // the single-PR query shape (PR_GRAPH_QUERY).
+  const firstCommitNode = node.firstCommit?.nodes?.[0] ?? node.commits?.nodes?.[0]
+  const firstCommitAt = firstCommitNode?.commit?.authoredDate ?? null
   return {
     rawPr: {
       number: node.number,
@@ -412,10 +425,13 @@ function adaptPrNode(node) {
       draft: node.isDraft ?? false,
       created_at: node.createdAt,
       updated_at: node.updatedAt,
+      first_commit_at: firstCommitAt,
       base: { ref: node.baseRefName, sha: node.baseRefOid ?? null },
       head: { ref: node.headRefName, sha: headSha },
-      user: node.author?.login ? { login: node.author.login } : null,
-      merged_by: node.mergedBy?.login ? { login: node.mergedBy.login } : null,
+      user: node.author?.login ? { login: node.author.login, type: node.author.__typename } : null,
+      merged_by: node.mergedBy?.login
+        ? { login: node.mergedBy.login, type: node.mergedBy.__typename }
+        : null,
     },
     reviews,
     comments,

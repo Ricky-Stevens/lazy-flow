@@ -264,6 +264,16 @@ describe('PR stage timestamps', () => {
     expect(reviews.length).toBe(2)
   })
 
+  it('pr-1 firstCommitAt is populated from the PR commits connection', async () => {
+    // Regression: the bulk GraphQL PR query never fetched the earliest commit's
+    // authoredDate, so first_commit_at was NULL on every merged PR — which in
+    // turn made DORA lead-time and the PR 4-phase cycle-time uncomputable. The
+    // query now requests `firstCommit: commits(first: 1)` and adaptPrNode surfaces
+    // it. baseOrg pr-1 has firstCommitAt 2024-03-01T07:30:00Z.
+    const pr = await store.getPullRequest(`${SYNCED_REPO_ALPHA}-pr-1`)
+    expect(pr?.firstCommitAt).toBe('2024-03-01T07:30:00Z')
+  })
+
   it('pr-1 has an APPROVED review stored (approvedAt derivable from reviews)', async () => {
     const reviews = await store.getReviewsByPullRequest(`${SYNCED_REPO_ALPHA}-pr-1`)
     const approved = reviews.find((r) => r.state === 'approved')
@@ -630,6 +640,73 @@ describe('syncGitHub repo discovery', () => {
 // the 'unknown' reviewer identity violated the NOT NULL FK, and `null.toUpperCase()`
 // threw — either aborting the whole repo's PR loop. (Adversarial-review regressions.)
 // ---------------------------------------------------------------------------
+
+describe('bot reviewer classification (GraphQL __typename)', () => {
+  it('flags a Bot-typed reviewer with no bot-shaped suffix as is_bot', async () => {
+    // Regression: GitHub-App reviewers (claude/semgrep/linearb) carry no
+    // [bot]/-bot/-app suffix, so the name-shape heuristic never flagged them and
+    // resolveIdentities only re-derives bot-ness from commit/PR authors — never
+    // reviewers. The author `__typename` is now fetched and threaded through, so
+    // an Actor typed `Bot` is flagged at write time.
+    const store = makeStore()
+    server.use(
+      graphql.query('RepoPullRequests', () =>
+        HttpResponse.json({
+          data: {
+            repository: {
+              pullRequests: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [
+                  {
+                    number: 1,
+                    title: 'reviewed by an app',
+                    body: '',
+                    state: 'MERGED',
+                    isDraft: false,
+                    createdAt: '2024-05-01T09:00:00Z',
+                    updatedAt: '2024-05-01T10:00:00Z',
+                    mergedAt: '2024-05-01T10:00:00Z',
+                    baseRefName: 'main',
+                    baseRefOid: null,
+                    headRefName: 'feat/x',
+                    headRefOid: null,
+                    author: { login: 'alice', __typename: 'User' },
+                    mergedBy: null,
+                    firstCommit: { nodes: [] },
+                    reviews: {
+                      pageInfo: { hasNextPage: false },
+                      nodes: [
+                        {
+                          databaseId: 99101,
+                          state: 'APPROVED',
+                          submittedAt: '2024-05-01T10:00:00Z',
+                          author: { login: 'claude', __typename: 'Bot' },
+                        },
+                      ],
+                    },
+                    reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [] },
+                    files: { pageInfo: { hasNextPage: false }, nodes: [] },
+                    headChecks: { nodes: [] },
+                  },
+                ],
+              },
+            },
+            rateLimit: { cost: 1, remaining: 4999, resetAt: new Date().toISOString() },
+          },
+        }),
+      ),
+    )
+
+    await syncGitHub(store, makeClient(), scope, 'backfill', '2024-06-01T00:00:00Z')
+
+    const botReviewer = await store.findIdentityByExternalId('github_login', 'claude')
+    expect(botReviewer).not.toBeNull()
+    expect(botReviewer?.isBot).toBe(true)
+    // The human author must NOT be misflagged.
+    const human = await store.findIdentityByExternalId('github_login', 'alice')
+    expect(human?.isBot).toBe(false)
+  })
+})
 
 describe('writePr resilience: ghost actors + null review state', () => {
   it('syncs a PR whose review/comment have a null author and null state, using the sentinel identity', async () => {

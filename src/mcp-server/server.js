@@ -68,7 +68,7 @@ import {
 // ---------------------------------------------------------------------------
 
 const SERVER_NAME = 'lazy-flow'
-const SERVER_VERSION = '0.1.0'
+const SERVER_VERSION = '0.1.1'
 
 // Stale threshold: warn at 4h, refuse at 24h (SPEC §7.5)
 const STALE_WARN_MS = 4 * 60 * 60 * 1000
@@ -1959,6 +1959,35 @@ Example — count merged PRs per person:
 - For "how much did we ingest" counts per repo/project, call the \`data_overview\`
   tool instead of writing SQL.`
 
+/**
+ * Build the schema guide + live DDL markdown. Shared by the lazy-flow://schema
+ * RESOURCE and the get_schema TOOL — many subagents (and some MCP clients) only
+ * call tools, never read resources, so the schema must be reachable both ways.
+ */
+function buildSchemaText(ctx) {
+  // Pull the live DDL so the doc can never drift from the actual schema.
+  let ddl = ''
+  try {
+    const rows = ctx.store.db
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY type, name",
+      )
+      .all()
+    ddl = rows.map((r) => `${r.sql};`).join('\n\n')
+  } catch (err) {
+    ddl = `-- failed to read live schema: ${String(err)}`
+  }
+
+  // The absolute DB path so Claude can discover it at runtime (mirrors the
+  // doctor db_path check).
+  const dbPathLine =
+    ctx.config.dbPath === ':memory:'
+      ? 'DB path: :memory: (ephemeral — not queryable across processes)'
+      : `DB path: ${ctx.config.dbPath}`
+
+  return `${SCHEMA_GUIDE}\n\n${dbPathLine}\n\n## Live schema (sqlite_master)\n\n\`\`\`sql\n${ddl}\n\`\`\`\n`
+}
+
 function registerSchemaResource(server, ctx) {
   server.registerResource(
     'schema',
@@ -1970,37 +1999,45 @@ function registerSchemaResource(server, ctx) {
         'where precomputed metrics live. Read this before writing query_db SQL.',
       mimeType: 'text/markdown',
     },
+    async () => ({
+      contents: [
+        {
+          uri: 'lazy-flow://schema',
+          mimeType: 'text/markdown',
+          text: buildSchemaText(ctx),
+        },
+      ],
+    }),
+  )
+}
+
+/**
+ * Tool mirror of the lazy-flow://schema resource. Subagents that can only call
+ * tools (the squad-reviewer stall was caused by reaching for a non-existent
+ * resource-read) need a tool path to the same content.
+ */
+function registerGetSchemaTool(server, ctx) {
+  const outputSchema = z.object({
+    ...provenanceSchema.shape,
+    schema: z.string(),
+  })
+
+  server.registerTool(
+    'get_schema',
+    {
+      title: 'Get DB Schema',
+      description:
+        'Return the lazy-flow SQLite schema guide + live DDL (identical to the lazy-flow://schema ' +
+        'resource) as a tool result. Call this before writing query_db SQL — it documents the ' +
+        'tables, how to resolve a person via the identities table, and where precomputed metrics live.',
+      inputSchema: z.object({}),
+      outputSchema,
+    },
     async () => {
-      // Pull the live DDL so the doc can never drift from the actual schema.
-      let ddl = ''
-      try {
-        const rows = ctx.store.db
-          .prepare(
-            "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY type, name",
-          )
-          .all()
-        ddl = rows.map((r) => `${r.sql};`).join('\n\n')
-      } catch (err) {
-        ddl = `-- failed to read live schema: ${String(err)}`
-      }
-
-      // The absolute DB path so Claude can discover it at runtime (mirrors the
-      // doctor db_path check).
-      const dbPathLine =
-        ctx.config.dbPath === ':memory:'
-          ? 'DB path: :memory: (ephemeral — not queryable across processes)'
-          : `DB path: ${ctx.config.dbPath}`
-
-      const body = `${SCHEMA_GUIDE}\n\n${dbPathLine}\n\n## Live schema (sqlite_master)\n\n\`\`\`sql\n${ddl}\n\`\`\`\n`
-
+      const output = { ...provenance('n/a'), schema: buildSchemaText(ctx) }
       return {
-        contents: [
-          {
-            uri: 'lazy-flow://schema',
-            mimeType: 'text/markdown',
-            text: body,
-          },
-        ],
+        content: [{ type: 'text', text: output.schema }],
+        structuredContent: output,
       }
     },
   )
@@ -2290,6 +2327,7 @@ export function createServer(ctx) {
   registerListPendingAiAuthorshipTool(server, ctx)
   registerRecordAiAuthorshipVerdictTool(server, ctx)
   registerBackfillPrPatchesTool(server, ctx)
+  registerGetSchemaTool(server, ctx)
 
   // Tools — reporting
   registerGenerateReportTool(server, ctx)

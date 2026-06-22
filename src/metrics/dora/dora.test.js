@@ -293,11 +293,36 @@ describe('changeFailureRate', () => {
     expect(Number.isNaN(result.rate)).toBe(false)
   })
 
-  it('deploys with no linked incidents → rate 0', () => {
+  it('incidents tracked but none linked to deploys → measured rate 0 at ok', () => {
     const noLink = []
-    const result = changeFailureRate.compute({ deploys, deployIncidentLinks: noLink }, AS_OF)
+    const result = changeFailureRate.compute(
+      { deploys, deployIncidentLinks: noLink, incidentsTracked: 2 },
+      AS_OF,
+    )
     expect(result.deploysWithIncident).toBe(0)
     expect(result.rate).toBe(0)
+    expect(result.dataQuality).toBe('ok')
+  })
+
+  it('prod deploys but zero incidents tracked → no_data, not measured 0%', () => {
+    // Regression: CFR returned rate 0 at data_quality "ok" whenever there were no
+    // incident links — indistinguishable from "no incident tracking exists". With
+    // no failure signal at all, 0% is unmeasurable and must degrade to no_data.
+    const result = changeFailureRate.compute(
+      { deploys, deployIncidentLinks: [], incidentsTracked: 0 },
+      AS_OF,
+    )
+    expect(result.value).toBeNull()
+    expect(result.rate).toBeNull()
+    expect(result.dataQuality).toBe('no_data')
+    expect(result.totalDeploys).toBeGreaterThan(0)
+    expect(result.coverageNote).toContain('No incidents')
+  })
+
+  it('omitting incidentsTracked is backward-compatible (computes rate, no degrade)', () => {
+    const result = changeFailureRate.compute({ deploys, deployIncidentLinks: [] }, AS_OF)
+    expect(result.rate).toBe(0)
+    expect(result.dataQuality).toBe('ok')
   })
 })
 

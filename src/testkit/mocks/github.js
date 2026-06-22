@@ -646,7 +646,9 @@ function graphQLHandlers() {
                 databaseId: r.nodeId,
                 state: rraw.state ?? r.state.toUpperCase(),
                 submittedAt: r.submittedAt,
-                author: rraw.user?.login ? { login: rraw.user.login } : null,
+                author: rraw.user?.login
+                  ? { login: rraw.user.login, __typename: rraw.user.type ?? 'User' }
+                  : null,
               }
             })
           const threads = baseOrg.reviewComments
@@ -661,7 +663,9 @@ function graphQLHandlers() {
                       createdAt: c.createdAt,
                       updatedAt: c.updatedAt,
                       path: c.path ?? null,
-                      author: craw.user?.login ? { login: craw.user.login } : null,
+                      author: craw.user?.login
+                        ? { login: craw.user.login, __typename: craw.user.type ?? 'User' }
+                        : null,
                       replyTo: c.inReplyTo ? { databaseId: c.inReplyTo } : null,
                     },
                   ],
@@ -701,6 +705,9 @@ function graphQLHandlers() {
             headRefOid: headSha,
             author: null,
             mergedBy: null,
+            firstCommit: p.firstCommitAt
+              ? { nodes: [{ commit: { authoredDate: p.firstCommitAt } }] }
+              : { nodes: [] },
             reviews: { pageInfo: { hasNextPage: false }, nodes: reviews },
             reviewThreads: { pageInfo: { hasNextPage: false }, nodes: threads },
             files: { pageInfo: { hasNextPage: false }, nodes: files },

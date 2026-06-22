@@ -4,4 +4,4 @@
  * refuse to plot across mixed engine versions (false-trend guard) and re-derivation
  * can be triggered on a version bump.
  */
-export const ENGINE_VERSION = '0.1.0'
+export const ENGINE_VERSION = '0.1.1'
