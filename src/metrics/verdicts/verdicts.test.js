@@ -101,6 +101,42 @@ describe('verdicts pipeline (in-session, no API)', () => {
     expect(r.pending[0].context.body).toContain('backoff')
   })
 
+  it('applies the sinceIso recency floor to candidate PRs', async () => {
+    // A second authored-merged PR created well before pr-1's NOW timestamp.
+    await store.upsertPullRequest({
+      id: 'pr-old',
+      repoId: 'repo-1',
+      number: 2,
+      authorIdentityId: 'id-1',
+      state: 'merged',
+      headRef: 'old',
+      baseRef: 'main',
+      isDraft: false,
+      mergedViaQueue: false,
+      createdAt: '2024-01-01T00:00:00.000Z',
+      readyAt: null,
+      firstCommitAt: null,
+      firstReviewAt: null,
+      approvedAt: null,
+      mergedAt: '2024-01-02T00:00:00.000Z',
+      mergedByIdentityId: 'id-1',
+      deletedAt: null,
+      raw: JSON.stringify({ title: 'Old PR', body: 'stale' }),
+      updatedAt: NOW,
+    })
+
+    // No floor → both PRs are candidates.
+    const all = await listPendingVerdicts(store, 'person.design_bearing_ratio', 'p-1')
+    expect(all.pendingCount).toBe(2)
+
+    // Floor between the two createdAt values → only the recent PR remains.
+    const floored = await listPendingVerdicts(store, 'person.design_bearing_ratio', 'p-1', 25, {
+      sinceIso: '2024-03-01T00:00:00.000Z',
+    })
+    expect(floored.pendingCount).toBe(1)
+    expect(floored.pending[0].subjectId).toBe('pr-1')
+  })
+
   it('surfaces the synthesised diff to the judge when a patch is present', async () => {
     await store.upsertPrFile({
       prId: 'pr-1',

@@ -75,6 +75,39 @@ export function parseBool(raw, fallback) {
   return !['false', '0', 'no', 'off'].includes(String(raw).trim().toLowerCase())
 }
 
+/**
+ * Validate the retention/window cascade invariant: raw-row retention must cover the
+ * snapshot backfill's hard need (horizon + rolling window), and the fetch floor must
+ * cover what we keep. The prune additionally FLOORS its cutoff at need + buffer, so a
+ * violation can't actually starve metrics or lose data — this only surfaces the
+ * surprise (e.g. "I set retention=45 but the store keeps ~97d") so doctor can warn
+ * instead of the user silently getting more retained data than they configured.
+ * Returns an array of human-readable warning strings (empty when consistent).
+ * `repoHistoryDays`/`retentionDays` of 0 mean all-time / keep-all and are skipped.
+ *
+ * NB the threshold is horizon + window (NOT + buffer): the buffer is automatic slack
+ * the prune floor adds for safety, never something the user must configure — so the
+ * default 90 / 60 / 30 cascade is consistent and does not warn.
+ */
+export function cascadeWarnings(config) {
+  const warnings = []
+  const need = config.snapshotHorizonDays + config.snapshotWindowDays
+  if (config.retentionDays > 0 && config.retentionDays < need) {
+    warnings.push(
+      `retention_days (${config.retentionDays}) is below the snapshot horizon + window (${need}); ` +
+        `the prune floors its cutoff so metrics stay correct, but the store will retain more than ` +
+        `configured. Raise retention_days to >= ${need} to match.`,
+    )
+  }
+  if (config.repoHistoryDays > 0 && config.repoHistoryDays < config.retentionDays) {
+    warnings.push(
+      `repo_history_days (${config.repoHistoryDays}) is below retention_days (${config.retentionDays}); ` +
+        `the oldest retained window may be under-filled because the fetch floor pulls less than is kept.`,
+    )
+  }
+  return warnings
+}
+
 /** First env var in `keys` with a non-empty, trimmed value; else null. */
 function firstNonEmptyEnv(env, keys) {
   for (const key of keys) {
@@ -141,10 +174,35 @@ export function loadConfig() {
     // Org-wildcard idle filter: skip ORG/* repos with no push in N days. 0 = off.
     repoMaxIdleDays: parseNonNegInt(env.LAZYFLOW_REPO_MAX_IDLE_DAYS),
     // Full-backfill lookback horizon (days): only pull commits/PRs newer than this
-    // rather than a repo's entire history. Default 180 (covers the 119-day snapshot
-    // window + trailing metric windows); explicit 0 = all-time. Incremental syncs are
-    // unaffected (they window via watermark).
-    repoHistoryDays: parseDaysWithDefault(env.LAZYFLOW_REPO_HISTORY_DAYS, 180),
+    // rather than a repo's entire history. Default 90 (covers the snapshot horizon +
+    // trailing window — see snapshotHorizonDays/snapshotWindowDays below); explicit
+    // 0 = all-time. Incremental syncs are unaffected (they window via watermark).
+    repoHistoryDays: parseDaysWithDefault(env.LAZYFLOW_REPO_HISTORY_DAYS, 90),
+    // Raw-row retention (days): the prune step deletes commits / PRs (+ their files,
+    // reviews, comments) / check-runs / deployments / AI-authorship rows older than
+    // this. Bounds DB growth and the in-memory working set the metric engine loads.
+    // The prune NEVER deletes below the snapshot horizon + window (it floors the
+    // cutoff at max(retentionDays, snapshotHorizonDays + snapshotWindowDays)) so the
+    // backfill can never be starved. Explicit 0 = keep everything (no prune).
+    retentionDays: parseDaysWithDefault(env.LAZYFLOW_RETENTION_DAYS, 90),
+    // Snapshot horizon (days): how many trailing days of daily metric snapshots the
+    // backfill computes. Default 60. (Was a hardcoded 119.)
+    snapshotHorizonDays: parseDaysWithDefault(env.LAZYFLOW_SNAPSHOT_HORIZON_DAYS, 60),
+    // Rolling window (days) each daily snapshot is computed over. Default 30.
+    snapshotWindowDays: parseDaysWithDefault(env.LAZYFLOW_SNAPSHOT_WINDOW_DAYS, 30),
+    // LLM-judgment window (days): the in-session verdict + AI-authorship pending
+    // queues only surface changes newer than this, so the (expensive) judgments stay
+    // bounded to recent work instead of the whole store. Default 30. 0 = no floor.
+    llmWindowDays: parseDaysWithDefault(env.LAZYFLOW_LLM_WINDOW_DAYS, 30),
+    // Patch-text retention (days): the prune NULLs pr_files.patch for PRs older than
+    // this (the denormalised pr_files.haloc is kept, so haloc metrics are unaffected;
+    // only diff-level verdicts need the raw patch, and those run on recent PRs).
+    // Default 30. 0 = keep all patch text. Patch text is the bulk of the DB on disk.
+    patchRetentionDays: parseDaysWithDefault(env.LAZYFLOW_PATCH_RETENTION_DAYS, 30),
+    // Retention buffer (days): extra slack the prune floor keeps BEYOND the strict
+    // snapshot need (horizon + window), to absorb boundary inclusivity, timezone
+    // skew, and a missed/catch-up sync. Advanced (env-only). Default 7.
+    retentionBufferDays: parseDaysWithDefault(env.LAZYFLOW_RETENTION_BUFFER_DAYS, 7),
     // Skip the patch/blob analysis for bot-authored PRs (dependabot lockfile
     // bumps etc.) — saves blob-fetch budget + DB bloat with no analytical loss
     // (bots are excluded from verdicts/person metrics anyway). Default ON.

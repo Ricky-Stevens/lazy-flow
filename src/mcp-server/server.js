@@ -49,7 +49,6 @@ import {
 } from '../metrics/verdicts/index.js'
 
 import { runSync, syncStatus } from '../orchestrator/index.js'
-
 import {
   buildBenchmarkProvider,
   generateReport,
@@ -57,6 +56,7 @@ import {
   toCsv,
   toJson,
 } from '../report/index.js'
+import { cascadeWarnings } from './config.js'
 
 import {
   assertIndexedPlan,
@@ -75,7 +75,7 @@ import {
 // ---------------------------------------------------------------------------
 
 const SERVER_NAME = 'lazy-flow'
-const SERVER_VERSION = '0.1.7'
+const SERVER_VERSION = '0.1.8'
 
 // Stale threshold: warn at 4h, refuse at 24h (SPEC §7.5)
 const STALE_WARN_MS = 4 * 60 * 60 * 1000
@@ -125,10 +125,33 @@ const SNAPSHOT_SCOPES = [
 ]
 
 /** Rolling window (days) each snapshot day is computed over. Matches the backfill. */
-const SNAPSHOT_WINDOW_DAYS = 30
+const SNAPSHOT_WINDOW_DAYS_DEFAULT = 30
 
 /** History depth (days) for backfill / engine-bump scans. */
-const SNAPSHOT_HISTORY_DAYS = 119
+const SNAPSHOT_HISTORY_DAYS_DEFAULT = 60
+
+/** Rolling window (days), config-overridable (LAZYFLOW_SNAPSHOT_WINDOW_DAYS). */
+function snapshotWindowDays(ctx) {
+  const n = ctx?.config?.snapshotWindowDays
+  return typeof n === 'number' && n > 0 ? n : SNAPSHOT_WINDOW_DAYS_DEFAULT
+}
+
+/** Snapshot horizon (days), config-overridable (LAZYFLOW_SNAPSHOT_HORIZON_DAYS). */
+function snapshotHorizonDays(ctx) {
+  const n = ctx?.config?.snapshotHorizonDays
+  return typeof n === 'number' && n > 0 ? n : SNAPSHOT_HISTORY_DAYS_DEFAULT
+}
+
+/**
+ * Recency floor (ISO) for the in-session LLM judgment queues, derived from
+ * LAZYFLOW_LLM_WINDOW_DAYS. Returns null when the window is 0/unset (no floor),
+ * so the verdict pipelines stay all-time unless explicitly bounded.
+ */
+function llmSinceIso(ctx, nowIso = new Date().toISOString()) {
+  const days = ctx?.config?.llmWindowDays
+  if (typeof days !== 'number' || days <= 0) return null
+  return new Date(Date.parse(nowIso) - days * 86_400_000).toISOString()
+}
 
 /**
  * Build a ComputeDayFn that computes a metric over the rolling
@@ -141,8 +164,9 @@ function makeComputeDayFn(ctx, now) {
   // this day), then compute each metric against that in-memory slice via the
   // `preloaded` arg — no per-metric re-read or re-slice. Opt into the patch-bearing
   // pr_files variant only when a stale metric needs it. Mirrors backfillSnapshots.
+  const windowDays = snapshotWindowDays(ctx)
   return async (scopeType, scopeId, day, metricIds) => {
-    const windowFrom = new Date(Date.parse(day) - (SNAPSHOT_WINDOW_DAYS - 1) * 86_400_000)
+    const windowFrom = new Date(Date.parse(day) - (windowDays - 1) * 86_400_000)
       .toISOString()
       .slice(0, 10)
     const data = await loadScopeData(ctx.store, windowFrom, day, {
@@ -188,7 +212,7 @@ async function rederiveOnEngineBump(ctx, now, signal) {
     // file_complexity / statuses. (Dedicated store starts with a fresh memo.)
     invalidateLookupsCache(store)
     const today = now.slice(0, 10)
-    const fromDay = new Date(Date.parse(today) - SNAPSHOT_HISTORY_DAYS * 86_400_000)
+    const fromDay = new Date(Date.parse(today) - snapshotHorizonDays(localCtx) * 86_400_000)
       .toISOString()
       .slice(0, 10)
     return await rederiveStaleEngineSnapshots({
@@ -365,6 +389,19 @@ function registerDoctorTool(server, ctx) {
           message: `DB integrity check failed: ${String(err)}`,
         })
       }
+
+      // 9. Retention/window cascade invariant — surface a misconfiguration (the
+      // prune floors its cutoff so data is never lost, but the user should know if
+      // the store will keep more than they configured, or a window under-fills).
+      const cascadeMsgs = cascadeWarnings(ctx.config)
+      checks.push({
+        name: 'retention_cascade',
+        status: cascadeMsgs.length > 0 ? 'warn' : 'ok',
+        message:
+          cascadeMsgs.length > 0
+            ? cascadeMsgs.join(' ')
+            : `retention ${ctx.config.retentionDays}d / horizon ${snapshotHorizonDays(ctx)}d × window ${snapshotWindowDays(ctx)}d / patch ${ctx.config.patchRetentionDays}d — consistent`,
+      })
 
       const errorCount = checks.filter((c) => c.status === 'error').length
       const warnCount = checks.filter((c) => c.status === 'warn').length
@@ -650,7 +687,9 @@ function registerRunSyncTool(server, ctx) {
       // under both 'team' and 'org' canonical scopes. Best-effort — a failure
       // here does not fail the sync that already succeeded.
       const today = result.syncedAt.slice(0, 10)
-      const backfillFrom = new Date(Date.parse(today) - 119 * 86_400_000).toISOString().slice(0, 10)
+      const backfillFrom = new Date(Date.parse(today) - snapshotHorizonDays(ctx) * 86_400_000)
+        .toISOString()
+        .slice(0, 10)
       const coverageFingerprint = `${org}|${repos.join(',')}|${ctx.config.jiraProjects.join(',')}`
       let snapshotsWritten = 0
       const tBackfill = Date.now()
@@ -665,7 +704,7 @@ function registerRunSyncTool(server, ctx) {
             metricIds: COMPUTE_METRIC_IDS,
             fromDay: backfillFrom,
             toDay: today,
-            windowDays: 30,
+            windowDays: snapshotWindowDays(ctx),
             now: result.syncedAt,
             ingestWatermarkVersion: '1',
             coverageFingerprint,
@@ -677,10 +716,39 @@ function registerRunSyncTool(server, ctx) {
       }
       const backfillMs = Date.now() - tBackfill
 
+      // Ongoing retention prune: delete time-series rows beyond the retention
+      // window + NULL stale PR diff text + trim snapshots beyond the horizon, so
+      // the DB and the engine's in-memory working set stay bounded sync-over-sync.
+      // Each sync deletes only the ~1 day that newly aged out, then reclaims freed
+      // pages via incremental_vacuum (no full VACUUM — that whole-file rewrite +
+      // exclusive lock is left to the `prune` tool). The orphan-GC anti-join is
+      // also skipped here (gcOrphans:false) and left to that tool. Best-effort — a
+      // failure here never fails the sync that already succeeded.
+      let pruned = null
+      try {
+        const res = await ctx.store.pruneOldData({
+          now: result.syncedAt,
+          retentionDays: ctx.config.retentionDays,
+          snapshotHorizonDays: snapshotHorizonDays(ctx),
+          snapshotWindowDays: snapshotWindowDays(ctx),
+          patchRetentionDays: ctx.config.patchRetentionDays,
+          retentionBufferDays: ctx.config.retentionBufferDays,
+          gcOrphans: false,
+        })
+        pruned = res.counts
+        await ctx.store.incrementalVacuum()
+        // The prune mutated rows the scope-data memo may hold — drop it so the next
+        // get_* / report reloads from the trimmed store rather than stale memory.
+        invalidateLookupsCache(ctx.store)
+      } catch (err) {
+        result.errors.push(`prune failed: ${err instanceof Error ? err.message : String(err)}`)
+      }
+
       const output = {
         ...provenance('n/a'),
         synced_at: result.syncedAt,
         snapshots_written: snapshotsWritten,
+        pruned,
         patch_backfill: result.patchBackfill
           ? {
               backfilled: result.patchBackfill.backfilled,
@@ -2594,13 +2662,17 @@ function registerGetPersonReportTool(server, ctx) {
           .min(7)
           .max(3650)
           .optional()
-          .describe('Lookback window in days (default: 90).'),
+          .describe('Lookback window in days (default: the snapshot horizon, 60).'),
       }),
     },
     async ({ person_id, window_days }) => {
-      const report = await computePersonReportLive(ctx.store, person_id, {
-        windowDays: window_days ?? 90,
-      })
+      // Cap the window at retention — beyond it the raw rows have been pruned, so a
+      // larger window would silently compute over truncated data. retentionDays 0
+      // (keep-all) imposes no cap.
+      const requested = window_days ?? snapshotHorizonDays(ctx)
+      const windowDays =
+        ctx.config.retentionDays > 0 ? Math.min(requested, ctx.config.retentionDays) : requested
+      const report = await computePersonReportLive(ctx.store, person_id, { windowDays })
       return {
         content: [{ type: 'text', text: JSON.stringify(report) }],
         structuredContent: report,
@@ -2632,7 +2704,9 @@ function registerListPendingVerdictsTool(server, ctx) {
       }),
     },
     async ({ metric, person_id, limit }) => {
-      const out = await listPendingVerdicts(ctx.store, metric, person_id, limit ?? 25)
+      const out = await listPendingVerdicts(ctx.store, metric, person_id, limit ?? 25, {
+        sinceIso: llmSinceIso(ctx),
+      })
       return { content: [{ type: 'text', text: JSON.stringify(out) }], structuredContent: out }
     },
   )
@@ -2720,6 +2794,7 @@ function registerListPendingAiAuthorshipTool(server, ctx) {
         limit,
         loBand: lo_band,
         hiBand: hi_band,
+        sinceIso: llmSinceIso(ctx),
       })
       return { content: [{ type: 'text', text: JSON.stringify(out) }], structuredContent: out }
     },
@@ -2840,6 +2915,63 @@ function registerBackfillPrPatchesTool(server, ctx) {
   )
 }
 
+function registerPruneTool(server, ctx) {
+  server.registerTool(
+    'prune',
+    {
+      title: 'Prune Old Data (retention + VACUUM)',
+      description:
+        'Apply the retention policy to the local store: delete commits, PRs (and their files/' +
+        'reviews/comments), check-runs, deployments and AI-authorship rows older than the ' +
+        'retention window; NULL PR diff text (pr_files.patch) for PRs older than the patch window ' +
+        '(the denormalised line-count is kept, so code metrics are unaffected); and trim metric ' +
+        'snapshots beyond the horizon. The raw cutoff is floored at the snapshot horizon + window ' +
+        '+ buffer so metrics can never be starved. Jira issues are not pruned. Pass dry_run:true to ' +
+        'preview the row impact WITHOUT deleting. By default VACUUMs afterwards to reclaim file space ' +
+        '(a whole-file rewrite — can take a while on a large DB; skipped on a dry run). Windows come ' +
+        'from config (LAZYFLOW_RETENTION_DAYS / _SNAPSHOT_HORIZON_DAYS / _PATCH_RETENTION_DAYS).',
+      inputSchema: z.object({
+        vacuum: z
+          .boolean()
+          .optional()
+          .describe('Run a full VACUUM after pruning to reclaim disk space (default true).'),
+        dry_run: z
+          .boolean()
+          .optional()
+          .describe(
+            'Preview the counts that WOULD be pruned without mutating the store (default false).',
+          ),
+      }),
+    },
+    async ({ vacuum, dry_run }) => {
+      const now = new Date().toISOString()
+      const res = await ctx.store.pruneOldData({
+        now,
+        retentionDays: ctx.config.retentionDays,
+        snapshotHorizonDays: snapshotHorizonDays(ctx),
+        snapshotWindowDays: snapshotWindowDays(ctx),
+        patchRetentionDays: ctx.config.patchRetentionDays,
+        retentionBufferDays: ctx.config.retentionBufferDays,
+        dryRun: dry_run === true,
+      })
+      let vacuumed = false
+      if (dry_run !== true) {
+        // Pruned rows invalidate any memoised scope data held for get_* / reports.
+        invalidateLookupsCache(ctx.store)
+        if (vacuum !== false) {
+          await ctx.store.vacuum()
+          vacuumed = true
+        }
+      }
+      const output = { ...res, vacuumed }
+      return {
+        content: [{ type: 'text', text: JSON.stringify(output) }],
+        structuredContent: output,
+      }
+    },
+  )
+}
+
 export function createServer(ctx) {
   const server = new McpServer({
     name: SERVER_NAME,
@@ -2867,6 +2999,7 @@ export function createServer(ctx) {
   registerListPendingAiAuthorshipTool(server, ctx)
   registerRecordAiAuthorshipVerdictTool(server, ctx)
   registerBackfillPrPatchesTool(server, ctx)
+  registerPruneTool(server, ctx)
   registerGetSchemaTool(server, ctx)
   registerListIdentityMatchesTool(server, ctx)
   registerResolveIdentityMatchTool(server, ctx)

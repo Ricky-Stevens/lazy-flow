@@ -84,9 +84,13 @@ export async function listPendingAuthorshipVerdicts(store, opts = {}) {
   const loBand = typeof opts.loBand === 'number' ? opts.loBand : DEFAULT_LO_BAND
   const hiBand = typeof opts.hiBand === 'number' ? opts.hiBand : DEFAULT_HI_BAND
   const limit = typeof opts.limit === 'number' ? opts.limit : DEFAULT_LIMIT
+  // Optional recency floor: only surface entities authored on/after `sinceIso`, so
+  // the (expensive) session judgments stay bounded to recent work. Null = no floor
+  // (preserves prior behaviour for callers/tests that don't pass it).
+  const sinceIso = typeof opts.sinceIso === 'string' ? opts.sinceIso : null
   if (loBand > hiBand) throw new Error('loBand must be <= hiBand')
 
-  const pendingRows = await store.getPendingAiAuthorship({ loBand, hiBand, limit })
+  const pendingRows = await store.getPendingAiAuthorship({ loBand, hiBand, limit, sinceIso })
 
   // Targeted text lookups: ONE batched query per kind, not a full-table scan.
   const commitEntityIds = []

@@ -9,10 +9,12 @@
  *     authenticated `gh` CLI rather than disabling GitHub sync.
  */
 
-import { describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import {
+  cascadeWarnings,
   githubTokenFromEnv,
   githubTokenFromGhCli,
+  loadConfig,
   parseBool,
   parseDaysWithDefault,
 } from './config.js'
@@ -101,5 +103,97 @@ describe('parseDaysWithDefault', () => {
   it('parses an explicit positive day count', () => {
     expect(parseDaysWithDefault('365', 180)).toBe(365)
     expect(parseDaysWithDefault(' 90 ', 180)).toBe(90)
+  })
+})
+
+describe('loadConfig — retention / window cascade', () => {
+  // loadConfig reads process.env directly; clear the knobs we assert so the test
+  // sees DEFAULTS regardless of the host environment, and force an in-memory DB so
+  // resolveDbPath creates no directory. Saved/restored around each case.
+  const KEYS = [
+    'LAZYFLOW_DB_PATH',
+    'LAZYFLOW_REPO_HISTORY_DAYS',
+    'LAZYFLOW_RETENTION_DAYS',
+    'LAZYFLOW_SNAPSHOT_HORIZON_DAYS',
+    'LAZYFLOW_SNAPSHOT_WINDOW_DAYS',
+    'LAZYFLOW_LLM_WINDOW_DAYS',
+    'LAZYFLOW_PATCH_RETENTION_DAYS',
+  ]
+  let saved
+  beforeEach(() => {
+    saved = {}
+    for (const k of KEYS) {
+      saved[k] = process.env[k]
+      delete process.env[k]
+    }
+    process.env.LAZYFLOW_DB_PATH = ':memory:'
+  })
+  afterEach(() => {
+    for (const k of KEYS) {
+      if (saved[k] === undefined) delete process.env[k]
+      else process.env[k] = saved[k]
+    }
+  })
+
+  it('defaults to the 90 / 60 / 30 cascade', () => {
+    const c = loadConfig()
+    expect(c.repoHistoryDays).toBe(90)
+    expect(c.retentionDays).toBe(90)
+    expect(c.snapshotHorizonDays).toBe(60)
+    expect(c.snapshotWindowDays).toBe(30)
+    expect(c.llmWindowDays).toBe(30)
+    expect(c.patchRetentionDays).toBe(30)
+    expect(c.retentionBufferDays).toBe(7)
+  })
+
+  it('honours explicit env overrides', () => {
+    process.env.LAZYFLOW_REPO_HISTORY_DAYS = '120'
+    process.env.LAZYFLOW_RETENTION_DAYS = '120'
+    process.env.LAZYFLOW_SNAPSHOT_HORIZON_DAYS = '90'
+    process.env.LAZYFLOW_LLM_WINDOW_DAYS = '14'
+    process.env.LAZYFLOW_PATCH_RETENTION_DAYS = '7'
+    const c = loadConfig()
+    expect(c.repoHistoryDays).toBe(120)
+    expect(c.retentionDays).toBe(120)
+    expect(c.snapshotHorizonDays).toBe(90)
+    expect(c.llmWindowDays).toBe(14)
+    expect(c.patchRetentionDays).toBe(7)
+  })
+
+  it('treats an explicit 0 as "disabled" (keep-all) for retention and patch', () => {
+    process.env.LAZYFLOW_RETENTION_DAYS = '0'
+    process.env.LAZYFLOW_PATCH_RETENTION_DAYS = '0'
+    const c = loadConfig()
+    expect(c.retentionDays).toBe(0)
+    expect(c.patchRetentionDays).toBe(0)
+  })
+})
+
+describe('cascadeWarnings', () => {
+  const base = {
+    repoHistoryDays: 90,
+    retentionDays: 90,
+    snapshotHorizonDays: 60,
+    snapshotWindowDays: 30,
+    retentionBufferDays: 7,
+  }
+
+  it('returns no warnings for the default 90 / 60 / 30 cascade', () => {
+    expect(cascadeWarnings(base)).toEqual([])
+  })
+
+  it('warns when retention is below the snapshot horizon + window', () => {
+    const w = cascadeWarnings({ ...base, retentionDays: 45 })
+    expect(w.length).toBeGreaterThan(0)
+    expect(w[0]).toMatch(/retention_days/)
+  })
+
+  it('warns when the fetch floor is below retention', () => {
+    const w = cascadeWarnings({ ...base, repoHistoryDays: 60 })
+    expect(w.some((m) => /repo_history_days/.test(m))).toBe(true)
+  })
+
+  it('does not warn when retention/history are 0 (keep-all / all-time)', () => {
+    expect(cascadeWarnings({ ...base, retentionDays: 0, repoHistoryDays: 0 })).toEqual([])
   })
 })

@@ -99,13 +99,13 @@ async function seedCommit(store, { sha, message }) {
   })
 }
 
-async function upsertAuthorship(store, { entityType, entityId, aiScore }) {
+async function upsertAuthorship(store, { entityType, entityId, aiScore, authoredAt }) {
   await store.upsertAiAuthorship({
     entityType,
     entityId,
     repoId: 'repo-1',
     authorIdentityId: 'id-dev',
-    authoredAt: '2026-06-01T00:00:00Z',
+    authoredAt: authoredAt ?? '2026-06-01T00:00:00Z',
     aiScore,
     signalsJson: '[]',
     computedAt: NOW,
@@ -179,6 +179,31 @@ describe('listPendingAuthorshipVerdicts', () => {
     const out = await listPendingAuthorshipVerdicts(store, { limit: 5 })
     expect(out.pendingCount).toBe(1)
     expect(out.pending[0].entityId).toBe('pr-b')
+  })
+
+  it('applies the sinceIso recency floor (only recent entities surface)', async () => {
+    await seedPr(store, { id: 'pr-stale', title: 'old work', body: '## Summary' })
+    await seedPr(store, { id: 'pr-fresh', title: 'new work', body: '## Summary' })
+    await upsertAuthorship(store, {
+      entityType: 'pull_request',
+      entityId: 'pr-stale',
+      aiScore: 0.5,
+      authoredAt: '2026-01-01T00:00:00Z',
+    })
+    await upsertAuthorship(store, {
+      entityType: 'pull_request',
+      entityId: 'pr-fresh',
+      aiScore: 0.5,
+      authoredAt: '2026-06-15T00:00:00Z',
+    })
+
+    // No floor → both ambiguous-band PRs surface.
+    expect((await listPendingAuthorshipVerdicts(store)).pendingCount).toBe(2)
+
+    // With a floor at 2026-06-01, only the fresh one remains.
+    const out = await listPendingAuthorshipVerdicts(store, { sinceIso: '2026-06-01T00:00:00Z' })
+    expect(out.pendingCount).toBe(1)
+    expect(out.pending[0].entityId).toBe('pr-fresh')
   })
 })
 

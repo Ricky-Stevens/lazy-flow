@@ -121,6 +121,7 @@ describe('MCP server — bootstrap', () => {
       'list_pending_ai_authorship',
       'list_pending_verdicts',
       'list_report_presets',
+      'prune',
       'query_db',
       'record_ai_authorship_verdict',
       'record_verdict',
@@ -1390,5 +1391,57 @@ describe('identity stitching tools', () => {
       arguments: { identity_id: 'nope', is_bot: true },
     })
     expect(res.structuredContent.error).toMatch(/identity not found/)
+  })
+})
+
+describe('MCP server — tool: prune', () => {
+  // Seed one org/identity/repo + a single very-old (200d) PR and commit so the
+  // retention prune (default 90/60/30 config) has something to remove.
+  function seedAged(ctx) {
+    const old = new Date(Date.now() - 200 * 86_400_000).toISOString()
+    const now = new Date().toISOString()
+    const run = (sql, ...p) => ctx.store.db.prepare(sql).run(...p)
+    run(`INSERT INTO organisations (id,name,created_at,updated_at) VALUES ('o','O',?,?)`, now, now)
+    run(
+      `INSERT INTO identities (id,kind,external_id,raw,updated_at) VALUES ('i','github_login','d','{}',?)`,
+      now,
+    )
+    run(
+      `INSERT INTO repositories (id,github_node_id,org_id,owner,name,default_branch,raw,created_at,updated_at)
+       VALUES ('r','n','o','o','app','main','{}',?,?)`,
+      now,
+      now,
+    )
+    run(
+      `INSERT INTO commits (repo_id,sha,author_identity_id,authored_at,raw,created_at,updated_at)
+       VALUES ('r','s','i',?, '{}', ?, ?)`,
+      old,
+      now,
+      now,
+    )
+    run(
+      `INSERT INTO pull_requests (id,repo_id,number,author_identity_id,state,head_ref,base_ref,created_at,raw,updated_at)
+       VALUES ('pr','r',1,'i','merged','h','main',?, '{}', ?)`,
+      old,
+      now,
+    )
+  }
+
+  it('dry_run previews counts without mutating; a real prune deletes', async () => {
+    const { client, ctx } = await makeConnectedPair()
+    seedAged(ctx)
+
+    const dry = await client.callTool({ name: 'prune', arguments: { dry_run: true } })
+    expect(dry.structuredContent.dryRun).toBe(true)
+    expect(dry.structuredContent.counts.pull_requests).toBe(1)
+    expect(dry.structuredContent.counts.commits).toBe(1)
+    expect(dry.structuredContent.vacuumed).toBe(false)
+    // Nothing actually removed by the dry run.
+    expect(ctx.store.db.prepare(`SELECT COUNT(*) c FROM pull_requests`).get().c).toBe(1)
+
+    const real = await client.callTool({ name: 'prune', arguments: { vacuum: false } })
+    expect(real.structuredContent.counts.pull_requests).toBe(1)
+    expect(ctx.store.db.prepare(`SELECT COUNT(*) c FROM pull_requests`).get().c).toBe(0)
+    expect(ctx.store.db.prepare(`SELECT COUNT(*) c FROM commits`).get().c).toBe(0)
   })
 })

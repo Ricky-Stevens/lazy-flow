@@ -70,7 +70,7 @@ function truncatePatch(patch) {
  * List artifacts that still need a verdict for `metric`, scoped to `personId`.
  * Returns { metric, subjectType, verdictShape, pending: [{ subjectId, context }] }.
  */
-export async function listPendingVerdicts(store, metric, personId, limit = 25) {
+export async function listPendingVerdicts(store, metric, personId, limit = 25, opts = {}) {
   if (!VERDICT_METRICS.includes(metric)) {
     throw new Error(`Unknown verdict metric: ${metric}`)
   }
@@ -79,6 +79,12 @@ export async function listPendingVerdicts(store, metric, personId, limit = 25) {
   const done = new Set(
     (await store.getAiVerdictsByMetric(subjectType, metric)).map((v) => v.subjectId),
   )
+  // Optional recency floor: only judge artifacts on PRs created on/after `sinceIso`,
+  // so the (expensive) session verdicts stay bounded to recent work. Null = no floor
+  // (preserves prior behaviour for callers/tests that don't pass it).
+  const sinceIso = typeof opts.sinceIso === 'string' ? opts.sinceIso : null
+  const inWindow = (pr) =>
+    !sinceIso || (pr && typeof pr.createdAt === 'string' && pr.createdAt >= sinceIso)
   const prs = await store.getAllPullRequests()
   const pending = []
 
@@ -89,7 +95,7 @@ export async function listPendingVerdicts(store, metric, personId, limit = 25) {
     const selected = []
     for (const pr of prs) {
       if (!(pr.authorIdentityId && ids.has(pr.authorIdentityId) && pr.state === 'merged')) continue
-      if (done.has(pr.id)) continue
+      if (done.has(pr.id) || !inWindow(pr)) continue
       selected.push(pr)
       if (selected.length >= limit) break
     }
@@ -118,7 +124,9 @@ export async function listPendingVerdicts(store, metric, personId, limit = 25) {
     }
   } else if (subjectType === 'review_comment') {
     const authoredPrIds = new Set(
-      prs.filter((p) => p.authorIdentityId && ids.has(p.authorIdentityId)).map((p) => p.id),
+      prs
+        .filter((p) => p.authorIdentityId && ids.has(p.authorIdentityId) && inWindow(p))
+        .map((p) => p.id),
     )
     for (const c of await store.getAllReviewComments()) {
       if (!authoredPrIds.has(c.prId) || done.has(c.nodeId)) continue
@@ -135,8 +143,9 @@ export async function listPendingVerdicts(store, metric, personId, limit = 25) {
     const prById = new Map(prs.map((p) => [p.id, p]))
     for (const r of await store.getAllReviews()) {
       if (!ids.has(r.reviewerIdentityId) || done.has(r.nodeId)) continue
-      const t = extractText(r.raw)
       const pr = prById.get(r.prId)
+      if (!inWindow(pr)) continue
+      const t = extractText(r.raw)
       pending.push({
         subjectId: r.nodeId,
         context: {

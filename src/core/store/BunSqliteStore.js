@@ -84,6 +84,13 @@ export class BunSqliteStore {
 
   constructor(path) {
     this.db = new Database(path)
+    // INCREMENTAL auto-vacuum lets the routine prune reclaim freed pages via
+    // `PRAGMA incremental_vacuum` (a normal write txn — no exclusive lock, no 2×
+    // rewrite) instead of a full VACUUM on the hot path. On a NEW db this takes
+    // effect immediately (set before any page is written); on an EXISTING db it is
+    // pending until the next full VACUUM converts the file (a no-op otherwise, so
+    // incrementalVacuum() degrades gracefully until that conversion happens).
+    this.db.exec(`PRAGMA auto_vacuum = INCREMENTAL`)
     this.db.exec(`PRAGMA journal_mode = WAL`)
     // Under WAL, synchronous=NORMAL is durable across application crashes (only
     // an OS or power crash can lose the last few committed transactions, with
@@ -332,6 +339,217 @@ export class BunSqliteStore {
          AND id NOT IN (SELECT person_id FROM team_membership)`,
     ).run()
     return res.changes ?? 0
+  }
+
+  /**
+   * Age-based retention prune. Bounds DB growth + the in-memory working set the
+   * metric engine loads by deleting time-series rows older than the retention
+   * window, NULLing stale PR diff text, and trimming snapshots beyond the horizon.
+   *
+   * Three INDEPENDENT toggles (each disabled when its day-count is 0):
+   *   - row prune       (retentionDays): commits/PRs(+files/reviews/comments)/
+   *                     check-runs/deployments/ai-authorship older than the cutoff.
+   *   - snapshot prune  (snapshotHorizonDays): metric_snapshots/_baselines beyond
+   *                     the horizon (cleans up when the horizon is reduced).
+   *   - patch prune     (patchRetentionDays): NULL pr_files.patch for PRs older
+   *                     than the patch window (haloc is denormalised, so metrics
+   *                     are untouched; diff-level verdicts run on recent PRs only).
+   *
+   * SAFETY: the row-prune cutoff is floored at `snapshot horizon + window +
+   * retentionBufferDays`, so a misconfiguration can NEVER delete raw data the
+   * snapshot backfill still needs, and the buffer absorbs boundary inclusivity /
+   * timezone skew / a missed (catch-up) sync. Deletes run children-before-parents
+   * (FK order; foreign_keys=ON) inside one transaction. Jira issues are
+   * intentionally NOT pruned (tiny + flow metrics rely on full transition history).
+   *
+   * `gcOrphans` (default true) controls the file_complexity orphan sweep — a full
+   * anti-join, so the per-sync auto-prune passes false and leaves it to the manual
+   * `prune` tool. `dryRun` (default false) runs every statement then rolls the
+   * deletes back, so the returned counts preview the impact WITHOUT mutating.
+   *
+   * Returns per-table change counts + the resolved cutoffs (for honest reporting).
+   */
+  async pruneOldData({
+    now,
+    retentionDays = 0,
+    snapshotHorizonDays = 0,
+    snapshotWindowDays = 0,
+    patchRetentionDays = 0,
+    retentionBufferDays = 0,
+    gcOrphans = true,
+    dryRun = false,
+  }) {
+    const nowMs = Date.parse(now ?? new Date().toISOString())
+    const nowIso = now ?? new Date().toISOString()
+    const dayCutoff = (days) => new Date(nowMs - days * 86_400_000).toISOString()
+    const dayOnly = (days) => new Date(nowMs - days * 86_400_000).toISOString().slice(0, 10)
+
+    // Floor the raw cutoff at horizon + window + buffer so the snapshot backfill is
+    // never starved and the boundary has slack (skew / missed sync / inclusivity).
+    const rawRetentionDays = Math.max(
+      retentionDays,
+      snapshotHorizonDays + snapshotWindowDays + retentionBufferDays,
+    )
+    const rawCutoffIso = dayCutoff(rawRetentionDays)
+    const patchCutoffIso = dayCutoff(patchRetentionDays)
+    const snapshotCutoffDay = dayOnly(snapshotHorizonDays)
+
+    const counts = {
+      reviews: 0,
+      review_comments: 0,
+      pr_issue_links: 0,
+      pr_refs: 0,
+      pr_files: 0,
+      pull_requests: 0,
+      commit_authors: 0,
+      commits: 0,
+      check_runs: 0,
+      deploy_incident_links: 0,
+      deployments: 0,
+      ai_authorship: 0,
+      file_complexity: 0,
+      metric_snapshots: 0,
+      metric_baselines: 0,
+      pr_files_patch_nulled: 0,
+    }
+
+    await this.transaction(async () => {
+      // A savepoint lets dryRun execute every statement (so .changes reports the
+      // real impact) then discard the deletes, leaving the store untouched.
+      this.db.exec('SAVEPOINT prune')
+      if (retentionDays > 0) {
+        // PR-rooted rows (anchor: pull_requests.created_at), children first.
+        const oldPrs = '(SELECT id FROM pull_requests WHERE created_at < ?)'
+        counts.reviews += this.stmt(`DELETE FROM reviews WHERE pr_id IN ${oldPrs}`).run(
+          rawCutoffIso,
+        ).changes
+        counts.review_comments += this.stmt(
+          `DELETE FROM review_comments WHERE pr_id IN ${oldPrs}`,
+        ).run(rawCutoffIso).changes
+        counts.pr_issue_links += this.stmt(
+          `DELETE FROM pr_issue_links WHERE pr_id IN ${oldPrs}`,
+        ).run(rawCutoffIso).changes
+        counts.pr_refs += this.stmt(`DELETE FROM pr_refs WHERE pr_id IN ${oldPrs}`).run(
+          rawCutoffIso,
+        ).changes
+        counts.pr_files += this.stmt(`DELETE FROM pr_files WHERE pr_id IN ${oldPrs}`).run(
+          rawCutoffIso,
+        ).changes
+        counts.pull_requests += this.stmt(`DELETE FROM pull_requests WHERE created_at < ?`).run(
+          rawCutoffIso,
+        ).changes
+
+        // Commits (anchor: authored_at) + their author/trailer rows (no cascade).
+        counts.commit_authors += this.stmt(
+          `DELETE FROM commit_authors
+            WHERE (repo_id, sha) IN (SELECT repo_id, sha FROM commits WHERE authored_at < ?)`,
+        ).run(rawCutoffIso).changes
+        counts.commits += this.stmt(`DELETE FROM commits WHERE authored_at < ?`).run(
+          rawCutoffIso,
+        ).changes
+
+        // CI check runs (anchor: completed/started/updated).
+        counts.check_runs += this.stmt(
+          `DELETE FROM check_runs WHERE COALESCE(completed_at, started_at, updated_at) < ?`,
+        ).run(rawCutoffIso).changes
+
+        // Deployments (+ their incident links, no cascade) (anchor: created_at).
+        counts.deploy_incident_links += this.stmt(
+          `DELETE FROM deploy_incident_links
+            WHERE deploy_id IN (SELECT id FROM deployments WHERE created_at < ?)`,
+        ).run(rawCutoffIso).changes
+        counts.deployments += this.stmt(`DELETE FROM deployments WHERE created_at < ?`).run(
+          rawCutoffIso,
+        ).changes
+
+        // AI-authorship signal rows (anchor: authored_at; fall back to computed_at
+        // for the rare NULL-authored_at row so it can't become immortal).
+        counts.ai_authorship += this.stmt(
+          `DELETE FROM ai_authorship
+            WHERE (authored_at IS NOT NULL AND authored_at < ?)
+               OR (authored_at IS NULL AND computed_at < ?)`,
+        ).run(rawCutoffIso, rawCutoffIso).changes
+
+        // Whole-file complexity cache rows whose sha is no longer referenced by any
+        // remaining commit or PR ref (dead weight after the row prune). A full
+        // anti-join (3× NOT IN) — gated behind gcOrphans so the per-sync auto-prune
+        // skips it and only the manual `prune` tool pays the scan. Subqueries are
+        // NULL-free (commits.sha is PK; pr_refs sha columns filtered NOT NULL).
+        if (gcOrphans) {
+          counts.file_complexity += this.stmt(
+            `DELETE FROM file_complexity
+              WHERE (repo_id, sha) NOT IN (SELECT repo_id, sha FROM commits)
+                AND (repo_id, sha) NOT IN (SELECT repo_id, base_sha FROM pr_refs WHERE base_sha IS NOT NULL)
+                AND (repo_id, sha) NOT IN (SELECT repo_id, head_sha FROM pr_refs WHERE head_sha IS NOT NULL)`,
+          ).run().changes
+        }
+      }
+
+      // Snapshot trim (independent of the row prune): drop snapshot/baseline rows
+      // beyond the current horizon — reclaims the tail when the horizon is reduced.
+      if (snapshotHorizonDays > 0) {
+        counts.metric_snapshots += this.stmt(`DELETE FROM metric_snapshots WHERE day < ?`).run(
+          snapshotCutoffDay,
+        ).changes
+        counts.metric_baselines += this.stmt(
+          `DELETE FROM metric_baselines WHERE as_of_day < ?`,
+        ).run(snapshotCutoffDay).changes
+      }
+
+      // Patch-text trim (independent): NULL diff text for PRs older than the patch
+      // window. The denormalised pr_files.haloc is preserved, so code metrics are
+      // unaffected; only diff-level verdicts (recent PRs) need the raw patch.
+      if (patchRetentionDays > 0) {
+        counts.pr_files_patch_nulled += this.stmt(
+          `UPDATE pr_files SET patch = NULL, updated_at = ?
+            WHERE patch IS NOT NULL
+              AND pr_id IN (SELECT id FROM pull_requests WHERE created_at < ?)`,
+        ).run(nowIso, patchCutoffIso).changes
+      }
+
+      // dryRun: undo every mutation above but keep the captured .changes counts.
+      // ROLLBACK TO rewinds to the savepoint; RELEASE then folds the (now empty)
+      // delta into the outer transaction, which commits nothing.
+      if (dryRun) this.db.exec('ROLLBACK TO prune')
+      this.db.exec('RELEASE prune')
+    })
+
+    return {
+      dryRun,
+      counts,
+      cutoffs: {
+        rawRetentionDays,
+        rawCutoffIso,
+        patchRetentionDays,
+        patchCutoffIso,
+        snapshotHorizonDays,
+        snapshotCutoffDay,
+      },
+    }
+  }
+
+  /**
+   * Full reclaim: VACUUM rewrites + defragments the whole file (and converts an
+   * existing db to the INCREMENTAL auto-vacuum mode set in the constructor). It
+   * takes an exclusive lock and needs ~2× the file size transiently, so it is the
+   * DELIBERATE / one-off path (the `prune` tool), never the per-sync hot path.
+   * Cannot run inside a transaction. Truncates the WAL afterwards.
+   */
+  async vacuum() {
+    this.db.exec('VACUUM')
+    this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+  }
+
+  /**
+   * Lightweight reclaim for the hot path: returns freed pages to the OS in a normal
+   * write transaction (no exclusive whole-file rewrite, no 2× spike) and truncates
+   * the WAL so per-sync deletes don't ratchet it up. A no-op on a file still in the
+   * legacy auto_vacuum=NONE mode (until the next full vacuum() converts it), so it
+   * is always safe to call.
+   */
+  async incrementalVacuum() {
+    this.db.exec('PRAGMA incremental_vacuum')
+    this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
   }
 
   async getIdentitiesByPerson(personId) {
@@ -1412,15 +1630,30 @@ export class BunSqliteStore {
    * keys + score; the caller fetches text by id from commits / pull_requests
    * separately, so no fat columns are loaded here.
    */
-  async getPendingAiAuthorship({ loBand, hiBand, limit }) {
-    const rows = this.stmt(
-      `SELECT entity_type, entity_id, repo_id, author_identity_id, ai_score
-         FROM ai_authorship
-        WHERE verdict_at IS NULL
-          AND ai_score BETWEEN ? AND ?
-        ORDER BY ai_score DESC
-        LIMIT ?`,
-    ).all(loBand, hiBand, limit)
+  async getPendingAiAuthorship({ loBand, hiBand, limit, sinceIso = null }) {
+    // Optional recency floor: a non-null sinceIso restricts the queue to entities
+    // authored on/after that ISO timestamp (rows with a NULL authored_at are of
+    // indeterminate age and are excluded from the bounded window). Omitting it
+    // (null) preserves the all-time behaviour for existing callers/tests.
+    const rows = sinceIso
+      ? this.stmt(
+          `SELECT entity_type, entity_id, repo_id, author_identity_id, ai_score
+             FROM ai_authorship
+            WHERE verdict_at IS NULL
+              AND ai_score BETWEEN ? AND ?
+              AND authored_at IS NOT NULL
+              AND authored_at >= ?
+            ORDER BY ai_score DESC
+            LIMIT ?`,
+        ).all(loBand, hiBand, sinceIso, limit)
+      : this.stmt(
+          `SELECT entity_type, entity_id, repo_id, author_identity_id, ai_score
+             FROM ai_authorship
+            WHERE verdict_at IS NULL
+              AND ai_score BETWEEN ? AND ?
+            ORDER BY ai_score DESC
+            LIMIT ?`,
+        ).all(loBand, hiBand, limit)
     return rows.map((r) => ({
       entityType: String(r.entity_type),
       entityId: String(r.entity_id),

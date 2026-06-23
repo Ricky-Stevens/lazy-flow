@@ -1610,3 +1610,330 @@ describe('sprint membership event idempotency', () => {
     expect(events).toHaveLength(1)
   })
 })
+
+// ---------------------------------------------------------------------------
+// pruneOldData — age-based retention
+// ---------------------------------------------------------------------------
+
+describe('pruneOldData', () => {
+  const NOW = '2026-06-23T00:00:00.000Z'
+  const ago = (days) => new Date(Date.parse(NOW) - days * 86_400_000).toISOString()
+  const dayAgo = (days) => ago(days).slice(0, 10)
+
+  /** Seed an org/identity/repo + dated time-series rows across the windows. */
+  function seed(db) {
+    const run = (sql, ...p) => db.prepare(sql).run(...p)
+    run(
+      `INSERT INTO organisations (id, name, created_at, updated_at) VALUES ('org-1','Org',?,?)`,
+      NOW,
+      NOW,
+    )
+    run(
+      `INSERT INTO identities (id, kind, external_id, raw, updated_at) VALUES ('id-1','github_login','dev','{}',?)`,
+      NOW,
+    )
+    run(
+      `INSERT INTO repositories (id, github_node_id, org_id, owner, name, default_branch, raw, created_at, updated_at)
+       VALUES ('repo-1','node-1','org-1','org','app','main','{}',?,?)`,
+      NOW,
+      NOW,
+    )
+
+    // Commits: one beyond retention (200d), one recent (5d) + a co-author row each.
+    for (const [sha, days] of [
+      ['old', 200],
+      ['new', 5],
+    ]) {
+      run(
+        `INSERT INTO commits (repo_id, sha, author_identity_id, authored_at, raw, created_at, updated_at)
+         VALUES ('repo-1',?, 'id-1', ?, '{}', ?, ?)`,
+        sha,
+        ago(days),
+        NOW,
+        NOW,
+      )
+      run(
+        `INSERT INTO commit_authors (repo_id, sha, identity_id, role, source) VALUES ('repo-1',?, 'id-1','author','api')`,
+        sha,
+      )
+    }
+
+    // PRs: OLD (200d, deleted), MID (50d, kept but patch nulled), NEW (5d, kept + patch).
+    for (const [id, days] of [
+      ['pr-old', 200],
+      ['pr-mid', 50],
+      ['pr-new', 5],
+    ]) {
+      run(
+        `INSERT INTO pull_requests (id, repo_id, number, author_identity_id, state, head_ref, base_ref, created_at, raw, updated_at)
+         VALUES (?, 'repo-1', 1, 'id-1', 'merged', 'h', 'main', ?, '{}', ?)`,
+        id,
+        ago(days),
+        NOW,
+      )
+      run(
+        `INSERT INTO pr_files (pr_id, repo_id, path, patch, created_at, updated_at)
+         VALUES (?, 'repo-1', 'a.js', '@@ patch @@', ?, ?)`,
+        id,
+        NOW,
+        NOW,
+      )
+    }
+    // A review on the OLD PR (cascade-pruned) and on the NEW PR (kept).
+    run(
+      `INSERT INTO reviews (node_id, pr_id, reviewer_identity_id, state, submitted_at, raw, updated_at)
+       VALUES ('rev-old','pr-old','id-1','approved',?, '{}', ?)`,
+      ago(200),
+      NOW,
+    )
+    run(
+      `INSERT INTO reviews (node_id, pr_id, reviewer_identity_id, state, submitted_at, raw, updated_at)
+       VALUES ('rev-new','pr-new','id-1','approved',?, '{}', ?)`,
+      ago(5),
+      NOW,
+    )
+
+    // Deployments, check runs, ai_authorship: one old, one recent each.
+    for (const [id, days] of [
+      ['dep-old', 200],
+      ['dep-new', 5],
+    ]) {
+      run(
+        `INSERT INTO deployments (id, repo_id, sha, environment, status, created_at, source, raw, updated_at)
+         VALUES (?, 'repo-1', 'old', 'production', 'success', ?, 'deployments_api', '{}', ?)`,
+        id,
+        ago(days),
+        NOW,
+      )
+    }
+    for (const [node, days] of [
+      ['cr-old', 200],
+      ['cr-new', 5],
+    ]) {
+      run(
+        `INSERT INTO check_runs (node_id, repo_id, head_sha, name, status, completed_at, updated_at)
+         VALUES (?, 'repo-1', 'old', 'ci', 'completed', ?, ?)`,
+        node,
+        ago(days),
+        NOW,
+      )
+    }
+    for (const [eid, days] of [
+      ['repo-1:old', 200],
+      ['repo-1:new', 5],
+    ]) {
+      run(
+        `INSERT INTO ai_authorship (entity_type, entity_id, repo_id, author_identity_id, authored_at, ai_score, signals_json, computed_at)
+         VALUES ('commit', ?, 'repo-1', 'id-1', ?, 0.5, '[]', ?)`,
+        eid,
+        ago(days),
+        NOW,
+      )
+    }
+
+    // Snapshots: one beyond the horizon (100d), one inside (10d).
+    for (const [metric, days] of [
+      ['m.old', 100],
+      ['m.new', 10],
+    ]) {
+      run(
+        `INSERT INTO metric_snapshots (scope_type, scope_id, metric, day, value, window, trust_tier, data_quality, engine_version, ingest_watermark_version, coverage_fingerprint, computed_at)
+         VALUES ('team','team', ?, ?, 1, '30d', 'deterministic', 'ok', '0.1.1', '1', 'fp', ?)`,
+        metric,
+        dayAgo(days),
+        NOW,
+      )
+    }
+
+    // One ORPHAN file_complexity row (sha referenced by no commit or pr_ref) — only
+    // the gcOrphans sweep removes it.
+    run(
+      `INSERT INTO file_complexity (repo_id, sha, path, language, loc, total_cyclomatic, function_count, functions, computed_at)
+       VALUES ('repo-1', 'orphan-sha', 'x.js', 'js', 1, 1, 1, '[]', ?)`,
+      NOW,
+    )
+  }
+
+  it('prunes rows beyond retention, trims snapshots, and NULLs stale patch text', async () => {
+    const { db, store } = migratedStore()
+    seed(db)
+
+    const { counts } = await store.pruneOldData({
+      now: NOW,
+      retentionDays: 90,
+      snapshotHorizonDays: 60,
+      snapshotWindowDays: 30,
+      patchRetentionDays: 30,
+    })
+
+    // Row prune (200d-old rows): exactly the old ones go.
+    expect(counts.pull_requests).toBe(1)
+    expect(counts.pr_files).toBe(1) // pr-old's file deleted with the PR
+    expect(counts.reviews).toBe(1)
+    expect(counts.commits).toBe(1)
+    expect(counts.commit_authors).toBe(1)
+    expect(counts.deployments).toBe(1)
+    expect(counts.check_runs).toBe(1)
+    expect(counts.ai_authorship).toBe(1)
+    // Snapshot trim (>60d): the 100d snapshot goes, the 10d one stays.
+    expect(counts.metric_snapshots).toBe(1)
+    // Patch trim (>30d but within retention): pr-mid's patch is nulled, pr-new kept.
+    expect(counts.pr_files_patch_nulled).toBe(1)
+    // Orphan GC (default on): the unreferenced file_complexity row is removed.
+    expect(counts.file_complexity).toBe(1)
+    expect(db.prepare(`SELECT COUNT(*) c FROM file_complexity`).get().c).toBe(0)
+
+    const remainingPrs = db
+      .prepare(`SELECT id FROM pull_requests ORDER BY id`)
+      .all()
+      .map((r) => r.id)
+    expect(remainingPrs).toEqual(['pr-mid', 'pr-new'])
+    const midPatch = db.prepare(`SELECT patch FROM pr_files WHERE pr_id='pr-mid'`).get().patch
+    const newPatch = db.prepare(`SELECT patch FROM pr_files WHERE pr_id='pr-new'`).get().patch
+    expect(midPatch).toBeNull()
+    expect(newPatch).toBe('@@ patch @@')
+  })
+
+  it('floors the raw cutoff at the snapshot horizon + window so metrics are never starved', async () => {
+    const { db, store } = migratedStore()
+    seed(db)
+
+    // retentionDays far below the horizon: the floor (60+30=90) must still protect
+    // the 50d-old PR/commit data the snapshot backfill needs.
+    const { counts, cutoffs } = await store.pruneOldData({
+      now: NOW,
+      retentionDays: 10,
+      snapshotHorizonDays: 60,
+      snapshotWindowDays: 30,
+      patchRetentionDays: 30,
+    })
+
+    expect(cutoffs.rawRetentionDays).toBe(90)
+    // Only the 200d rows are removed; the 50d-old PR survives the floor.
+    expect(counts.pull_requests).toBe(1)
+    const remaining = db
+      .prepare(`SELECT id FROM pull_requests ORDER BY id`)
+      .all()
+      .map((r) => r.id)
+    expect(remaining).toEqual(['pr-mid', 'pr-new'])
+  })
+
+  it('is a no-op for row + patch prune when their windows are 0 (keep-all)', async () => {
+    const { db, store } = migratedStore()
+    seed(db)
+
+    const { counts } = await store.pruneOldData({
+      now: NOW,
+      retentionDays: 0,
+      snapshotHorizonDays: 0,
+      snapshotWindowDays: 0,
+      patchRetentionDays: 0,
+    })
+
+    expect(counts.pull_requests).toBe(0)
+    expect(counts.commits).toBe(0)
+    expect(counts.pr_files_patch_nulled).toBe(0)
+    expect(counts.metric_snapshots).toBe(0)
+    expect(db.prepare(`SELECT COUNT(*) c FROM pull_requests`).get().c).toBe(3)
+    expect(db.prepare(`SELECT COUNT(*) c FROM commits`).get().c).toBe(2)
+  })
+
+  it('gcOrphans:false skips the file_complexity anti-join (hot-path mode)', async () => {
+    const { db, store } = migratedStore()
+    seed(db)
+
+    const { counts } = await store.pruneOldData({
+      now: NOW,
+      retentionDays: 90,
+      snapshotHorizonDays: 60,
+      snapshotWindowDays: 30,
+      patchRetentionDays: 30,
+      gcOrphans: false,
+    })
+
+    // Row prune still runs; the orphan file_complexity row is left for the manual tool.
+    expect(counts.pull_requests).toBe(1)
+    expect(counts.file_complexity).toBe(0)
+    expect(db.prepare(`SELECT COUNT(*) c FROM file_complexity`).get().c).toBe(1)
+  })
+
+  it('dryRun previews the counts without mutating the store', async () => {
+    const { db, store } = migratedStore()
+    seed(db)
+
+    const { dryRun, counts } = await store.pruneOldData({
+      now: NOW,
+      retentionDays: 90,
+      snapshotHorizonDays: 60,
+      snapshotWindowDays: 30,
+      patchRetentionDays: 30,
+      dryRun: true,
+    })
+
+    // Counts reflect what WOULD be deleted…
+    expect(dryRun).toBe(true)
+    expect(counts.pull_requests).toBe(1)
+    expect(counts.commits).toBe(1)
+    expect(counts.metric_snapshots).toBe(1)
+    expect(counts.pr_files_patch_nulled).toBe(1)
+    expect(counts.file_complexity).toBe(1)
+    // …but nothing was actually removed or NULLed.
+    expect(db.prepare(`SELECT COUNT(*) c FROM pull_requests`).get().c).toBe(3)
+    expect(db.prepare(`SELECT COUNT(*) c FROM commits`).get().c).toBe(2)
+    expect(db.prepare(`SELECT COUNT(*) c FROM metric_snapshots`).get().c).toBe(2)
+    expect(db.prepare(`SELECT COUNT(*) c FROM file_complexity`).get().c).toBe(1)
+    expect(db.prepare(`SELECT patch FROM pr_files WHERE pr_id='pr-mid'`).get().patch).toBe(
+      '@@ patch @@',
+    )
+  })
+
+  it('retentionBufferDays extends the raw-retention floor', async () => {
+    const { store } = migratedStore()
+
+    const withBuffer = await store.pruneOldData({
+      now: NOW,
+      retentionDays: 90,
+      snapshotHorizonDays: 60,
+      snapshotWindowDays: 30,
+      patchRetentionDays: 30,
+      retentionBufferDays: 14,
+      dryRun: true,
+    })
+    expect(withBuffer.cutoffs.rawRetentionDays).toBe(104) // max(90, 60+30+14)
+
+    const noBuffer = await store.pruneOldData({
+      now: NOW,
+      retentionDays: 90,
+      snapshotHorizonDays: 60,
+      snapshotWindowDays: 30,
+      patchRetentionDays: 30,
+      retentionBufferDays: 0,
+      dryRun: true,
+    })
+    expect(noBuffer.cutoffs.rawRetentionDays).toBe(90) // max(90, 60+30+0)
+  })
+
+  it('prunes a NULL-authored_at ai_authorship row via computed_at fallback', async () => {
+    const { db, store } = migratedStore()
+    seed(db)
+    // A row with NULL authored_at but an OLD computed_at must not become immortal.
+    db.prepare(
+      `INSERT INTO ai_authorship (entity_type, entity_id, repo_id, author_identity_id, authored_at, ai_score, signals_json, computed_at)
+       VALUES ('commit', 'repo-1:nulldate', 'repo-1', 'id-1', NULL, 0.5, '[]', ?)`,
+    ).run(ago(200))
+
+    const { counts } = await store.pruneOldData({
+      now: NOW,
+      retentionDays: 90,
+      snapshotHorizonDays: 60,
+      snapshotWindowDays: 30,
+      patchRetentionDays: 30,
+    })
+
+    // The 200d authored row + the NULL-authored/200d-computed row both go (2 total).
+    expect(counts.ai_authorship).toBe(2)
+    expect(
+      db.prepare(`SELECT COUNT(*) c FROM ai_authorship WHERE entity_id='repo-1:nulldate'`).get().c,
+    ).toBe(0)
+  })
+})

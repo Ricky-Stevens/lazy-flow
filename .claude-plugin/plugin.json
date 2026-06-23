@@ -1,7 +1,7 @@
 {
   "name": "lazy-flow",
   "displayName": "Lazy Flow",
-  "version": "1.0.9",
+  "version": "1.0.10",
   "description": "Open-source DORA + Flow + PR + Code + Agile metrics platform for Claude Code. Fuses GitHub and Jira into a local-first, fully-transparent delivery intelligence layer that Claude can query directly over SQL.",
   "author": {
     "name": "Ricky Stevens"
@@ -20,6 +20,11 @@
         "LAZYFLOW_REPOS": "${user_config.repos}",
         "LAZYFLOW_REPO_MAX_IDLE_DAYS": "${user_config.repo_max_idle_days}",
         "LAZYFLOW_REPO_HISTORY_DAYS": "${user_config.repo_history_days}",
+        "LAZYFLOW_RETENTION_DAYS": "${user_config.retention_days}",
+        "LAZYFLOW_SNAPSHOT_HORIZON_DAYS": "${user_config.snapshot_horizon_days}",
+        "LAZYFLOW_SNAPSHOT_WINDOW_DAYS": "${user_config.snapshot_window_days}",
+        "LAZYFLOW_LLM_WINDOW_DAYS": "${user_config.llm_window_days}",
+        "LAZYFLOW_PATCH_RETENTION_DAYS": "${user_config.patch_retention_days}",
         "LAZYFLOW_SKIP_BOT_PATCHES": "${user_config.skip_bot_patches}",
         "LAZYFLOW_JIRA_PROJECTS": "${user_config.jira_projects}",
         "LAZYFLOW_DB_PATH": "${CLAUDE_PLUGIN_DATA}/lazy-flow.db"
@@ -76,10 +81,50 @@
     "repo_history_days": {
       "type": "number",
       "title": "Backfill History Window (days)",
-      "description": "On a full backfill, only pull commits and PRs from the last N days per repo, instead of a repo's entire (possibly many-year) history — which wastes API budget and database space and is irrelevant to the metrics window. Default 180. Set to 0 to pull all-time history. Incremental syncs are unaffected. Example: 180.",
+      "description": "On a full backfill, only pull commits and PRs from the last N days per repo, instead of a repo's entire (possibly many-year) history — which wastes API budget and database space and is irrelevant to the metrics window. Default 90 (covers the 60-day snapshot horizon + 30-day rolling window). Set to 0 to pull all-time history. Incremental syncs are unaffected. Example: 90.",
       "sensitive": false,
       "required": false,
-      "default": 180
+      "default": 90
+    },
+    "retention_days": {
+      "type": "number",
+      "title": "Raw Data Retention (days)",
+      "description": "Delete commits, PRs (and their files/reviews/comments), check-runs, deployments and AI-authorship rows older than N days, so the database and the in-memory working set stay bounded as you scale. The prune never deletes below the snapshot horizon + window + buffer, so metrics are never starved. Default 90. Set to 0 to keep all raw rows (PR diff text is controlled separately by PR Diff Retention).",
+      "sensitive": false,
+      "required": false,
+      "default": 90
+    },
+    "snapshot_horizon_days": {
+      "type": "number",
+      "title": "Snapshot Horizon (days)",
+      "description": "How many trailing days of daily metric snapshots to compute on each sync. Lower = faster backfill and smaller DB; higher = more trend history. Minimum 1 (0 falls back to the default). Default 60.",
+      "sensitive": false,
+      "required": false,
+      "default": 60
+    },
+    "snapshot_window_days": {
+      "type": "number",
+      "title": "Snapshot Rolling Window (days)",
+      "description": "The rolling window each daily snapshot is computed over (e.g. a 30-day moving average). This is a metric-semantics knob — most users should leave it at the default. Minimum 1 (0 falls back to the default). Default 30.",
+      "sensitive": false,
+      "required": false,
+      "default": 30
+    },
+    "llm_window_days": {
+      "type": "number",
+      "title": "LLM Judgment Window (days)",
+      "description": "The in-session AI-authorship and verdict queues only surface changes from the last N days, so the (expensive) LLM judgments stay bounded to recent work instead of the entire backlog. Default 30. Set to 0 for no limit.",
+      "sensitive": false,
+      "required": false,
+      "default": 30
+    },
+    "patch_retention_days": {
+      "type": "number",
+      "title": "PR Diff Retention (days)",
+      "description": "Drop stored PR diff text (pr_files.patch) for PRs older than N days — diff text is the bulk of the database on disk, and only diff-level verdicts on recent PRs need it (the denormalised line-count is always kept, so code metrics are unaffected). Default 30. Set to 0 to keep all diff text.",
+      "sensitive": false,
+      "required": false,
+      "default": 30
     },
     "skip_bot_patches": {
       "type": "boolean",
