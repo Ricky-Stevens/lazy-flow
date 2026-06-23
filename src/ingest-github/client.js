@@ -200,7 +200,7 @@ const REPO_PULL_REQUESTS_QUERY = /* graphql */ `
           # lossless, just cheaper for the common case.
           reviews(first: 30) {
             pageInfo { hasNextPage endCursor }
-            nodes { databaseId state submittedAt author { login __typename } }
+            nodes { databaseId body state submittedAt author { login __typename } }
           }
           reviewThreads(first: 30) {
             pageInfo { hasNextPage endCursor }
@@ -208,7 +208,7 @@ const REPO_PULL_REQUESTS_QUERY = /* graphql */ `
               # comments has NO per-thread overflow path, so keep it generous (a
               # single thread with >50 comments is vanishingly rare).
               comments(first: 50) {
-                nodes { databaseId createdAt updatedAt path author { login __typename } replyTo { databaseId } }
+                nodes { databaseId body createdAt updatedAt path author { login __typename } replyTo { databaseId } }
               }
             }
           }
@@ -294,13 +294,13 @@ const PR_CONNECTIONS_QUERY = /* graphql */ `
       pullRequest(number: $number) {
         reviews(first: 100, after: $reviewsAfter) {
           pageInfo { hasNextPage endCursor }
-          nodes { databaseId state submittedAt author { login } }
+          nodes { databaseId body state submittedAt author { login } }
         }
         reviewThreads(first: 100, after: $threadsAfter) {
           pageInfo { hasNextPage endCursor }
           nodes {
             comments(first: 50) {
-              nodes { databaseId createdAt updatedAt path author { login } replyTo { databaseId } }
+              nodes { databaseId body createdAt updatedAt path author { login } replyTo { databaseId } }
             }
           }
         }
@@ -393,6 +393,10 @@ const adaptReviewNode = (r) => ({
   user: r.author?.login ? { login: r.author.login, type: r.author.__typename } : null,
   state: r.state, // UPPER enum; normaliseReviewState upper-cases anyway
   submitted_at: r.submittedAt,
+  // Review summary text — required by the qualitative verdict layer
+  // (review_depth_mentorship). null when GitHub returns an empty review body.
+  // Scrubbed downstream in writePr (raw = scrubFreeText(JSON.stringify(...))).
+  body: r.body ?? null,
 })
 const adaptThreadComments = (threadNodes) => {
   const comments = []
@@ -405,6 +409,10 @@ const adaptThreadComments = (threadNodes) => {
         updated_at: c.updatedAt,
         path: c.path ?? null,
         in_reply_to_id: c.replyTo?.databaseId ?? null,
+        // Inline review-comment text — required by the qualitative verdict layer
+        // (feedback_severity_mix_received). null when the body is empty.
+        // Scrubbed downstream in writePr (raw = scrubFreeText(JSON.stringify(...))).
+        body: c.body ?? null,
       })
     }
   }

@@ -577,7 +577,7 @@ const reviews = Object.freeze([
     reviewerIdentityId: IDS.identityBobGh,
     state: 'changes_requested',
     submittedAt: '2024-03-01T12:00:00Z',
-    raw: '{"id":"review-1-r1","state":"CHANGES_REQUESTED","user":{"login":"bob"}}',
+    raw: '{"id":"review-1-r1","body":"This needs a guard before the dereference — please add a null check on widget.","state":"CHANGES_REQUESTED","user":{"login":"bob"}}',
     updatedAt: '2024-03-01T12:00:00Z',
   }),
   // pr-1, round 2: bob approves after fix
@@ -587,7 +587,7 @@ const reviews = Object.freeze([
     reviewerIdentityId: IDS.identityBobGh,
     state: 'approved',
     submittedAt: '2024-03-02T09:00:00Z',
-    raw: '{"id":"review-1-r2","state":"APPROVED","user":{"login":"bob"}}',
+    raw: '{"id":"review-1-r2","body":"Looks good now, thanks for adding the guard. LGTM.","state":"APPROVED","user":{"login":"bob"}}',
     updatedAt: '2024-03-02T09:00:00Z',
   }),
 ])

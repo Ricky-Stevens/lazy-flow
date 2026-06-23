@@ -1,7 +1,7 @@
 {
   "name": "lazy-flow",
   "displayName": "Lazy Flow",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "description": "Open-source DORA + Flow + PR + Code + Agile metrics platform for Claude Code. Fuses GitHub and Jira into a local-first, fully-transparent delivery intelligence layer that Claude can query directly over SQL.",
   "author": {
     "name": "Ricky Stevens"

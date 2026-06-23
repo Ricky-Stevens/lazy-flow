@@ -644,6 +644,7 @@ function graphQLHandlers() {
               const rraw = JSON.parse(r.raw)
               return {
                 databaseId: r.nodeId,
+                body: rraw.body ?? null,
                 state: rraw.state ?? r.state.toUpperCase(),
                 submittedAt: r.submittedAt,
                 author: rraw.user?.login
@@ -660,6 +661,7 @@ function graphQLHandlers() {
                   nodes: [
                     {
                       databaseId: craw.id ?? c.nodeId,
+                      body: craw.body ?? null,
                       createdAt: c.createdAt,
                       updatedAt: c.updatedAt,
                       path: c.path ?? null,

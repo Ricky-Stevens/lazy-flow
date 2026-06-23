@@ -309,6 +309,45 @@ describe('PR stage timestamps', () => {
 })
 
 // ---------------------------------------------------------------------------
+// 4a-bis. Review / review-comment BODY text is persisted into raw
+// ---------------------------------------------------------------------------
+//
+// Regression: the bulk GraphQL PR query never selected `body` on reviews or
+// review-thread comments, and the adapters dropped it — so reviews.raw and
+// review_comments.raw held only metadata (id/user/timestamps/path). The two
+// text-dependent qualitative metrics (review_depth_mentorship,
+// feedback_severity_mix_received) were therefore unjudgeable. The query now
+// selects `body` and the adapters surface it; it must land (scrubbed) in raw.
+describe('review / comment body persistence', () => {
+  let store
+
+  beforeEach(async () => {
+    store = makeStore()
+    const client = makeClient()
+    await syncGitHub(store, client, scope, 'backfill')
+  })
+
+  it('persists review summary body into reviews.raw', async () => {
+    const reviews = await store.getReviewsByPullRequest(`${SYNCED_REPO_ALPHA}-pr-1`)
+    expect(reviews.length).toBe(2)
+    for (const r of reviews) {
+      const raw = JSON.parse(r.raw)
+      expect(typeof raw.body).toBe('string')
+      expect(raw.body.length).toBeGreaterThan(0)
+    }
+    const approved = reviews.find((r) => r.state === 'approved')
+    expect(JSON.parse(approved.raw).body).toContain('LGTM')
+  })
+
+  it('persists inline review-comment body into review_comments.raw', async () => {
+    const comments = await store.getReviewCommentsByPullRequest(`${SYNCED_REPO_ALPHA}-pr-1`)
+    expect(comments.length).toBeGreaterThan(0)
+    const raw = JSON.parse(comments[0].raw)
+    expect(raw.body).toContain('null check')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // 4b. PR file diffs persisted with real HALOC
 // ---------------------------------------------------------------------------
 
